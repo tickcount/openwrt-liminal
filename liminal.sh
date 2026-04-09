@@ -1402,10 +1402,9 @@ reconstruct_peer_config() {
     fi
     [ -z "$_endpoint_host" ] && _endpoint_host="YOUR_SERVER_IP"
 
-    _out="$(printf "[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\nEndpoint = %s:%s\nPersistentKeepAlive = %s\n" \
-        "$_client_priv" "$_peer_ip" "$_dns" "$_mtu" "$_server_pub" "$_client_allowed_ips" "$_endpoint_host" "$_port" "$_keepalive")"
-    [ -n "$_psk" ] && _out="${_out}$(printf "PresharedKey = %s\n" "$_psk")"
-    printf "%s" "$_out"
+    printf "[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\nEndpoint = %s:%s\nPersistentKeepAlive = %s\n" \
+        "$_client_priv" "$_peer_ip" "$_dns" "$_mtu" "$_server_pub" "$_client_allowed_ips" "$_endpoint_host" "$_port" "$_keepalive"
+    [ -n "$_psk" ] && printf "PresharedKey = %s\n" "$_psk"
 }
 
 build_vpn_key() {
@@ -1500,9 +1499,10 @@ show_peer_download() {
     _conf="$(reconstruct_peer_config "$1" "$2")"
     [ -z "$_conf" ] && { warn "Failed to read peer private key"; PAUSE; return; }
     _b64="$(printf "%s" "$_conf" | base64 -w 0 2>/dev/null || printf "%s" "$_conf" | base64)"
+    _fname="$(printf '%s_%s' "${3:-peer}" "$1" | tr 'A-Z ' 'a-z-' | sed 's/[^a-z0-9_-]//g')"
     echo ""
     echo -e "  ${A}Download link:${NC}"
-    echo "https://immalware.vercel.app/download?filename=awg_$1.conf&content=${_b64}"
+    echo "https://immalware.vercel.app/download?filename=${_fname}.conf&content=${_b64}"
     PAUSE
 }
 
@@ -1517,7 +1517,7 @@ show_peer_vpn_key() {
 }
 
 show_peer_all() {
-    _iface="$1"; _idx="$2"
+    _iface="$1"; _idx="$2"; _pname="${3:-peer}"
     _conf="$(reconstruct_peer_config "$_iface" "$_idx")"
     [ -z "$_conf" ] && { warn "Failed to read peer private key"; PAUSE; return; }
 
@@ -1536,8 +1536,9 @@ show_peer_all() {
 
     if have_cmd base64; then
         _b64="$(printf "%s" "$_conf" | base64 -w 0 2>/dev/null || printf "%s" "$_conf" | base64)"
+        _fname="$(printf '%s_%s' "$_pname" "$_iface" | tr 'A-Z ' 'a-z-' | sed 's/[^a-z0-9_-]//g')"
         echo -e "  ${A}Download:${NC}"
-        echo "https://immalware.vercel.app/download?filename=awg_${_iface}.conf&content=${_b64}"
+        echo "https://immalware.vercel.app/download?filename=${_fname}.conf&content=${_b64}"
         echo ""
     fi
 
@@ -1826,10 +1827,10 @@ do_peer_menu() {
 
         case "${_peer_choice:-}" in
             1) show_peer_conf "$_iface" "$_idx" ;;
-            2) show_peer_download "$_iface" "$_idx" ;;
+            2) show_peer_download "$_iface" "$_idx" "$_desc" ;;
             3) show_peer_vpn_key "$_iface" "$_idx" ;;
             4) show_peer_qr "$_iface" "$_idx" ;;
-            5) show_peer_all "$_iface" "$_idx" ;;
+            5) show_peer_all "$_iface" "$_idx" "$_desc" ;;
             6)  PEER_NEW_NAME=""
                 if do_rename_peer "$_iface" "$_idx" "$_desc"; then
                     _desc="$PEER_NEW_NAME"
@@ -2428,7 +2429,12 @@ do_manage_interface() {
         detect_podkop_state "$_iface"
 
         _ep_override="$(uci -q get "network.${_iface}.endpoint_host" || true)"
-        _ep_display="${_ep_override:-auto}"
+        if [ -n "$_ep_override" ]; then
+            _ep_display="$_ep_override"
+        else
+            _ep_display="$(detect_wan_ip 2>/dev/null || true)"
+            [ -z "$_ep_display" ] && _ep_display="auto"
+        fi
         _dns_chain="$(dns_chain_label "$_iface")"
         if [ -n "$_dns_chain" ]; then _dns_chain="  ${_dns_chain}"; fi
 
