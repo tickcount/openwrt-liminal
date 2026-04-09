@@ -28,8 +28,8 @@ Create encrypted tunnels from your devices (phone, laptop, etc.) back to your ho
 
 ## Preview
 <center>
-  <img width="514" height="478" src="https://github.com/user-attachments/assets/d76785b3-b283-4f6c-948a-df3526283f35" />
-  <img width="577" height="463" src="https://github.com/user-attachments/assets/7adbf9c5-35ed-45cc-928f-18bdc435e24f" />
+<img width="525" height="542" alt="Untitled" src="https://github.com/user-attachments/assets/9c816a9a-5785-43f2-be18-02b58da7ea5e" />
+<img width="680" height="687" alt="interface" src="https://github.com/user-attachments/assets/5b7bb1de-7993-4c69-ad55-d0521318b5f3" />
 </center>
 
 ## Features
