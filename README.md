@@ -36,24 +36,32 @@ Create encrypted tunnels from your devices (phone, laptop, etc.) back to your ho
 
 ### Interface Management
 - **Create** AmneziaWG interfaces with automatic firewall zone, rules, and forwarding setup
+- **Rename** interfaces — updates all peers, firewall zone/rules/forwardings, DNS records, Podkop
 - **Auto-detect** router LAN IP, WAN IP (endpoint), and firewall zones
+- **Address conflict detection** — prevents creating interfaces with overlapping subnets
 - **Inline peer list** on interface page with direct numeric selection
+- **Interactive DNS selector** — preset servers with Sing-Box/Podkop awareness, current DNS highlighted
 - **Edit settings** — DNS, MTU, listen port, endpoint host override
 - **Toggle LAN/WAN forwarding** directly from the interface menu
 - **Podkop integration** — link/unlink with one toggle
-- **Inline diagnostics** — warnings for down device, closed port, missing zone/forwarding
-- **Interface info** — uptime, total traffic (Rx/Tx), public key, Podkop status
+- **Sing-Box detection** — standalone or via Podkop, DNS chain status in interface/peer display
+- **Inline diagnostics** — warnings for down device, closed port, missing zone/forwarding, DNS chain issues
+- **Interface info** — uptime, total traffic (Rx/Tx), public key, Podkop/Sing-Box status
 - **Disable / Enable / Delete** interfaces with full cleanup
 - **Non-Liminal interface support** — manage interfaces created outside Liminal (read-only, no delete)
 
 ### Peer Management
 - **Add peers** with automatic IP allocation and subnet validation
+- **Duplicate name prevention** — globally unique peer names enforced on create and rename
+- **Local DNS hostrecords** — optional `peer.interface.lan` hostname via dnsmasq, with auto or custom name
+- **Manage hostnames** — add, change, or remove DNS records from the peer menu (`h`)
+- **DNS diagnostics** — inline warnings when hostname won't resolve (DNS mismatch, zone blocks port 53, dnsmasq/Sing-Box issues)
 - **Routing mode presets** — Full tunnel, LAN only, WAN only, or custom AllowedIPs
 - **PreSharedKey** generation for extra security
 - **Live status** — Online/Offline detection via latest handshake (≤120s threshold)
 - **Handshake color-coding** — green ≤30s, amber ≤120s, red >120s
-- **Per-peer info** — endpoint, handshake time, Rx/Tx transfer, keepalive, public key
-- **Edit per-peer settings** — AllowedIPs, Keepalive
+- **Per-peer info** — DNS (with Sing-Box chain indicator), endpoint, handshake, Rx/Tx, keepalive, public key, hostname
+- **Edit per-peer settings** — AllowedIPs, Keepalive, Hostname
 - **Export configs** — WireGuard config, QR code, download link, `vpn://` AmneziaVPN key
 - **Show All** — config + QR + vpn:// + download in one view
 - **Rename / Regenerate keys / Disable / Enable / Delete** peers
@@ -78,7 +86,7 @@ Create encrypted tunnels from your devices (phone, laptop, etc.) back to your ho
 - **Manual backups** on demand
 - **Restore** from any backup with one click
 - **Manage** — list, inspect (with size), delete individual or all backups
-- Backups include `network`, `firewall`, and `podkop` configs
+- Backups include `network`, `firewall`, `dhcp`, and `podkop` configs
 
 ### Self-Update
 - **Check for updates** from GitHub directly from the main menu
@@ -96,9 +104,11 @@ Create encrypted tunnels from your devices (phone, laptop, etc.) back to your ho
 - **Soft color palette** — white-blue-violet theme
 
 ### Safety
-- `_is_liminal` flag on all created UCI objects — Liminal never touches configs it didn't create
+- `_liminal_iface` tag on all firewall/DNS objects — links each UCI object to its parent interface
+- Ctrl+C safe — never kills the script; goes back to parent menu or prompts to exit
 - Input sanitization and name validation
-- Subnet validation for generated peer IPs
+- Subnet/address overlap validation across all network interfaces
+- DNS safety checks — dnsmasq status, zone input, Sing-Box chain, localservice, rebind protection
 
 ## Requirements
 
@@ -147,11 +157,11 @@ Main Menu
 │       │   ├── + ) Add Peer
 │       │   └── 1..N ) Select peer
 │       │       ├── Config: Show Config / Download Link / vpn:// Key / QR Code / Show All
-│       │       ├── Settings: AllowedIPs / Keepalive
+│       │       ├── Settings: AllowedIPs / Keepalive / Hostname (DNS record)
 │       │       └── Actions: Rename / Regenerate Keys / Disable|Enable / Delete
 │       ├── Settings: DNS+MTU / Port / Endpoint / LAN Fwd / WAN Fwd / Podkop
 │       ├── Info: Public Key
-│       └── Interface: Restart / Disable|Enable / Delete
+│       └── Interface: Rename / Restart / Disable|Enable / Delete
 ├── m ) Live Dashboard
 ├── e ) Export / Import
 ├── b ) Manage Backups
@@ -186,7 +196,7 @@ Liminal creates standard AmneziaWG interfaces via UCI with:
 - WAN masquerading for internet access
 - Optional Podkop source interface registration
 
-All objects are tagged with `_is_liminal=1` so Liminal can safely manage only what it created.
+All firewall and DNS objects are tagged with `_liminal_iface=<interface>` so Liminal can safely manage only what it created, and knows exactly which interface each object belongs to.
 
 ## Note
 

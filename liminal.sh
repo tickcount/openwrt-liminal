@@ -138,7 +138,7 @@ hs_colored() {
 log()  { printf '%s\n' "$*"; }
 warn() { echo -e "  ${ERR}${ICO_WARN} warning:${NC} $*" >&2; }
 die()  { echo -e "  ${ERR}${ICO_ERR} error:${NC} $*" >&2; exit 1; }
-PAUSE() { echo -ne "\n  ${DIM2}Press Enter...${NC}"; read dummy; }
+PAUSE() { echo -ne "\n  ${DIM2}Press Enter...${NC}"; read dummy || true; }
 
 # read_choice VAR — read a single menu choice, strip invisible/control chars
 read_choice() {
@@ -158,6 +158,7 @@ init_backup() {
     mkdir -p "$BACKUP_DIR"
     cp /etc/config/network  "$BACKUP_DIR/network.bak"
     cp /etc/config/firewall "$BACKUP_DIR/firewall.bak"
+    [ -f /etc/config/dhcp ]   && cp /etc/config/dhcp   "$BACKUP_DIR/dhcp.bak" || true
     [ -f /etc/config/podkop ] && cp /etc/config/podkop "$BACKUP_DIR/podkop.bak" || true
     echo "$_reason" > "$BACKUP_DIR/.reason"
     date '+%Y-%m-%d %H:%M:%S' > "$BACKUP_DIR/.date"
@@ -172,41 +173,50 @@ restore_backups() {
     echo -e "  ${B}Restoring${NC} backups from $BACKUP_DIR ..."
     [ -f "$BACKUP_DIR/network.bak" ]  && cp "$BACKUP_DIR/network.bak"  /etc/config/network
     [ -f "$BACKUP_DIR/firewall.bak" ] && cp "$BACKUP_DIR/firewall.bak" /etc/config/firewall
+    [ -f "$BACKUP_DIR/dhcp.bak" ]     && cp "$BACKUP_DIR/dhcp.bak"     /etc/config/dhcp || true
     [ -f "$BACKUP_DIR/podkop.bak" ]   && cp "$BACKUP_DIR/podkop.bak"   /etc/config/podkop || true
     echo -e "  ${B}Reloading${NC} network..."
     /etc/init.d/network reload   >/dev/null 2>&1 || true
     echo -e "  ${B}Restarting${NC} firewall..."
     /etc/init.d/firewall restart >/dev/null 2>&1 || true
+    echo -e "  ${B}Restarting${NC} dnsmasq..."
+    /etc/init.d/dnsmasq restart  >/dev/null 2>&1 || true
     if [ -x /etc/init.d/podkop ]; then
         echo -e "  ${B}Restarting${NC} Podkop..."
         /etc/init.d/podkop restart >/dev/null 2>&1 || true
     fi
+    podkop_refresh
 }
+
+_SIGINT=0
 
 on_error() {
-    trap - INT TERM HUP
+    _SIGINT=1
     echo ""
-    exit 1
 }
 
-trap on_error INT TERM HUP
+trap on_error INT
 
-# Flag for cancellable sections
+# Flag for cancellable sections (create, rename, etc.)
 _CANCELLED=0
 
-# Call at start of cancellable flow (create, rename, etc.)
 trap_cancel() {
     _CANCELLED=0
     trap '_CANCELLED=1; trap on_error INT' INT
 }
 
-# Call at end to restore default trap
 trap_restore() {
     trap on_error INT
 }
 
-# Check if cancelled
 is_cancelled() { [ "$_CANCELLED" -eq 1 ]; }
+
+# Check & reset SIGINT flag — use after read in menu loops
+sigint_caught() {
+    [ "$_SIGINT" -eq 1 ] || return 1
+    _SIGINT=0
+    return 0
+}
 
 # ─── Input helpers ────────────────────────────────────────────────────
 
@@ -243,6 +253,381 @@ confirm() {
         *)
             if [ "$_def" = "y" ]; then return 0; else return 1; fi ;;
     esac
+}
+
+# ─── DNS selector ─────────────────────────────────────────────────────
+
+# select_dns VAR [current_dns]
+# Shows a numbered list of popular DNS servers. Sets VAR to the chosen IP.
+# Returns 1 if cancelled.
+select_dns() {
+    _sd_var="$1"; _sd_cur="${2:-}"
+    _sd_lan="$(detect_router_lan_ip 2>/dev/null || true)"
+
+    # Read cached state (set by podkop_refresh at startup)
+    _sd_sb_active=0
+    if [ "${SB_RUNNING:-0}" -eq 1 ] && [ "${SB_DNS:-0}" -eq 1 ]; then
+        _sd_sb_active=1
+    fi
+
+    echo ""
+    echo -e "  ${A}Select DNS server:${NC}"
+    if [ "$_sd_sb_active" -eq 1 ] && [ "${PK_INSTALLED:-0}" -eq 1 ]; then
+        echo -e "  ${DIM2}Podkop: dnsmasq → Sing-Box (127.0.0.42:53)${NC}"
+    elif [ "$_sd_sb_active" -eq 1 ]; then
+        echo -e "  ${DIM2}Sing-Box DNS active (127.0.0.42:53)${NC}"
+    elif [ "${SB_RUNNING:-0}" -eq 1 ]; then
+        echo -e "  ${WARN_C}Sing-Box running but DNS not listening${NC}"
+    fi
+    echo ""
+
+    # Build ordered list: current first (if set), then presets, then Router LAN
+    _sd_n=0
+    _sd_list=""
+    _sd_cur_shown=0
+
+    # Show current DNS first if it's set and not in the preset list
+    if [ -n "$_sd_cur" ]; then
+        _sd_cur_in_presets=0
+        for _sd_entry in \
+            "Cloudflare|1.1.1.1" \
+            "Google|8.8.8.8" \
+            "Quad9|9.9.9.9" \
+            "OpenDNS|208.67.222.222" \
+            "AdGuard|94.140.14.14" \
+            "Comss.one|92.223.109.31"; do
+            _sd_ip="${_sd_entry##*|}"
+            if [ "$_sd_cur" = "$_sd_ip" ]; then _sd_cur_in_presets=1; fi
+        done
+        if [ -n "$_sd_lan" ] && [ "$_sd_cur" = "$_sd_lan" ]; then _sd_cur_in_presets=1; fi
+    fi
+
+    # Column positions (ANSI escape)
+    _C1="\033[17G"  # name column
+    _C2="\033[30G"  # ip column
+    _C3="\033[48G"  # note column
+
+    # Helper: print one DNS row
+    # _sd_print NAME IP NOTE MARK
+    _sd_print() {
+        echo -e "  ${B}${_sd_n}${NC} ${DIM2}›${NC}${_C1}${W}${1}${NC}${_C2}${DIM2}${2}${NC}${_C3}${3}${4}"
+    }
+
+    # If current is custom (not in any preset), show it as #1
+    if [ "$_sd_cur_shown" -eq 0 ] && [ -n "$_sd_cur" ] && [ "$_sd_cur_in_presets" -eq 0 ]; then
+        _sd_n=$((_sd_n + 1))
+        _sd_print "$_sd_cur" "" "" "${OK}current${NC}"
+        _sd_list="${_sd_list} ${_sd_cur}"
+        _sd_cur_shown=1
+    fi
+
+    # Preset list: name|ip
+    for _sd_entry in \
+        "Cloudflare|1.1.1.1" \
+        "Google|8.8.8.8" \
+        "Quad9|9.9.9.9" \
+        "OpenDNS|208.67.222.222" \
+        "AdGuard|94.140.14.14" \
+        "Comss.one|92.223.109.31"; do
+        _sd_name="${_sd_entry%%|*}"
+        _sd_ip="${_sd_entry##*|}"
+        _sd_n=$((_sd_n + 1))
+        _sd_note=""
+        _sd_mark=""
+        if [ "$_sd_sb_active" -eq 1 ]; then _sd_note="${WARN_C}bypasses Sing-Box${NC}"; fi
+        if [ -n "$_sd_cur" ] && [ "$_sd_cur" = "$_sd_ip" ]; then _sd_mark="${OK}current${NC}"; _sd_note=""; fi
+        _sd_print "$_sd_name" "$_sd_ip" "$_sd_note" "$_sd_mark"
+        _sd_list="${_sd_list} ${_sd_ip}"
+    done
+
+    # Router LAN IP
+    if [ -n "$_sd_lan" ]; then
+        _sd_n=$((_sd_n + 1))
+        _sd_note=""
+        _sd_mark=""
+        if [ "$_sd_sb_active" -eq 1 ]; then _sd_note="${OK}→ Sing-Box + local DNS${NC}"; fi
+        if [ -n "$_sd_cur" ] && [ "$_sd_cur" = "$_sd_lan" ]; then _sd_mark="${OK}current${NC}"; fi
+        _sd_print "Router LAN" "$_sd_lan" "$_sd_note" "$_sd_mark"
+        _sd_list="${_sd_list} ${_sd_lan}"
+    fi
+
+    echo -e "  ${B}0${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter manually)${NC}"
+    echo ""
+
+    _sd_max="$_sd_n"
+    echo -ne "  ${A}>${NC} "; read -r _sd_choice || true
+    sigint_caught && return 1
+    _sd_choice="$(printf '%s' "${_sd_choice:-}" | tr -d '\001-\037\177')"
+
+    # Empty = cancel
+    [ -z "$_sd_choice" ] && return 1
+
+    # Custom
+    if [ "$_sd_choice" = "0" ]; then
+        while true; do
+            prompt _sd_custom "DNS server (IPv4)" "" || return 1
+            sigint_caught && return 1
+            [ -z "$_sd_custom" ] && return 1
+            validate_ipv4 "$_sd_custom" && break
+        done
+        eval "$_sd_var=\$_sd_custom"
+        return 0
+    fi
+
+    # Validate choice
+    case "$_sd_choice" in *[!0-9]*) warn "Invalid selection"; return 1 ;; esac
+    if [ "$_sd_choice" -lt 1 ] 2>/dev/null; then warn "Invalid selection"; return 1; fi
+    if [ "$_sd_choice" -gt "$_sd_max" ] 2>/dev/null; then warn "Invalid selection"; return 1; fi
+
+    # Map choice to IP from ordered list
+    _sd_i=0; _sd_result=""
+    for _sd_ip in $_sd_list; do
+        _sd_i=$((_sd_i + 1))
+        if [ "$_sd_i" = "$_sd_choice" ]; then _sd_result="$_sd_ip"; fi
+    done
+
+    if [ -z "$_sd_result" ]; then
+        warn "Invalid selection"; return 1
+    fi
+
+    eval "$_sd_var=\$_sd_result"
+    return 0
+}
+
+# ─── DNS hostrecord helpers ────────────────────────────────────────────
+
+# Sanitize a string into a valid DNS label (lowercase, dashes, no special chars)
+sanitize_hostname() {
+    printf '%s' "$1" | tr 'A-Z' 'a-z' | tr ' _' '--' \
+        | sed 's/[^a-z0-9-]//g; s/--*/-/g; s/^-//; s/-$//'
+}
+
+# Get router's local domain (default: lan)
+get_lan_domain() {
+    uci -q get "dhcp.@dnsmasq[0].domain" 2>/dev/null || echo "lan"
+}
+
+# Build FQDN for a peer: {sanitized_peer}.{sanitized_iface}.{domain}
+build_peer_fqdn() {
+    _bp_iface="$1"; _bp_desc="$2"
+    _bp_h="$(sanitize_hostname "$_bp_desc")"
+    _bp_i="$(sanitize_hostname "$_bp_iface")"
+    _bp_d="$(get_lan_domain)"
+    [ -z "$_bp_h" ] && return 1
+    printf '%s.%s.%s\n' "$_bp_h" "$_bp_i" "$_bp_d"
+}
+
+# Find hostrecord index by _liminal_iface + _liminal_peer
+find_hostrecord() {
+    _fh_iface="$1"; _fh_peer="$2"; _fh_i=0
+    while uci -q get "dhcp.@hostrecord[$_fh_i]" >/dev/null 2>&1; do
+        _fh_li="$(uci -q get "dhcp.@hostrecord[$_fh_i]._liminal_iface" || true)"
+        _fh_lp="$(uci -q get "dhcp.@hostrecord[$_fh_i]._liminal_peer" || true)"
+        if [ "$_fh_li" = "$_fh_iface" ] && [ "$_fh_lp" = "$_fh_peer" ]; then
+            echo "$_fh_i"; return 0
+        fi
+        _fh_i=$((_fh_i + 1))
+    done
+    return 1
+}
+
+# Get peer FQDN from existing hostrecord (or empty)
+get_peer_hostrecord_fqdn() {
+    _gph_idx="$(find_hostrecord "$1" "$2" 2>/dev/null)" || return 1
+    uci -q get "dhcp.@hostrecord[$_gph_idx].name" || true
+}
+
+# Check if FQDN already exists in any hostrecord
+hostrecord_fqdn_exists() {
+    _he_fqdn="$1"; _he_i=0
+    while uci -q get "dhcp.@hostrecord[$_he_i]" >/dev/null 2>&1; do
+        _he_n="$(uci -q get "dhcp.@hostrecord[$_he_i].name" || true)"
+        [ "$_he_n" = "$_he_fqdn" ] && return 0
+        _he_i=$((_he_i + 1))
+    done
+    return 1
+}
+
+# Add a hostrecord for a peer (takes explicit FQDN)
+add_peer_hostrecord() {
+    _ah_iface="$1"; _ah_desc="$2"; _ah_ip="${3%%/*}"; _ah_fqdn="$4"
+    hostrecord_fqdn_exists "$_ah_fqdn" && { warn "Hostname '$_ah_fqdn' already exists"; return 1; }
+    uci add dhcp hostrecord >/dev/null
+    _ah_idx="$(uci show dhcp 2>/dev/null \
+        | sed -n 's/^dhcp\.@hostrecord\[\([0-9]\+\)\]=hostrecord$/\1/p' | tail -n1)"
+    uci set "dhcp.@hostrecord[$_ah_idx].name=${_ah_fqdn}"
+    uci set "dhcp.@hostrecord[$_ah_idx].ip=${_ah_ip}"
+    uci set "dhcp.@hostrecord[$_ah_idx]._liminal_iface=${_ah_iface}"
+    uci set "dhcp.@hostrecord[$_ah_idx]._liminal_peer=${_ah_desc}"
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    echo -e "  ${ICO_OK} ${OK}DNS:${NC} ${_ah_fqdn} → ${_ah_ip}"
+}
+
+# Remove hostrecord for a specific peer
+remove_peer_hostrecord() {
+    _rh_idx="$(find_hostrecord "$1" "$2" 2>/dev/null)" || return 0
+    _rh_fqdn="$(uci -q get "dhcp.@hostrecord[$_rh_idx].name" || true)"
+    uci delete "dhcp.@hostrecord[$_rh_idx]"
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    [ -n "$_rh_fqdn" ] && echo -e "  ${B}Removed${NC} DNS: ${_rh_fqdn}"
+}
+
+# Remove all hostrecords for an interface
+remove_iface_hostrecords() {
+    _ri_iface="$1"; _ri_changed=0
+    _ri_cnt=0
+    while uci -q get "dhcp.@hostrecord[$_ri_cnt]" >/dev/null 2>&1; do
+        _ri_cnt=$((_ri_cnt + 1))
+    done
+    _ri_i=$((_ri_cnt - 1))
+    while [ "$_ri_i" -ge 0 ]; do
+        _ri_li="$(uci -q get "dhcp.@hostrecord[$_ri_i]._liminal_iface" || true)"
+        if [ "$_ri_li" = "$_ri_iface" ]; then
+            uci delete "dhcp.@hostrecord[$_ri_i]"
+            _ri_changed=1
+        fi
+        _ri_i=$((_ri_i - 1))
+    done
+    if [ "$_ri_changed" -eq 1 ]; then
+        uci commit dhcp
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+        echo -e "  ${B}Removed${NC} DNS records for ${W}${_ri_iface}${NC}"
+    fi
+}
+
+# Update all hostrecords when interface is renamed
+rename_iface_hostrecords() {
+    _uih_old="$1"; _uih_new="$2"
+    _uih_domain="$(get_lan_domain)"
+    _uih_changed=0; _uih_i=0
+    while uci -q get "dhcp.@hostrecord[$_uih_i]" >/dev/null 2>&1; do
+        _uih_li="$(uci -q get "dhcp.@hostrecord[$_uih_i]._liminal_iface" || true)"
+        if [ "$_uih_li" = "$_uih_old" ]; then
+            _uih_peer="$(uci -q get "dhcp.@hostrecord[$_uih_i]._liminal_peer" || true)"
+            _uih_fqdn="$(build_peer_fqdn "$_uih_new" "$_uih_peer")"
+            uci set "dhcp.@hostrecord[$_uih_i].name=${_uih_fqdn}"
+            uci set "dhcp.@hostrecord[$_uih_i]._liminal_iface=${_uih_new}"
+            _uih_changed=1
+        fi
+        _uih_i=$((_uih_i + 1))
+    done
+    if [ "$_uih_changed" -eq 1 ]; then
+        uci commit dhcp
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+        echo -e "  ${B}Updated${NC} DNS records: *.${_uih_old}.${_uih_domain} → *.$(sanitize_hostname "$_uih_new").${_uih_domain}"
+    fi
+}
+
+# Run all DNS hostrecord safety checks and print warnings.
+# Returns 0 if all checks pass, 1 if any warning was issued.
+check_hostrecord_warnings() {
+    _chw_iface="$1"
+    _chw_ok=0
+
+    # 1. dnsmasq running
+    if ! /etc/init.d/dnsmasq enabled 2>/dev/null; then
+        warn "dnsmasq is not enabled — hostnames will not resolve"
+        _chw_ok=1
+    elif ! pgrep -x dnsmasq >/dev/null 2>&1; then
+        warn "dnsmasq is not running — hostnames will not resolve"
+        _chw_ok=1
+    fi
+
+    # 2. Peer DNS points to router
+    _chw_dns="$(uci -q get "network.${_chw_iface}.dns" || true)"
+    _chw_lan="$(detect_router_lan_ip 2>/dev/null || true)"
+    if [ -n "$_chw_dns" ] && [ -n "$_chw_lan" ] && [ "$_chw_dns" != "$_chw_lan" ]; then
+        warn "Interface DNS is ${_chw_dns}, not router (${_chw_lan})"
+        warn "Peers using external DNS will not resolve local hostnames"
+        _chw_ok=1
+    fi
+
+    # 3. Zone input allows DNS
+    _chw_zone="$(find_zone_for_interface "$_chw_iface" 2>/dev/null || true)"
+    if [ -n "$_chw_zone" ]; then
+        _chw_zi="$(find_zone_index "$_chw_zone" || true)"
+        if [ -n "$_chw_zi" ]; then
+            _chw_input="$(uci -q get "firewall.@zone[$_chw_zi].input" || echo "DROP")"
+            if [ "$_chw_input" != "ACCEPT" ]; then
+                _chw_has_dns_rule=0; _chw_ri=0
+                while uci -q get "firewall.@rule[$_chw_ri]" >/dev/null 2>&1; do
+                    _chw_src="$(uci -q get "firewall.@rule[$_chw_ri].src" || true)"
+                    _chw_dp="$(uci -q get "firewall.@rule[$_chw_ri].dest_port" || true)"
+                    _chw_tgt="$(uci -q get "firewall.@rule[$_chw_ri].target" || true)"
+                    [ "$_chw_src" = "$_chw_zone" ] && [ "$_chw_dp" = "53" ] && [ "$_chw_tgt" = "ACCEPT" ] && { _chw_has_dns_rule=1; break; }
+                    _chw_ri=$((_chw_ri + 1))
+                done
+                [ "$_chw_has_dns_rule" -eq 0 ] && {
+                    warn "Zone '${_chw_zone}' input=${_chw_input} and no DNS rule"
+                    warn "Peers cannot reach router DNS — add a rule for port 53"
+                    _chw_ok=1
+                }
+            fi
+        fi
+    fi
+
+    # 4-5. dnsmasq localservice & rebind_protection
+    # Skip when Sing-Box DNS chain is active — Sing-Box handles resolution,
+    # dnsmasq only forwards, so these settings don't affect hostrecord delivery.
+    if [ "${SB_DNS:-0}" -eq 0 ] || [ "${DM_FWD:-0}" -eq 0 ]; then
+        # 4. dnsmasq localservice
+        _chw_ls="$(uci -q get "dhcp.@dnsmasq[0].localservice" || true)"
+        if [ "$_chw_ls" = "1" ]; then
+            warn "dnsmasq localservice=1 — may reject queries from VPN subnet"
+            warn "Set 'localservice 0' or add VPN subnet to dnsmasq listen"
+            _chw_ok=1
+        fi
+
+        # 5. rebind_protection
+        _chw_rb="$(uci -q get "dhcp.@dnsmasq[0].rebind_protection" || true)"
+        if [ "$_chw_rb" = "1" ]; then
+            _chw_rb_ok=0
+            _chw_domain="$(get_lan_domain)"
+            for _chw_rd in $(uci -q get "dhcp.@dnsmasq[0].rebind_domain" 2>/dev/null || true); do
+                if [ "$_chw_rd" = "/${_chw_domain}/" ] || [ "$_chw_rd" = "$_chw_domain" ]; then _chw_rb_ok=1; fi
+            done
+            if [ "$_chw_rb_ok" -eq 0 ]; then
+                warn "dnsmasq rebind_protection=1 — may block private IP responses"
+                warn "Add '${_chw_domain}' to rebind_domain whitelist if resolution fails"
+                _chw_ok=1
+            fi
+        fi
+    fi
+
+    # 6. Sing-Box / Podkop DNS chain
+    detect_podkop_state "$_chw_iface"
+    _chw_label="Sing-Box"
+    if [ "${PK_INSTALLED:-0}" -eq 1 ] && [ "${PK_LINKED:-0}" -eq 1 ]; then _chw_label="Podkop"; fi
+    # Check if Sing-Box is relevant (podkop linked, or standalone with dnsmasq fwd)
+    if { [ "${PK_LINKED:-0}" -eq 1 ]; } || { [ "${SB_DNS:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 1 ]; }; then
+        if [ "${SB_RUNNING:-0}" -eq 0 ]; then
+            warn "${_chw_label}: Sing-Box is not running"
+            _chw_ok=1
+        elif [ "${SB_DNS:-0}" -eq 0 ]; then
+            warn "${_chw_label}: Sing-Box not listening on 127.0.0.42:53"
+            _chw_ok=1
+        elif [ "${DM_FWD:-0}" -eq 0 ]; then
+            warn "${_chw_label}: dnsmasq missing server 127.0.0.42"
+            _chw_ok=1
+        elif [ "${PK_DNS_VIA_ROUTER:-0}" -eq 1 ]; then
+            echo -e "  ${ICO_OK} ${DIM2}${_chw_label}: peer → dnsmasq → Sing-Box (hostrecords OK)${NC}"
+        fi
+        if [ "${DM_NORESOLV:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 0 ]; then
+            warn "${_chw_label}: noresolv=1 but no server 127.0.0.42 — DNS broken"
+            _chw_ok=1
+        fi
+        if [ "${PK_DTD:-0}" -eq 1 ]; then
+            warn "Podkop: dont_touch_dhcp=1 — verify dnsmasq config manually"
+            if [ "${DM_FWD:-0}" -eq 0 ]; then
+                warn "Add 'list server 127.0.0.42' to dhcp config"
+                _chw_ok=1
+            fi
+        fi
+    fi
+
+    return "$_chw_ok"
 }
 
 # ─── Validators ───────────────────────────────────────────────────────
@@ -537,13 +922,109 @@ remove_podkop_interface() {
     uci commit podkop
 }
 
+# ─── Sing-box / Podkop DNS state detection ───────────────────────────
+#
+# Two-level cache:
+#   podkop_refresh  — heavy checks (process, ports, nft, dnsmasq).
+#                     Call once at startup and after service restarts.
+#   detect_podkop_state IFACE — lightweight per-interface UCI lookup.
+#
+# SB_RUNNING    — Sing-Box process alive
+# SB_DNS        — Sing-Box listening on 127.0.0.42:53
+# SB_TPROXY     — Sing-Box listening on 127.0.0.1:1602
+# PK_INSTALLED  — podkop UCI config exists
+# PK_ENABLED    — podkop service enabled (/etc/rc.d/S99podkop)
+# PK_NFT_ACTIVE — nftables PodkopTable exists
+# PK_DTD        — podkop dont_touch_dhcp=1
+# DM_FWD        — dnsmasq server=127.0.0.42
+# DM_NORESOLV   — dnsmasq noresolv=1
+# DM_OK         — dnsmasq fully configured (server + noresolv + cachesize=0)
+# PK_LINKED     — (per-iface) interface in podkop source_network_interfaces
+# PK_DNS_VIA_ROUTER — (per-iface) DNS equals router LAN IP
+#
+
+# Heavy checks — call once at startup and after service restarts
+podkop_refresh() {
+    SB_RUNNING=0; SB_DNS=0; SB_TPROXY=0
+    PK_INSTALLED=0; PK_ENABLED=0; PK_NFT_ACTIVE=0; PK_DTD=0
+    DM_FWD=0; DM_NORESOLV=0; DM_OK=0
+    PK_LINKED=0; PK_DNS_VIA_ROUTER=0
+
+    # Sing-Box (standalone or via podkop)
+    if pgrep -f "sing-box" >/dev/null 2>&1; then SB_RUNNING=1; fi
+
+    if [ "$SB_RUNNING" -eq 1 ]; then
+        _dpk_ports="$(netstat -ln 2>/dev/null || true)"
+        if echo "$_dpk_ports" | grep -q '127\.0\.0\.42:53'; then SB_DNS=1; fi
+        if echo "$_dpk_ports" | grep -q '127\.0\.0\.1:1602'; then SB_TPROXY=1; fi
+    fi
+
+    # dnsmasq configuration (independent of podkop)
+    _dpk_cachesize="$(uci -q get "dhcp.@dnsmasq[0].cachesize" 2>/dev/null || true)"
+    if [ "$(uci -q get "dhcp.@dnsmasq[0].noresolv" 2>/dev/null || true)" = "1" ]; then DM_NORESOLV=1; fi
+    for _dpk_srv in $(uci -q get "dhcp.@dnsmasq[0].server" 2>/dev/null || true); do
+        case "$_dpk_srv" in 127.0.0.42|127.0.0.42\#*) DM_FWD=1 ;; esac
+    done
+    if [ "$DM_FWD" -eq 1 ] && [ "$DM_NORESOLV" -eq 1 ] && [ "$_dpk_cachesize" = "0" ]; then DM_OK=1; fi
+
+    # podkop-specific
+    if podkop_present; then
+        PK_INSTALLED=1
+        if [ -x /etc/rc.d/S99podkop ] 2>/dev/null; then PK_ENABLED=1; fi
+        if nft list table inet PodkopTable >/dev/null 2>&1; then PK_NFT_ACTIVE=1; fi
+        if [ "$(uci -q get "podkop.settings.dont_touch_dhcp" 2>/dev/null || true)" = "1" ]; then PK_DTD=1; fi
+    fi
+}
+
+# Lightweight per-interface update — reads cached globals,
+# only updates PK_LINKED and PK_DNS_VIA_ROUTER.
+detect_podkop_state() {
+    _dpk_iface="${1:-}"
+    PK_LINKED=0; PK_DNS_VIA_ROUTER=0
+
+    # PK_LINKED only makes sense if podkop is installed
+    if [ "${PK_INSTALLED:-0}" -eq 1 ] && [ -n "$_dpk_iface" ]; then
+        if podkop_has_interface "$_dpk_iface" 2>/dev/null; then
+            PK_LINKED=1
+        fi
+    fi
+
+    if [ -n "$_dpk_iface" ]; then
+        _dpk_dns="$(uci -q get "network.${_dpk_iface}.dns" || true)"
+        _dpk_lan="$(detect_router_lan_ip 2>/dev/null || true)"
+        if [ -n "$_dpk_dns" ] && [ -n "$_dpk_lan" ] && [ "$_dpk_dns" = "$_dpk_lan" ]; then
+            PK_DNS_VIA_ROUTER=1
+        fi
+    fi
+}
+
+# Short description of the DNS chain for display.
+# Shows Sing-Box status if: podkop linked to this iface, OR standalone Sing-Box with dnsmasq forwarding.
+# REQUIRES: podkop_refresh done + detect_podkop_state called.
+dns_chain_label() {
+    # Show label if: podkop linked, OR Sing-Box DNS active with dnsmasq forwarding
+    if [ "${PK_LINKED:-0}" -eq 0 ] && [ "${SB_DNS:-0}" -eq 0 ]; then return; fi
+    if [ "${PK_LINKED:-0}" -eq 0 ] && [ "${DM_FWD:-0}" -eq 0 ]; then return; fi
+    if [ "${SB_RUNNING:-0}" -eq 0 ]; then
+        printf '%b' "${ERR}Sing-Box not running${NC}"
+    elif [ "${SB_DNS:-0}" -eq 0 ]; then
+        printf '%b' "${ERR}Sing-Box DNS not listening${NC}"
+    elif [ "${PK_DNS_VIA_ROUTER:-0}" -eq 1 ] && [ "$DM_FWD" -eq 1 ]; then
+        printf '%b' "${DIM2}→ Sing-Box${NC}"
+    elif [ "${PK_DNS_VIA_ROUTER:-0}" -eq 0 ]; then
+        printf '%b' "${WARN_C}bypasses Sing-Box${NC}"
+    elif [ "$DM_FWD" -eq 0 ]; then
+        printf '%b' "${WARN_C}dnsmasq not forwarding${NC}"
+    fi
+}
+
 # ─── Enumerate AWG interfaces ────────────────────────────────────────
 
 get_awg_interfaces() {
     # Only return interfaces created by Liminal
     uci show network 2>/dev/null \
-        | grep "\._is_liminal='1'" \
-        | sed "s/\._is_liminal=.*//" \
+        | grep "\._liminal_iface=" \
+        | sed "s/\._liminal_iface=.*//" \
         | sed "s/network\.//"
 }
 
@@ -1033,9 +1514,24 @@ do_rename_peer() {
     [ -z "${_new_name:-}" ] && { echo -e "${DIM2}Cancelled${NC}"; PAUSE; return 1; }
     validate_name "$_new_name" || { PAUSE; return 1; }
     [ "$_new_name" = "$_old_desc" ] && { echo -e "${DIM2}Name unchanged${NC}"; PAUSE; return 1; }
+    _dup="$(uci -q show network 2>/dev/null \
+        | grep "\.description='${_new_name}'" | head -n1 || true)"
+    [ -n "$_dup" ] && { warn "Peer '${_new_name}' already exists"; PAUSE; return 1; }
 
     uci set "network.@${_pt}[$_idx].description=$_new_name"
     uci commit network
+
+    # Update hostrecord if exists
+    _rp_hr_idx="$(find_hostrecord "$_iface" "$_old_desc" 2>/dev/null)" && {
+        _rp_ip="$(uci -q get "dhcp.@hostrecord[$_rp_hr_idx].ip" || true)"
+        _rp_fqdn="$(build_peer_fqdn "$_iface" "$_new_name")"
+        uci set "dhcp.@hostrecord[$_rp_hr_idx].name=${_rp_fqdn}"
+        uci set "dhcp.@hostrecord[$_rp_hr_idx]._liminal_peer=${_new_name}"
+        uci commit dhcp
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+        echo -e "  ${B}Updated${NC} DNS: ${W}${_rp_fqdn}${NC}"
+    }
+
     echo -e "  ${OK}Renamed:${NC} ${_old_desc} -> ${W}${_new_name}${NC}"
     PAUSE
     # Return new name via global
@@ -1141,6 +1637,8 @@ do_peer_menu() {
 
         _hs_col="$(hs_colored "${_hs:--}" "${_hs_sec}")"
 
+        detect_podkop_state "$_iface"
+
         box_top 44
         box_line "  ${_st_ico} ${W}${_desc}${NC}  ${_online}"
         box_sep 44
@@ -1154,13 +1652,94 @@ do_peer_menu() {
             if [ -n "$_tx" ]; then box_line "  ${A}Tx${NC}           ${W}${_tx}${NC}"; fi
         fi
         box_sep 44
+        _peer_dns="$(uci -q get "network.${_iface}.dns" || echo "n/a")"
+        _pdns_chain="$(dns_chain_label "$_iface")"
+        [ -n "$_pdns_chain" ] && _pdns_chain="  ${_pdns_chain}"
+        box_line "  ${A}DNS${NC}          ${W}${_peer_dns}${NC}${_pdns_chain}"
         if [ -n "$_ka" ] && [ "$_ka" != "0" ]; then
             box_line "  ${A}Keepalive${NC}    ${DIM2}every ${_ka}s${NC}"
         else
             box_line "  ${A}Keepalive${NC}    ${DIM2}off${NC}"
         fi
         box_line "  ${A}Public Key${NC}   ${DIM2}${_shortpub}${NC}"
+        _hr_fqdn="$(get_peer_hostrecord_fqdn "$_iface" "$_desc" 2>/dev/null || true)"
+        if [ -n "$_hr_fqdn" ]; then
+            box_line "  ${A}Hostname${NC}     ${W}${_hr_fqdn}${NC}"
+        else
+            box_line "  ${A}Hostname${NC}     ${DIM2}none${NC}"
+        fi
         box_bot 44
+
+        # ── Inline DNS diagnostics (PK_* already set above) ──
+        if [ -n "$_hr_fqdn" ]; then
+            _dns_warns=0
+            _router_ip="$(detect_router_lan_ip 2>/dev/null || true)"
+
+            # dnsmasq not running
+            if ! pgrep -x dnsmasq >/dev/null 2>&1; then
+                echo -e "  ${ICO_WARN} ${WARN_C}dnsmasq is not running${NC}"
+                _dns_warns=1
+            fi
+
+            # DNS mismatch (skip if podkop handles DNS via Sing-Box)
+            if [ -n "$_peer_dns" ] && [ -n "$_router_ip" ] && [ "$_peer_dns" != "$_router_ip" ]; then
+                echo -e "  ${ICO_WARN} ${WARN_C}DNS is ${_peer_dns}, not router — hostname won't resolve${NC}"
+                _dns_warns=1
+            fi
+
+            # Zone input blocks DNS
+            _peer_zone="$(find_zone_for_interface "$_iface" 2>/dev/null || true)"
+            if [ -n "$_peer_zone" ]; then
+                _pz_zi="$(find_zone_index "$_peer_zone" || true)"
+                if [ -n "$_pz_zi" ]; then
+                    _pz_input="$(uci -q get "firewall.@zone[$_pz_zi].input" || echo "DROP")"
+                    if [ "$_pz_input" != "ACCEPT" ]; then
+                        _pz_dns_ok=0; _pz_ri=0
+                        while uci -q get "firewall.@rule[$_pz_ri]" >/dev/null 2>&1; do
+                            _pz_src="$(uci -q get "firewall.@rule[$_pz_ri].src" || true)"
+                            _pz_dp="$(uci -q get "firewall.@rule[$_pz_ri].dest_port" || true)"
+                            _pz_tgt="$(uci -q get "firewall.@rule[$_pz_ri].target" || true)"
+                            [ "$_pz_src" = "$_peer_zone" ] && [ "$_pz_dp" = "53" ] && [ "$_pz_tgt" = "ACCEPT" ] && { _pz_dns_ok=1; break; }
+                            _pz_ri=$((_pz_ri + 1))
+                        done
+                        [ "$_pz_dns_ok" -eq 0 ] && {
+                            echo -e "  ${ICO_WARN} ${WARN_C}Zone '${_peer_zone}' blocks DNS (port 53)${NC}"
+                            _dns_warns=1
+                        }
+                    fi
+                fi
+            fi
+
+            # Sing-Box / Podkop diagnostics
+            _sb_label="Sing-Box"
+            if [ "${PK_INSTALLED:-0}" -eq 1 ] && [ "${PK_LINKED:-0}" -eq 1 ]; then
+                _sb_label="Podkop"
+            fi
+            # Show if: podkop linked, or standalone Sing-Box with dnsmasq forwarding
+            if { [ "${PK_LINKED:-0}" -eq 1 ]; } || { [ "${SB_DNS:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 1 ]; }; then
+                if [ "${SB_RUNNING:-0}" -eq 0 ]; then
+                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: Sing-Box is not running${NC}"
+                    _dns_warns=1
+                elif [ "${SB_DNS:-0}" -eq 0 ]; then
+                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: Sing-Box not listening on 127.0.0.42:53${NC}"
+                    _dns_warns=1
+                elif [ "${DM_FWD:-0}" -eq 0 ]; then
+                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: dnsmasq missing server 127.0.0.42${NC}"
+                    _dns_warns=1
+                elif [ "${PK_DNS_VIA_ROUTER:-0}" -eq 1 ]; then
+                    echo -e "  ${ICO_OK} ${DIM2}${_sb_label}: peer → dnsmasq → Sing-Box (hostrecords OK)${NC}"
+                fi
+                if [ "${DM_NORESOLV:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 0 ]; then
+                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: noresolv=1 but no server 127.0.0.42${NC}"
+                    _dns_warns=1
+                fi
+                if [ "${PK_DTD:-0}" -eq 1 ]; then
+                    echo -e "  ${ICO_WARN} ${WARN_C}Podkop: dont_touch_dhcp=1 — verify dnsmasq manually${NC}"
+                fi
+            fi
+
+            [ "$_dns_warns" -eq 1 ] && echo ""
+        fi
         echo ""
 
         if [ "$_peer_disabled" -eq 1 ]; then
@@ -1180,6 +1759,11 @@ do_peer_menu() {
         _cur_caip="$(uci -q get "network.@${_pt}[$_idx].client_allowed_ips" || echo "0.0.0.0/0, ::/0")"
         echo -e "  ${B}a${NC} ${DIM2}›${NC} ${W}AllowedIPs${NC}  ${DIM2}${_cur_caip}${NC}"
         echo -e "  ${B}k${NC} ${DIM2}›${NC} ${W}Keepalive${NC}   ${DIM2}${_ka}s${NC}"
+        if [ -n "$_hr_fqdn" ]; then
+            echo -e "  ${B}h${NC} ${DIM2}›${NC} ${W}Hostname${NC}    ${DIM2}${_hr_fqdn}${NC}"
+        else
+            echo -e "  ${B}h${NC} ${DIM2}›${NC} ${W}Hostname${NC}    ${DIM2}none${NC}"
+        fi
         echo ""
         echo -e "  ${DIM2}Actions${NC}"
         echo -e "  ${B}6${NC} ${DIM2}›${NC} ${W}Rename${NC} Peer"
@@ -1191,6 +1775,7 @@ do_peer_menu() {
         echo ""
 
         echo -ne "  ${A}>${NC} " && read_choice _peer_choice
+        sigint_caught && { crumb_pop; return; }
 
         case "${_peer_choice:-}" in
             1) show_peer_conf "$_iface" "$_idx" ;;
@@ -1223,6 +1808,8 @@ do_peer_menu() {
                 fi
                 PAUSE ;;
             9)  confirm "Delete peer '${_desc}'?" "n" || continue
+                sigint_caught && continue
+                remove_peer_hostrecord "$_iface" "$_desc"
                 uci delete "network.@${_pt}[$_idx]"
                 uci commit network
                 spinner_start "Restarting AWG..."
@@ -1243,10 +1830,12 @@ do_peer_menu() {
                 echo -e "  ${DIM2}Enter › Cancel${NC}"
                 echo ""
                 prompt _aip_choice "Select" "" || continue
+                sigint_caught && continue
                 [ -z "$_aip_choice" ] && { echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; continue; }
                 case "$_aip_choice" in
                     1) _new_caip="0.0.0.0/0, ::/0" ;;
                     2) prompt _new_caip "AllowedIPs" "$_cur_caip" || continue
+                       sigint_caught && continue
                        [ -z "$_new_caip" ] && { echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; continue; } ;;
                     *) continue ;;
                 esac
@@ -1261,12 +1850,89 @@ do_peer_menu() {
                 fi
                 PAUSE ;;
 
+            h) # Manage Hostname
+                echo ""
+                _cur_hr="$(get_peer_hostrecord_fqdn "$_iface" "$_desc" 2>/dev/null || true)"
+                _peer_ip_bare="${_aip%%/*}"
+                if [ -n "$_cur_hr" ]; then
+                    echo -e "  ${A}Current:${NC} ${W}${_cur_hr}${NC} → ${W}${_peer_ip_bare}${NC}"
+                    echo ""
+                    echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Change${NC} hostname"
+                    echo -e "  ${B}2${NC} ${DIM2}›${NC} ${ERR}Remove${NC} hostname"
+                    echo -e "  ${DIM2}Enter › Cancel${NC}"
+                    echo ""
+                    echo -ne "  ${A}>${NC} "; read -r _h_choice || true
+                    sigint_caught && { PAUSE; continue; }
+                    case "${_h_choice:-}" in
+                        1)  _h_domain="$(sanitize_hostname "$_iface").$(get_lan_domain)"
+                            while true; do
+                                prompt _h_new "Hostname (without .${_h_domain})" "" || break
+                                sigint_caught && break
+                                [ -z "$_h_new" ] && break
+                                _h_san="$(sanitize_hostname "$_h_new")"
+                                [ -z "$_h_san" ] && { warn "Invalid hostname"; continue; }
+                                _h_fqdn="${_h_san}.${_h_domain}"
+                                [ "$_h_fqdn" = "$_cur_hr" ] && { echo -e "  ${DIM2}No change${NC}"; break; }
+                                if hostrecord_fqdn_exists "$_h_fqdn"; then
+                                    warn "Hostname '${_h_fqdn}' already exists"
+                                    continue
+                                fi
+                                _h_idx="$(find_hostrecord "$_iface" "$_desc")"
+                                uci set "dhcp.@hostrecord[$_h_idx].name=${_h_fqdn}"
+                                uci commit dhcp
+                                /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+                                echo -e "  ${ICO_OK} ${OK}Hostname changed:${NC} ${_h_fqdn}"
+                                break
+                            done ;;
+                        2)  remove_peer_hostrecord "$_iface" "$_desc" ;;
+                    esac
+                else
+                    echo -e "  ${A}No DNS record for this peer${NC}"
+                    echo ""
+                    _h_auto="$(build_peer_fqdn "$_iface" "$_desc" 2>/dev/null || true)"
+                    _h_domain="$(sanitize_hostname "$_iface").$(get_lan_domain)"
+                    echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}${_h_auto}${NC}"
+                    echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter hostname.${_h_domain})${NC}"
+                    echo -e "  ${DIM2}Enter › Cancel${NC}"
+                    echo ""
+                    echo -ne "  ${A}>${NC} "; read -r _h_choice || true
+                    sigint_caught && { PAUSE; continue; }
+                    _h_fqdn=""
+                    case "${_h_choice:-}" in
+                        1)  _h_fqdn="$_h_auto" ;;
+                        2)  while true; do
+                                prompt _h_custom "Hostname (without .${_h_domain})" "" || break
+                                sigint_caught && break
+                                [ -z "$_h_custom" ] && break
+                                _h_san="$(sanitize_hostname "$_h_custom")"
+                                [ -z "$_h_san" ] && { warn "Invalid hostname"; continue; }
+                                _h_fqdn="${_h_san}.${_h_domain}"
+                                if hostrecord_fqdn_exists "$_h_fqdn"; then
+                                    warn "Hostname '${_h_fqdn}' already exists"
+                                    _h_fqdn=""
+                                    continue
+                                fi
+                                break
+                            done ;;
+                    esac
+                    if [ -n "$_h_fqdn" ]; then
+                        if hostrecord_fqdn_exists "$_h_fqdn"; then
+                            warn "Hostname '${_h_fqdn}' already exists"
+                        else
+                            check_hostrecord_warnings "$_iface" || true
+                            add_peer_hostrecord "$_iface" "$_desc" "$_aip" "$_h_fqdn"
+                        fi
+                    fi
+                fi
+                PAUSE ;;
+
             k) # Edit Keepalive
                 echo ""
                 _cur_ka="$(uci -q get "network.@${_pt}[$_idx].persistent_keepalive" || echo "25")"
                 echo -e "  ${A}Current:${NC} ${W}${_cur_ka}s${NC}"
                 echo -e "  ${DIM2}0 = off, 25 = recommended for NAT${NC}"
                 prompt _new_ka "Keepalive" "$_cur_ka" || continue
+                sigint_caught && continue
                 case "$_new_ka" in *[!0-9]*) warn "Must be numeric"; PAUSE; continue ;; esac
                 if [ "$_new_ka" != "$_cur_ka" ]; then
                     confirm "Change keepalive ${_cur_ka}s → ${_new_ka}s?" "y" || continue
@@ -1343,6 +2009,7 @@ do_list_peers() {
     echo -e "  ${DIM2}Enter › Back${NC}"
     echo ""
     echo -ne "  ${A}>${NC} " && read_choice _peer_sel
+    sigint_caught && return
     [ -z "${_peer_sel:-}" ] && return
 
     _sel_idx=$((_peer_sel - 1))
@@ -1570,6 +2237,45 @@ PresharedKey = $_psk"
     ifup "$_iface" >/dev/null 2>&1 || true
     echo -e "  ${ICO_OK} ${OK}Done${NC}"
 
+    # Offer DNS hostrecord
+    _hr_auto="$(build_peer_fqdn "$_iface" "$PEER_NAME" 2>/dev/null || true)"
+    if [ -n "$_hr_auto" ]; then
+        _hr_domain="$(sanitize_hostname "$_iface").$(get_lan_domain)"
+        echo ""
+        echo -e "  ${A}Local DNS record:${NC}"
+        echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}${_hr_auto}${NC}"
+        echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter hostname.${_hr_domain})${NC}"
+        echo -e "  ${DIM2}Enter › Skip${NC}"
+        echo ""
+        echo -ne "  ${A}>${NC} "; read -r _hr_choice || true
+        sigint_caught && _hr_choice=""
+        case "${_hr_choice:-}" in
+            1)  _hr_fqdn="$_hr_auto" ;;
+            2)  while true; do
+                    prompt _hr_custom "Hostname (without .${_hr_domain})" "" || { _hr_fqdn=""; break; }
+                    sigint_caught && { _hr_fqdn=""; break; }
+                    [ -z "$_hr_custom" ] && { _hr_fqdn=""; break; }
+                    _hr_san="$(sanitize_hostname "$_hr_custom")"
+                    [ -z "$_hr_san" ] && { warn "Invalid hostname"; continue; }
+                    _hr_fqdn="${_hr_san}.${_hr_domain}"
+                    if hostrecord_fqdn_exists "$_hr_fqdn"; then
+                        warn "Hostname '${_hr_fqdn}' already exists"
+                        continue
+                    fi
+                    break
+                done ;;
+            *)  _hr_fqdn="" ;;
+        esac
+        if [ -n "$_hr_fqdn" ]; then
+            if hostrecord_fqdn_exists "$_hr_fqdn"; then
+                warn "Hostname '${_hr_fqdn}' already exists — skipping"
+            else
+                check_hostrecord_warnings "$_iface" || true
+                add_peer_hostrecord "$_iface" "$PEER_NAME" "$_peer_ip" "$_hr_fqdn"
+            fi
+        fi
+    fi
+
     PAUSE
 
     # Find index of newly created peer for navigation
@@ -1667,32 +2373,43 @@ do_manage_interface() {
         fi
 
         # Podkop status
-        _podkop_str=""
-        if podkop_present; then
-            if podkop_has_interface "$_iface" 2>/dev/null; then
-                _podkop_str="${OK}Active${NC}"
-            else
-                _podkop_str="${DIM2}Not linked${NC}"
-            fi
-        fi
+        # Detect podkop state (sets PK_* globals)
+        detect_podkop_state "$_iface"
+
+        _ep_override="$(uci -q get "network.${_iface}.endpoint_host" || true)"
+        _ep_display="${_ep_override:-auto}"
+        _dns_chain="$(dns_chain_label "$_iface")"
+        if [ -n "$_dns_chain" ]; then _dns_chain="  ${_dns_chain}"; fi
 
         box_top 44
         box_line "  ${_st_ico} ${W}${_iface}${NC}  ${_st_txt}"
         box_sep 44
-        _ep_override="$(uci -q get "network.${_iface}.endpoint_host" || true)"
-        _ep_display="${_ep_override:-auto}"
         box_line "  ${A}Address${NC}      ${W}${_addr}${NC}"
         box_line "  ${A}Endpoint${NC}     ${W}${_ep_display}:${_port}${NC}"
-        box_line "  ${A}DNS${NC}          ${W}${_dns}${NC}"
         box_line "  ${A}MTU${NC}          ${W}${_mtu}${NC}"
+        box_line "  ${A}DNS${NC}          ${W}${_dns}${NC}${_dns_chain}"
         if [ -n "$_srv_pub_short" ]; then
             box_line "  ${A}Public Key${NC}   ${DIM2}${_srv_pub_short}${NC}"
         fi
         box_sep 44
         box_line "  ${A}FW Zone${NC}      ${W}${_zone}${NC}"
         box_line "  ${A}Routing${NC}      ${_fwd_lan} LAN  ${_fwd_wan} WAN"
-        if [ -n "$_podkop_str" ]; then
-            box_line "  ${A}Podkop${NC}       ${_podkop_str}"
+        if [ "${PK_INSTALLED:-0}" -eq 1 ]; then
+            if [ "$PK_LINKED" -eq 0 ]; then
+                box_line "  ${A}Podkop${NC}       ${DIM2}Not linked${NC}"
+            elif [ "$SB_RUNNING" -eq 1 ] && [ "$SB_DNS" -eq 1 ] && [ "$DM_OK" -eq 1 ]; then
+                box_line "  ${A}Podkop${NC}       ${OK}Active${NC}  ${DIM2}Sing-Box ✓  dns ✓${NC}"
+            elif [ "$SB_RUNNING" -eq 1 ] && [ "$SB_DNS" -eq 1 ]; then
+                box_line "  ${A}Podkop${NC}       ${OK}Active${NC}  ${WARN_C}dnsmasq misconfigured${NC}"
+            elif [ "$SB_RUNNING" -eq 1 ]; then
+                box_line "  ${A}Podkop${NC}       ${WARN_C}Sing-Box running, DNS not listening${NC}"
+            else
+                box_line "  ${A}Podkop${NC}       ${ERR}Linked but Sing-Box stopped${NC}"
+            fi
+        elif [ "${SB_DNS:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 1 ]; then
+            box_line "  ${A}Sing-Box${NC}     ${OK}Active${NC}  ${DIM2}dnsmasq → 127.0.0.42${NC}"
+        elif [ "${SB_RUNNING:-0}" -eq 1 ]; then
+            box_line "  ${A}Sing-Box${NC}     ${WARN_C}Running${NC}  ${DIM2}DNS not configured${NC}"
         fi
         if [ -n "$_uptime_str" ] || [ -n "$_rx_sum" ]; then
             box_sep 44
@@ -1731,7 +2448,8 @@ do_manage_interface() {
         else
             _toggle_label="${ERR}Disable${NC} Interface"
         fi
-        _is_l="$(uci -q get "network.${_iface}._is_liminal" || echo "0")"
+        _is_l="$(uci -q get "network.${_iface}._liminal_iface" || true)"
+        [ -n "$_is_l" ] && _is_l="1" || _is_l="0"
 
         # ── Inline peer list ──
         _pt="amneziawg_${_iface}"
@@ -1812,6 +2530,9 @@ do_manage_interface() {
 
         # ── Interface ──
         echo -e "  ${DIM2}Interface${NC}"
+        if [ "$_is_l" = "1" ]; then
+            echo -e "  ${B}m${NC} ${DIM2}›${NC} ${W}Rename${NC} Interface"
+        fi
         echo -e "  ${B}r${NC} ${DIM2}›${NC} ${WARN_C}Restart${NC} Interface"
         echo -e "  ${B}t${NC} ${DIM2}›${NC} ${_toggle_label}"
         if [ "$_is_l" = "1" ]; then
@@ -1822,6 +2543,7 @@ do_manage_interface() {
         echo ""
 
         echo -ne "  ${A}>${NC} " && read_choice _mgmt_choice
+        sigint_caught && { crumb_pop; crumb_pop; return; }
 
         case "${_mgmt_choice:-}" in
             +) CREATED_PEER_IDX=""; CREATED_PEER_NAME=""
@@ -1836,14 +2558,16 @@ do_manage_interface() {
                 _cur_mtu="$(uci -q get "network.${_iface}.mtu" || echo "1280")"
                 _changed=0; _mtu_changed=0; _dns_changed=0
 
-                prompt _new_dns "DNS" "$_cur_dns" || continue
-                if [ -n "$_new_dns" ] && [ "$_new_dns" != "$_cur_dns" ]; then
-                    validate_ipv4 "$_new_dns" || { PAUSE; continue; }
-                    uci set "network.${_iface}.dns=$_new_dns"
-                    _changed=1; _dns_changed=1
+                _new_dns=""
+                if select_dns _new_dns "$_cur_dns"; then
+                    if [ -n "$_new_dns" ] && [ "$_new_dns" != "$_cur_dns" ]; then
+                        uci set "network.${_iface}.dns=$_new_dns"
+                        _changed=1; _dns_changed=1
+                    fi
                 fi
 
                 prompt _new_mtu "MTU" "$_cur_mtu" || continue
+                sigint_caught && continue
                 if [ -n "$_new_mtu" ] && [ "$_new_mtu" != "$_cur_mtu" ]; then
                     case "$_new_mtu" in *[!0-9]*) warn "MTU must be numeric"; PAUSE; continue ;; esac
                     uci set "network.${_iface}.mtu=$_new_mtu"
@@ -1875,6 +2599,7 @@ do_manage_interface() {
                 echo -e "  ${WARN_C}with the new port after this change.${NC}"
                 echo ""
                 prompt _new_port "New port" "$_cur_port" || continue
+                sigint_caught && continue
                 [ "$_new_port" = "$_cur_port" ] && { echo -e "  ${DIM2}No change${NC}"; PAUSE; continue; }
                 validate_port "$_new_port" || { PAUSE; continue; }
                 port_in_use "$_new_port" && { warn "Port $_new_port is already in use"; PAUSE; continue; }
@@ -1886,9 +2611,8 @@ do_manage_interface() {
                 # Update firewall rule if exists
                 _ri=0
                 while uci -q get "firewall.@rule[$_ri]" >/dev/null 2>&1; do
-                    _rl="$(uci -q get "firewall.@rule[$_ri]._is_liminal" || echo "0")"
-                    _rport="$(uci -q get "firewall.@rule[$_ri].dest_port" || true)"
-                    if [ "$_rl" = "1" ] && [ "$_rport" = "$_cur_port" ]; then
+                    _rl="$(uci -q get "firewall.@rule[$_ri]._liminal_iface" || true)"
+                    if [ "$_rl" = "$_iface" ]; then
                         uci set "firewall.@rule[$_ri].dest_port=$_new_port"
                         echo -e "  ${B}Updated${NC} FW rule port"
                     fi
@@ -1920,6 +2644,7 @@ do_manage_interface() {
                 echo -e "  ${DIM2}Leave empty to reset to auto-detect.${NC}"
                 echo ""
                 prompt _new_ep "Endpoint host (empty = cancel)" "" || continue
+                sigint_caught && continue
                 if [ -z "$_new_ep" ]; then
                     if [ -n "$_cur_ep" ]; then
                         confirm "Reset to auto-detect?" "n" || continue
@@ -1947,8 +2672,8 @@ do_manage_interface() {
                     while uci -q get "firewall.@forwarding[$_fi]" >/dev/null 2>&1; do
                         _fsrc="$(uci -q get "firewall.@forwarding[$_fi].src" || true)"
                         _fdst="$(uci -q get "firewall.@forwarding[$_fi].dest" || true)"
-                        _fl="$(uci -q get "firewall.@forwarding[$_fi]._is_liminal" || echo "0")"
-                        if [ "$_fl" = "1" ] && [ "$_fsrc" = "$_zone" ] && [ "$_fdst" = "lan" ]; then
+                        _fl="$(uci -q get "firewall.@forwarding[$_fi]._liminal_iface" || true)"
+                        if [ "$_fl" = "$_iface" ] && [ "$_fsrc" = "$_zone" ] && [ "$_fdst" = "lan" ]; then
                             uci delete "firewall.@forwarding[$_fi]"
                             break
                         fi
@@ -1965,7 +2690,7 @@ do_manage_interface() {
                         | sed -n 's/^firewall\.@forwarding\[\([0-9]\+\)\]=forwarding$/\1/p' | tail -n1)"
                     uci set "firewall.@forwarding[$_fwd_idx].src=${_zone}"
                     uci set "firewall.@forwarding[$_fwd_idx].dest=lan"
-                    uci set "firewall.@forwarding[$_fwd_idx]._is_liminal=1"
+                    uci set "firewall.@forwarding[$_fwd_idx]._liminal_iface=${_iface}"
                     uci commit firewall
                     echo -e "  ${B}Restarting${NC} firewall..."
                     /etc/init.d/firewall restart >/dev/null 2>&1 || true
@@ -1979,8 +2704,8 @@ do_manage_interface() {
                     while uci -q get "firewall.@forwarding[$_fi]" >/dev/null 2>&1; do
                         _fsrc="$(uci -q get "firewall.@forwarding[$_fi].src" || true)"
                         _fdst="$(uci -q get "firewall.@forwarding[$_fi].dest" || true)"
-                        _fl="$(uci -q get "firewall.@forwarding[$_fi]._is_liminal" || echo "0")"
-                        if [ "$_fl" = "1" ] && [ "$_fsrc" = "$_zone" ] && [ "$_fdst" = "wan" ]; then
+                        _fl="$(uci -q get "firewall.@forwarding[$_fi]._liminal_iface" || true)"
+                        if [ "$_fl" = "$_iface" ] && [ "$_fsrc" = "$_zone" ] && [ "$_fdst" = "wan" ]; then
                             uci delete "firewall.@forwarding[$_fi]"
                             break
                         fi
@@ -1996,7 +2721,7 @@ do_manage_interface() {
                         | sed -n 's/^firewall\.@forwarding\[\([0-9]\+\)\]=forwarding$/\1/p' | tail -n1)"
                     uci set "firewall.@forwarding[$_fwd_idx].src=${_zone}"
                     uci set "firewall.@forwarding[$_fwd_idx].dest=wan"
-                    uci set "firewall.@forwarding[$_fwd_idx]._is_liminal=1"
+                    uci set "firewall.@forwarding[$_fwd_idx]._liminal_iface=${_iface}"
                     uci commit firewall
                     ensure_wan_masq
                     echo -e "  ${B}Restarting${NC} firewall..."
@@ -2018,6 +2743,7 @@ do_manage_interface() {
                         [ -x /etc/init.d/podkop ] && /etc/init.d/podkop restart >/dev/null 2>&1 || true
                         echo -e "  ${ICO_OK} ${OK}Podkop linked${NC}"
                     fi
+                    podkop_refresh
                     PAUSE
                 fi ;;
 
@@ -2066,6 +2792,14 @@ do_manage_interface() {
                     echo -e "  ${ICO_OK} ${OK}Interface disabled${NC}"
                 fi
                 PAUSE ;;
+            m|M) if [ "$_is_l" = "1" ]; then
+                    RENAMED_IFACE=""
+                    do_rename_interface "$_iface" && [ -n "$RENAMED_IFACE" ] && {
+                        _iface="$RENAMED_IFACE"
+                        crumb_pop; crumb_pop
+                        crumb_push "Interfaces"; crumb_push "$_iface"
+                    }
+                fi ;;
             d|D) if [ "$_is_l" = "1" ]; then do_delete_interface "$_iface" && { crumb_pop; crumb_pop; return; }; fi ;;
             "") crumb_pop; crumb_pop; return ;;
             *)  # Numeric = peer selection
@@ -2087,8 +2821,8 @@ do_list() {
     # Find non-liminal interfaces
     _other=""
     for iface in $_all; do
-        _is_l="$(uci -q get "network.${iface}._is_liminal" || echo "0")"
-        [ "$_is_l" = "1" ] || _other="${_other} ${iface}"
+        _is_l="$(uci -q get "network.${iface}._liminal_iface" || true)"
+        [ -n "$_is_l" ] || _other="${_other} ${iface}"
     done
     _other="${_other# }"
 
@@ -2175,6 +2909,178 @@ do_list() {
 }
 
 # ═════════════════════════════════════════════════════════════════════
+#  RENAME INTERFACE (called from inside interface management)
+# ═════════════════════════════════════════════════════════════════════
+
+do_rename_interface() {
+    _old="$1"
+    echo ""
+    echo -e "  ${A}Current name:${NC} ${W}${_old}${NC}"
+    echo -e "  ${DIM2}(Ctrl+C = cancel)${NC}"
+    echo ""
+
+    # ── Prompt for new name ──
+    while true; do
+        prompt _new "New interface name" "" || return 1
+        sigint_caught && return 1
+        [ -z "$_new" ] && { echo -e "  ${DIM2}Cancelled${NC}"; return 1; }
+        [ "$_new" = "$_old" ] && { warn "Same as current name"; continue; }
+        validate_ifname "$_new" || continue
+        uci_network_exists "$_new"     && { warn "Interface '$_new' already exists"; continue; }
+        interface_device_exists "$_new" && { warn "Device '$_new' already exists"; continue; }
+        break
+    done
+
+    _old_zone="$(find_zone_for_interface "$_old" 2>/dev/null || true)"
+    _old_port="$(uci -q get "network.${_old}.listen_port" || true)"
+    _has_podkop=0
+    podkop_present && podkop_has_interface "$_old" 2>/dev/null && _has_podkop=1
+
+    # ── Generate new zone & rule names ──
+    _new_zone="$(generate_zone_name "$_new")"
+    _new_rule="Allow-AWG-${_new}"
+    rule_exists_by_name "$_new_rule" && _new_rule="$(generate_rule_name "$_new")"
+
+    # ── Summary ──
+    echo ""
+    echo -e "  ${A}Will be renamed:${NC}"
+    echo -e "  ${B}•${NC} Interface        ${W}${_old}${NC} → ${OK}${_new}${NC}"
+    echo -e "  ${B}•${NC} Peer sections    ${W}amneziawg_${_old}${NC} → ${OK}amneziawg_${_new}${NC}"
+    if [ -n "$_old_zone" ]; then
+        echo -e "  ${B}•${NC} FW Zone          ${W}${_old_zone}${NC} → ${OK}${_new_zone}${NC}"
+        echo -e "  ${B}•${NC} FW Forwardings   src=${W}${_old_zone}${NC} → src=${OK}${_new_zone}${NC}"
+    fi
+    if [ -n "$_old_port" ]; then
+        echo -e "  ${B}•${NC} FW Rule          ${W}Allow-AWG-${_old}${NC} → ${OK}${_new_rule}${NC}"
+    fi
+    if [ "$_has_podkop" -eq 1 ]; then
+        echo -e "  ${B}•${NC} Podkop           ${W}${_old}${NC} → ${OK}${_new}${NC}"
+    fi
+    echo ""
+
+    confirm "Proceed with rename?" "n" || { echo -e "  ${DIM2}Cancelled${NC}"; return 1; }
+
+    init_backup "Pre-Interface Rename"
+
+    spinner_start "Stopping ${_old}..."
+    ifdown "$_old" >/dev/null 2>&1 || true
+    spinner_stop
+
+    # ── 1. Copy network interface ──
+    echo -e "  ${B}Creating${NC} new interface ${W}${_new}${NC}"
+    uci set "network.${_new}=interface"
+    # Copy all known fields from old to new
+    for _field in proto private_key listen_port mtu dns endpoint_host disabled; do
+        _val="$(uci -q get "network.${_old}.${_field}" || true)"
+        [ -n "$_val" ] && uci set "network.${_new}.${_field}=${_val}"
+    done
+    uci set "network.${_new}._liminal_iface=${_new}"
+    # Copy list fields (addresses)
+    for _addr_val in $(uci -q get "network.${_old}.addresses" 2>/dev/null || true); do
+        uci add_list "network.${_new}.addresses=${_addr_val}"
+    done
+
+    # ── 2. Copy all peers ──
+    _old_pt="amneziawg_${_old}"
+    _new_pt="amneziawg_${_new}"
+    _pi=0
+    while uci -q get "network.@${_old_pt}[$_pi]" >/dev/null 2>&1; do
+        _sec="$(uci add network "$_new_pt")"
+        for _pf in public_key private_key preshared_key route_allowed_ips allowed_ips \
+                   persistent_keepalive description disabled client_allowed_ips endpoint_host; do
+            _pv="$(uci -q get "network.@${_old_pt}[$_pi].${_pf}" || true)"
+            [ -n "$_pv" ] && uci set "network.${_sec}.${_pf}=${_pv}"
+        done
+        _pi=$((_pi + 1))
+    done
+    echo -e "  ${B}Copied${NC} ${_pi} peer(s)"
+
+    # ── 3. Delete old peers & interface ──
+    while uci -q get "network.@${_old_pt}[0]" >/dev/null 2>&1; do
+        uci delete "network.@${_old_pt}[0]"
+    done
+    uci delete "network.${_old}"
+
+    # ── 4. Rename firewall zone ──
+    if [ -n "$_old_zone" ]; then
+        _zi="$(find_zone_index "$_old_zone" || true)"
+        if [ -n "$_zi" ]; then
+            _zl="$(uci -q get "firewall.@zone[$_zi]._liminal_iface" || true)"
+            if [ "$_zl" = "$_old" ]; then
+                echo -e "  ${B}Renaming${NC} FW zone ${W}${_old_zone}${NC} → ${OK}${_new_zone}${NC}"
+                uci set "firewall.@zone[$_zi].name=${_new_zone}"
+                uci del_list "firewall.@zone[$_zi].network=${_old}" 2>/dev/null || true
+                uci add_list "firewall.@zone[$_zi].network=${_new}"
+                uci set "firewall.@zone[$_zi]._liminal_iface=${_new}"
+            else
+                # Non-liminal zone: just update network list
+                uci del_list "firewall.@zone[$_zi].network=${_old}" 2>/dev/null || true
+                uci add_list "firewall.@zone[$_zi].network=${_new}"
+            fi
+        fi
+    fi
+
+    # ── 5. Update forwardings ──
+    _fi=0
+    while uci -q get "firewall.@forwarding[$_fi]" >/dev/null 2>&1; do
+        _fl="$(uci -q get "firewall.@forwarding[$_fi]._liminal_iface" || true)"
+        if [ "$_fl" = "$_old" ]; then
+            _fsrc="$(uci -q get "firewall.@forwarding[$_fi].src" || true)"
+            _fdst="$(uci -q get "firewall.@forwarding[$_fi].dest" || true)"
+            # Update zone references in src/dest
+            [ "$_fsrc" = "$_old_zone" ] && uci set "firewall.@forwarding[$_fi].src=${_new_zone}"
+            [ "$_fdst" = "$_old_zone" ] && uci set "firewall.@forwarding[$_fi].dest=${_new_zone}"
+            uci set "firewall.@forwarding[$_fi]._liminal_iface=${_new}"
+            echo -e "  ${B}Updated${NC} forwarding: ${OK}${_new_zone}${NC} → ${W}${_fdst}${NC}"
+        fi
+        _fi=$((_fi + 1))
+    done
+
+    # ── 6. Rename firewall rule ──
+    _ri=0
+    while uci -q get "firewall.@rule[$_ri]" >/dev/null 2>&1; do
+        _rl="$(uci -q get "firewall.@rule[$_ri]._liminal_iface" || true)"
+        if [ "$_rl" = "$_old" ]; then
+            _rname="$(uci -q get "firewall.@rule[$_ri].name" || true)"
+            echo -e "  ${B}Renaming${NC} FW rule ${W}${_rname}${NC} → ${OK}${_new_rule}${NC}"
+            uci set "firewall.@rule[$_ri].name=${_new_rule}"
+            uci set "firewall.@rule[$_ri]._liminal_iface=${_new}"
+        fi
+        _ri=$((_ri + 1))
+    done
+
+    # ── 7. Update DNS hostrecords ──
+    rename_iface_hostrecords "$_old" "$_new"
+
+    # ── 8. Update Podkop ──
+    if [ "$_has_podkop" -eq 1 ]; then
+        echo -e "  ${B}Updating${NC} Podkop: ${W}${_old}${NC} → ${OK}${_new}${NC}"
+        uci del_list podkop.settings.source_network_interfaces="$_old" 2>/dev/null || true
+        uci add_list podkop.settings.source_network_interfaces="$_new"
+        uci commit podkop
+    fi
+
+    # ── 9. Commit & reload ──
+    echo -e "  ${B}Committing${NC} config..."
+    uci commit network
+    uci commit firewall
+
+    echo -e "  ${B}Reloading${NC} network & firewall..."
+    /etc/init.d/network reload
+    /etc/init.d/firewall restart 2>/dev/null
+    if podkop_present && [ -x /etc/init.d/podkop ] && [ "$_has_podkop" -eq 1 ]; then
+        echo -e "  ${B}Restarting${NC} Podkop..."
+        /etc/init.d/podkop restart >/dev/null 2>&1 || true
+    fi
+
+    echo -e "\n  ${OK}Interface renamed: ${_old} → ${_new}${NC}"
+    PAUSE
+    # Return new name via global variable
+    RENAMED_IFACE="$_new"
+    return 0
+}
+
+# ═════════════════════════════════════════════════════════════════════
 #  DELETE INTERFACE (called from inside interface management)
 # ═════════════════════════════════════════════════════════════════════
 
@@ -2195,11 +3101,23 @@ do_delete_interface() {
     if podkop_present && podkop_has_interface "$DEL_IFACE" 2>/dev/null; then
         echo -e "  ${ERR}-${NC} Podkop           ${W}$DEL_IFACE${NC}"
     fi
+    # Count DNS hostrecords
+    _del_hr=0; _del_hi=0
+    while uci -q get "dhcp.@hostrecord[$_del_hi]" >/dev/null 2>&1; do
+        _del_hli="$(uci -q get "dhcp.@hostrecord[$_del_hi]._liminal_iface" || true)"
+        [ "$_del_hli" = "$DEL_IFACE" ] && _del_hr=$((_del_hr + 1))
+        _del_hi=$((_del_hi + 1))
+    done
+    [ "$_del_hr" -gt 0 ] && \
+    echo -e "  ${ERR}-${NC} DNS records      ${W}${_del_hr}${NC} hostrecord(s)"
     echo ""
 
     confirm "Proceed with deletion?" "n" || return 1
 
     init_backup "Pre-Interface Delete"
+
+    # ── Delete DNS hostrecords ──
+    remove_iface_hostrecords "$DEL_IFACE"
 
     # ── Delete peers ──
     while uci -q get "network.@amneziawg_${DEL_IFACE}[0]" >/dev/null 2>&1; do
@@ -2210,53 +3128,50 @@ do_delete_interface() {
     echo -e "  ${B}Removing${NC} interface ${W}$DEL_IFACE${NC}"
     uci delete "network.${DEL_IFACE}"
 
-    # ── Delete forwardings (reverse order, only _is_liminal) ──
-    if [ -n "$DEL_ZONE" ]; then
-        _cnt=0
-        while uci -q get "firewall.@forwarding[$_cnt]" >/dev/null 2>&1; do
-            _cnt=$((_cnt + 1))
-        done
-        _fi=$((_cnt - 1))
-        while [ "$_fi" -ge 0 ]; do
-            _fl="$(uci -q get "firewall.@forwarding[$_fi]._is_liminal" || echo "0")"
+    # ── Delete forwardings (reverse order, by _liminal_iface) ──
+    _cnt=0
+    while uci -q get "firewall.@forwarding[$_cnt]" >/dev/null 2>&1; do
+        _cnt=$((_cnt + 1))
+    done
+    _fi=$((_cnt - 1))
+    while [ "$_fi" -ge 0 ]; do
+        _fl="$(uci -q get "firewall.@forwarding[$_fi]._liminal_iface" || true)"
+        if [ "$_fl" = "$DEL_IFACE" ]; then
             _fsrc="$(uci -q get "firewall.@forwarding[$_fi].src"  || true)"
             _fdst="$(uci -q get "firewall.@forwarding[$_fi].dest" || true)"
-            if [ "$_fl" = "1" ] && { [ "$_fsrc" = "$DEL_ZONE" ] || [ "$_fdst" = "$DEL_ZONE" ]; }; then
-                echo -e "  ${B}Removing${NC} forwarding: ${_fsrc} -> ${_fdst}"
-                uci delete "firewall.@forwarding[$_fi]"
-            fi
-            _fi=$((_fi - 1))
-        done
+            echo -e "  ${B}Removing${NC} forwarding: ${_fsrc} -> ${_fdst}"
+            uci delete "firewall.@forwarding[$_fi]"
+        fi
+        _fi=$((_fi - 1))
+    done
 
-        # Delete zone only if _is_liminal
+    # Delete zone by _liminal_iface
+    if [ -n "$DEL_ZONE" ]; then
         _zi="$(find_zone_index "$DEL_ZONE" || true)"
         if [ -n "$_zi" ]; then
-            _zl="$(uci -q get "firewall.@zone[$_zi]._is_liminal" || echo "0")"
-            if [ "$_zl" = "1" ]; then
+            _zl="$(uci -q get "firewall.@zone[$_zi]._liminal_iface" || true)"
+            if [ "$_zl" = "$DEL_IFACE" ]; then
                 echo -e "  ${B}Removing${NC} FW zone ${W}$DEL_ZONE${NC}"
                 uci delete "firewall.@zone[$_zi]"
             fi
         fi
     fi
 
-    # ── Delete firewall rules (reverse order, only _is_liminal) ──
-    if [ -n "$DEL_PORT" ]; then
-        _cnt=0
-        while uci -q get "firewall.@rule[$_cnt]" >/dev/null 2>&1; do
-            _cnt=$((_cnt + 1))
-        done
-        _ri=$((_cnt - 1))
-        while [ "$_ri" -ge 0 ]; do
-            _rl="$(uci -q get "firewall.@rule[$_ri]._is_liminal" || echo "0")"
-            _rport="$(uci -q get "firewall.@rule[$_ri].dest_port" || true)"
-            if [ "$_rl" = "1" ] && [ "$_rport" = "$DEL_PORT" ]; then
-                _rname="$(uci -q get "firewall.@rule[$_ri].name" || echo "unnamed")"
-                echo -e "  ${B}Removing${NC} FW rule ${W}${_rname}${NC} (port ${DEL_PORT})"
-                uci delete "firewall.@rule[$_ri]"
-            fi
-            _ri=$((_ri - 1))
-        done
-    fi
+    # ── Delete firewall rules (reverse order, by _liminal_iface) ──
+    _cnt=0
+    while uci -q get "firewall.@rule[$_cnt]" >/dev/null 2>&1; do
+        _cnt=$((_cnt + 1))
+    done
+    _ri=$((_cnt - 1))
+    while [ "$_ri" -ge 0 ]; do
+        _rl="$(uci -q get "firewall.@rule[$_ri]._liminal_iface" || true)"
+        if [ "$_rl" = "$DEL_IFACE" ]; then
+            _rname="$(uci -q get "firewall.@rule[$_ri].name" || echo "unnamed")"
+            echo -e "  ${B}Removing${NC} FW rule ${W}${_rname}${NC}"
+            uci delete "firewall.@rule[$_ri]"
+        fi
+        _ri=$((_ri - 1))
+    done
 
     # ── Remove from Podkop ──
     if podkop_present && podkop_has_interface "$DEL_IFACE" 2>/dev/null; then
@@ -2317,7 +3232,28 @@ do_create() {
         prompt IFADDR "Interface address with CIDR (e.g. 10.10.10.1/24)" "" || { trap_restore; return; }
         is_cancelled && { trap_restore; return; }
         [ -z "$IFADDR" ] && { warn "Required field"; continue; }
-        validate_cidr_ipv4 "$IFADDR" && break
+        validate_cidr_ipv4 "$IFADDR" || continue
+        # Check for address/subnet overlap with all network interfaces
+        _addr_conflict=""
+        _new_subnet="$(network_base_from_cidr "$IFADDR")"
+        _new_ip="${IFADDR%/*}"
+        _all_ifaces="$(uci show network 2>/dev/null \
+            | sed -n "s/^network\.\([^.]*\)\.addresses=.*/\1/p" \
+            | sort -u)"
+        for _eif in $_all_ifaces; do
+            for _ev in $(uci -q get "network.${_eif}.addresses" 2>/dev/null); do
+                case "$_ev" in */*) ;; *) continue ;; esac
+                _esubnet="$(network_base_from_cidr "$_ev")"
+                if [ "$_esubnet" = "$_new_subnet" ] || cidr_contains_ip "$_ev" "$_new_ip"; then
+                    _addr_conflict="$_eif"; break 2
+                fi
+            done
+        done
+        if [ -n "$_addr_conflict" ]; then
+            warn "Address ${IFADDR} overlaps with interface '${_addr_conflict}'"
+            continue
+        fi
+        break
     done
     IF_IP="${IFADDR%/*}"
     IF_SUBNET="$(network_base_from_cidr "$IFADDR")"
@@ -2438,18 +3374,29 @@ do_create() {
     USE_PODKOP="0"; DNS_IP=""
     if podkop_present; then
         echo -e "  ${OK}Podkop found${NC}"
+        if [ "$SB_RUNNING" -eq 1 ] && [ "$SB_DNS" -eq 1 ]; then
+            echo -e "  ${DIM2}Sing-Box listening on 127.0.0.42:53${NC}"
+            if [ "$DM_FWD" -eq 1 ]; then
+                echo -e "  ${DIM2}DNS chain: peer → dnsmasq → Sing-Box → internet${NC}"
+            else
+                echo -e "  ${WARN_C}dnsmasq is not forwarding to Sing-Box (missing server 127.0.0.42)${NC}"
+            fi
+        elif [ "$SB_RUNNING" -eq 0 ]; then
+            echo -e "  ${WARN_C}Sing-Box is not running${NC}"
+        fi
         if confirm "Configure Podkop-aware routing?" "y"; then
             USE_PODKOP="1"
             DNS_IP="$ROUTER_LAN_IP"
-            echo -e "  Client DNS set to LAN IP: ${OK}$DNS_IP${NC}"
+            if [ "$SB_DNS" -eq 1 ] && [ "$DM_FWD" -eq 1 ]; then
+                echo -e "  ${OK}Client DNS:${NC} ${W}$DNS_IP${NC} ${DIM2}→ dnsmasq → Sing-Box${NC}"
+            else
+                echo -e "  ${OK}Client DNS:${NC} ${W}$DNS_IP${NC} ${DIM2}(router LAN)${NC}"
+            fi
         fi
     fi
     if [ "$USE_PODKOP" != "1" ]; then
         while true; do
-            prompt DNS_IP "Client DNS server (IPv4)" "" || { trap_restore; return; }
-            is_cancelled && { trap_restore; return; }
-            [ -z "$DNS_IP" ] && { warn "Required field"; continue; }
-            validate_ipv4 "$DNS_IP" && break
+            select_dns DNS_IP && [ -n "$DNS_IP" ] && break
         done
     fi
 
@@ -2488,7 +3435,7 @@ do_create() {
     echo -e "  ${B}Creating${NC} interface..."
     uci set "network.${IFNAME}=interface"
     uci set "network.${IFNAME}.proto=amneziawg"
-    uci set "network.${IFNAME}._is_liminal=1"
+    uci set "network.${IFNAME}._liminal_iface=${IFNAME}"
     uci set "network.${IFNAME}.private_key=${SERVER_PRIVKEY}"
     uci set "network.${IFNAME}.listen_port=${PORT}"
     uci add_list "network.${IFNAME}.addresses=${IFADDR}"
@@ -2505,7 +3452,7 @@ do_create() {
     uci set "firewall.@zone[$ZONE_IDX].output=ACCEPT"
     uci set "firewall.@zone[$ZONE_IDX].forward=ACCEPT"
     uci add_list "firewall.@zone[$ZONE_IDX].network=${IFNAME}"
-    uci set "firewall.@zone[$ZONE_IDX]._is_liminal=1"
+    uci set "firewall.@zone[$ZONE_IDX]._liminal_iface=${IFNAME}"
 
     # ── Apply: forwardings ──
     if [ "$ALLOW_LAN_FORWARD" = "1" ] && ! forwarding_exists "$ZONE_NAME" "$LAN_ZONE"; then
@@ -2515,7 +3462,7 @@ do_create() {
             | sed -n 's/^firewall\.@forwarding\[\([0-9]\+\)\]=forwarding$/\1/p' | tail -n1)"
         uci set "firewall.@forwarding[$FWD_IDX].src=${ZONE_NAME}"
         uci set "firewall.@forwarding[$FWD_IDX].dest=${LAN_ZONE}"
-        uci set "firewall.@forwarding[$FWD_IDX]._is_liminal=1"
+        uci set "firewall.@forwarding[$FWD_IDX]._liminal_iface=${IFNAME}"
     fi
 
     if [ "$ALLOW_WAN_FORWARD" = "1" ]; then
@@ -2526,7 +3473,7 @@ do_create() {
                 | sed -n 's/^firewall\.@forwarding\[\([0-9]\+\)\]=forwarding$/\1/p' | tail -n1)"
             uci set "firewall.@forwarding[$FWD_IDX].src=${ZONE_NAME}"
             uci set "firewall.@forwarding[$FWD_IDX].dest=${WAN_ZONE}"
-            uci set "firewall.@forwarding[$FWD_IDX]._is_liminal=1"
+            uci set "firewall.@forwarding[$FWD_IDX]._liminal_iface=${IFNAME}"
         fi
         ensure_wan_masq
     fi
@@ -2542,7 +3489,7 @@ do_create() {
         uci set "firewall.@rule[$RULE_IDX].proto=udp"
         uci set "firewall.@rule[$RULE_IDX].dest_port=${PORT}"
         uci set "firewall.@rule[$RULE_IDX].target=ACCEPT"
-        uci set "firewall.@rule[$RULE_IDX]._is_liminal=1"
+        uci set "firewall.@rule[$RULE_IDX]._liminal_iface=${IFNAME}"
     else
         warn "Rule '$INCOMING_RULE_NAME' already exists — skipping"
     fi
@@ -2776,6 +3723,9 @@ do_full_reset() {
         _port="$(uci -q get "network.${iface}.listen_port" || true)"
         _zone="$(find_zone_for_interface "$iface" 2>/dev/null || true)"
 
+        # Delete DNS hostrecords
+        remove_iface_hostrecords "$iface"
+
         # Delete peers
         while uci -q get "network.@amneziawg_${iface}[0]" >/dev/null 2>&1; do
             uci delete "network.@amneziawg_${iface}[0]"
@@ -2785,45 +3735,38 @@ do_full_reset() {
         echo -e "  ${B}Removing${NC} ${W}${iface}${NC}..."
         uci delete "network.${iface}" 2>/dev/null || true
 
-        # Delete forwardings (reverse order, only _is_liminal)
-        if [ -n "$_zone" ]; then
-            _cnt=0
-            while uci -q get "firewall.@forwarding[$_cnt]" >/dev/null 2>&1; do
-                _cnt=$((_cnt + 1))
-            done
-            _fi=$((_cnt - 1))
-            while [ "$_fi" -ge 0 ]; do
-                _fl="$(uci -q get "firewall.@forwarding[$_fi]._is_liminal" || echo "0")"
-                _fsrc="$(uci -q get "firewall.@forwarding[$_fi].src"  || true)"
-                _fdst="$(uci -q get "firewall.@forwarding[$_fi].dest" || true)"
-                if [ "$_fl" = "1" ] && { [ "$_fsrc" = "$_zone" ] || [ "$_fdst" = "$_zone" ]; }; then
-                    uci delete "firewall.@forwarding[$_fi]"
-                fi
-                _fi=$((_fi - 1))
-            done
+        # Delete forwardings (reverse order, by _liminal_iface)
+        _cnt=0
+        while uci -q get "firewall.@forwarding[$_cnt]" >/dev/null 2>&1; do
+            _cnt=$((_cnt + 1))
+        done
+        _fi=$((_cnt - 1))
+        while [ "$_fi" -ge 0 ]; do
+            _fl="$(uci -q get "firewall.@forwarding[$_fi]._liminal_iface" || true)"
+            [ "$_fl" = "$iface" ] && uci delete "firewall.@forwarding[$_fi]"
+            _fi=$((_fi - 1))
+        done
 
-            # Delete zone only if _is_liminal
+        # Delete zone by _liminal_iface
+        if [ -n "$_zone" ]; then
             _zi="$(find_zone_index "$_zone" || true)"
             if [ -n "$_zi" ]; then
-                _zl="$(uci -q get "firewall.@zone[$_zi]._is_liminal" || echo "0")"
-                [ "$_zl" = "1" ] && uci delete "firewall.@zone[$_zi]"
+                _zl="$(uci -q get "firewall.@zone[$_zi]._liminal_iface" || true)"
+                [ "$_zl" = "$iface" ] && uci delete "firewall.@zone[$_zi]"
             fi
         fi
 
-        # Delete firewall rules (reverse order, only _is_liminal)
-        if [ -n "$_port" ]; then
-            _cnt=0
-            while uci -q get "firewall.@rule[$_cnt]" >/dev/null 2>&1; do
-                _cnt=$((_cnt + 1))
-            done
-            _ri=$((_cnt - 1))
-            while [ "$_ri" -ge 0 ]; do
-                _rl="$(uci -q get "firewall.@rule[$_ri]._is_liminal" || echo "0")"
-                _rport="$(uci -q get "firewall.@rule[$_ri].dest_port" || true)"
-                [ "$_rl" = "1" ] && [ "$_rport" = "$_port" ] && uci delete "firewall.@rule[$_ri]"
-                _ri=$((_ri - 1))
-            done
-        fi
+        # Delete firewall rules (reverse order, by _liminal_iface)
+        _cnt=0
+        while uci -q get "firewall.@rule[$_cnt]" >/dev/null 2>&1; do
+            _cnt=$((_cnt + 1))
+        done
+        _ri=$((_cnt - 1))
+        while [ "$_ri" -ge 0 ]; do
+            _rl="$(uci -q get "firewall.@rule[$_ri]._liminal_iface" || true)"
+            [ "$_rl" = "$iface" ] && uci delete "firewall.@rule[$_ri]"
+            _ri=$((_ri - 1))
+        done
 
         # Remove from Podkop
         if podkop_present && podkop_has_interface "$iface" 2>/dev/null; then
@@ -3025,7 +3968,7 @@ do_import_config() {
         echo -e "  ${B}Creating${NC} interface ${W}${_iname}${NC}..."
         uci set "network.${_iname}=interface"
         uci set "network.${_iname}.proto=amneziawg"
-        uci set "network.${_iname}._is_liminal=1"
+        uci set "network.${_iname}._liminal_iface=${_iname}"
         uci set "network.${_iname}.private_key=${_iprivkey}"
         uci set "network.${_iname}.listen_port=${_iport}"
         uci add_list "network.${_iname}.addresses=${_iaddr}"
@@ -3394,7 +4337,8 @@ show_menu() {
 
             # Non-liminal AWG interfaces
             for iface in $_all_awg; do
-                _is_l="$(uci -q get "network.${iface}._is_liminal" || echo "0")"
+                _is_l="$(uci -q get "network.${iface}._liminal_iface" || true)"
+                [ -n "$_is_l" ] && _is_l="1" || _is_l="0"
                 [ "$_is_l" = "1" ] && continue
                 _iface_n=$((_iface_n + 1))
                 _iface_list="${_iface_list} ${iface}"
@@ -3468,6 +4412,12 @@ show_menu() {
         echo ""
 
         echo -ne "  ${A}>${NC} " && read_choice MENU_CHOICE
+        if sigint_caught; then
+            echo -e "  ${DIM2}Press Ctrl+C again to exit${NC}"
+            read -r _confirm_exit || true
+            sigint_caught && exit 0
+            continue
+        fi
 
         case "${MENU_CHOICE:-}" in
             +) if [ "$_has_awg" -eq 1 ]; then do_create; else warn "Install AmneziaWG first"; fi ;;
@@ -3752,6 +4702,7 @@ handle_cli() {
     exit 0
 }
 
+
 # ═══ Entry point ═════════════════════════════════════════════════════
 
 # CLI mode: if arguments given, handle non-interactively
@@ -3762,4 +4713,5 @@ fi
 
 ensure_required_tools
 ensure_base_firewall
+podkop_refresh
 show_menu
