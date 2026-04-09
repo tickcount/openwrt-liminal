@@ -9,7 +9,7 @@ set -eu
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 BACKUP_DIR=""
-LIMINAL_VERSION="1.1"
+LIMINAL_VERSION="1.2"
 LIMINAL_REPO="tickcount/openwrt-liminal"
 LIMINAL_RAW_URL="https://raw.githubusercontent.com/${LIMINAL_REPO}/refs/heads/main/liminal.sh"
 
@@ -2061,16 +2061,57 @@ do_add_peer() {
     fi
     echo -e "  ${ICO_OK} ${OK}Assigned IP:${NC} $_peer_ip ${DIM2}(subnet: ${_iface_subnet})${NC}"
 
-    # Endpoint (WAN IP auto-detect)
-    _endpoint_host="$(detect_wan_ip || true)"
-    if [ -z "$_endpoint_host" ]; then
-        prompt _endpoint_host "Could not detect WAN IP — enter manually" ""
-    else
-        echo -e "  ${OK}WAN IP (endpoint):${NC} $_endpoint_host"
-        if ! confirm "Use this address?" "y"; then
-            prompt _endpoint_host "Enter endpoint address" "$_endpoint_host"
-        fi
+    # Endpoint selection
+    _ep_iface="$(uci -q get "network.${_iface}.endpoint_host" || true)"
+    _ep_wan="$(detect_wan_ip || true)"
+
+    echo ""
+    echo -e "  ${A}Select endpoint for client config:${NC}"
+    echo ""
+    _ep_n=0
+    _ep_list=""
+    if [ -n "$_ep_iface" ]; then
+        _ep_n=$((_ep_n + 1))
+        echo -e "  ${B}${_ep_n}${NC} ${DIM2}›${NC} ${W}Interface endpoint${NC}  ${DIM2}${_ep_iface}${NC}"
+        _ep_list="${_ep_list} ${_ep_iface}"
     fi
+    if [ -n "$_ep_wan" ]; then
+        _ep_n=$((_ep_n + 1))
+        _ep_same=""
+        if [ "$_ep_wan" = "$_ep_iface" ]; then _ep_same="  ${DIM2}(same)${NC}"; fi
+        echo -e "  ${B}${_ep_n}${NC} ${DIM2}›${NC} ${W}WAN IP${NC}  ${DIM2}${_ep_wan}${NC}${_ep_same}"
+        _ep_list="${_ep_list} ${_ep_wan}"
+    fi
+    _ep_n=$((_ep_n + 1))
+    echo -e "  ${B}${_ep_n}${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter manually)${NC}"
+    echo ""
+    _ep_max="$_ep_n"
+
+    while true; do
+        echo -ne "  ${A}>${NC} "; read -r _ep_choice || true
+        sigint_caught && return
+        is_cancelled && return
+        [ -z "$_ep_choice" ] && { _ep_choice=1; }
+        case "$_ep_choice" in *[!0-9]*) warn "Invalid selection"; continue ;; esac
+        if [ "$_ep_choice" -lt 1 ] 2>/dev/null || [ "$_ep_choice" -gt "$_ep_max" ] 2>/dev/null; then
+            warn "Invalid selection"; continue
+        fi
+        # Custom
+        if [ "$_ep_choice" -eq "$_ep_max" ]; then
+            prompt _endpoint_host "Endpoint address" "" || return
+            sigint_caught && return
+            [ -z "$_endpoint_host" ] && { warn "Required field"; continue; }
+            break
+        fi
+        # Pick from list
+        _ep_i=0
+        for _ep_val in $_ep_list; do
+            _ep_i=$((_ep_i + 1))
+            if [ "$_ep_i" = "$_ep_choice" ]; then _endpoint_host="$_ep_val"; fi
+        done
+        [ -n "$_endpoint_host" ] && break
+    done
+    echo -e "  ${ICO_OK} ${OK}Endpoint:${NC} $_endpoint_host"
 
     _port="$(uci -q get "network.${_iface}.listen_port" || echo "51820")"
 
