@@ -1,26 +1,8 @@
 # Liminal
 
-A menu-driven AmneziaWG tunnel manager for OpenWrt routers.
+AmneziaWG tunnel manager for OpenWrt routers. Runs over SSH as an interactive TUI.
 
-Create encrypted tunnels from your devices (phone, laptop, etc.) back to your home router, routing traffic through your LAN and out to the internet — all managed from an interactive SSH terminal UI.
-
-```
-┌─────────────┐       ┌──────────────────┐       ┌─────────────────┐       ┌──────────────┐       ┌──────────┐
-│   Client    │──────>│   Home Router    │──────>│   LAN / WAN     │──────>│   Podkop     │──────>│ Internet │
-│             │  AWG  │   (OpenWrt +     │       │   Access        │       │  (optional)  │       │          │
-│ Phone (LTE) │ tunnel│    Liminal)      │       │                 │       │              │       │          │
-│ Laptop      │       │                  │       │ Local devices,  │       │ Split-tunnel  │       │          │
-│ PC          │       │                  │       │ home network    │       │ routing       │       │          │
-└─────────────┘       └──────────────────┘       └─────────────────┘       └──────────────┘       └──────────┘
-```
-
-| Step | Description |
-|------|-------------|
-| **Client** | Any device (phone, laptop, PC) connects via AmneziaWG tunnel |
-| **Home Router** | OpenWrt router running Liminal — terminates the tunnel |
-| **LAN / WAN Access** | Client gets full access to local network and internet through the router |
-| **Podkop** (optional) | Split-tunnel routing — selectively route traffic through different paths |
-| **Internet** | Final destination — traffic exits from your home IP |
+Sets up encrypted VPN tunnels so your devices (phone, laptop, etc.) can route traffic through your home router — accessing your LAN and going out to the internet through your home IP.
 
 ![Shell Script](https://img.shields.io/badge/shell-ash%2Fbusybox-blue)
 ![Platform](https://img.shields.io/badge/platform-OpenWrt%2024.10-green)
@@ -28,105 +10,61 @@ Create encrypted tunnels from your devices (phone, laptop, etc.) back to your ho
 
 ## Preview
 <center>
-<img width="525" height="542" alt="Untitled" src="https://github.com/user-attachments/assets/9c816a9a-5785-43f2-be18-02b58da7ea5e" />
+<img width="525" height="542" alt="main" src="https://github.com/user-attachments/assets/9c816a9a-5785-43f2-be18-02b58da7ea5e" />
 <img width="680" height="687" alt="interface" src="https://github.com/user-attachments/assets/5b7bb1de-7993-4c69-ad55-d0521318b5f3" />
 </center>
 
-## Features
+## What it does
 
-### Interface Management
-- **Create** AmneziaWG interfaces with automatic firewall zone, rules, and forwarding setup
-- **Rename** interfaces — updates all peers, firewall zone/rules/forwardings, DNS records, Podkop
-- **Auto-detect** router LAN IP, WAN IP (endpoint), and firewall zones
-- **Address conflict detection** — prevents creating interfaces with overlapping subnets
-- **Inline peer list** on interface page with direct numeric selection
-- **Interactive DNS selector** — preset servers with Sing-Box/Podkop awareness, current DNS highlighted
-- **Edit settings** — DNS, MTU, listen port, endpoint host override
-- **Toggle LAN/WAN forwarding** directly from the interface menu
-- **Podkop integration** — link/unlink with one toggle
-- **Sing-Box detection** — standalone or via Podkop, DNS chain status in interface/peer display
-- **Inline diagnostics** — warnings for down device, closed port, missing zone/forwarding, DNS chain issues
-- **Interface info** — uptime, total traffic (Rx/Tx), public key, Podkop/Sing-Box status
-- **Disable / Enable / Delete** interfaces with full cleanup
-- **Non-Liminal interface support** — manage interfaces created outside Liminal (read-only, no delete)
+Creates AmneziaWG interfaces and peers on OpenWrt, handling all the UCI/firewall/DNS plumbing.
 
-### Peer Management
-- **Add peers** with automatic IP allocation and subnet validation
-- **Duplicate name prevention** — globally unique peer names enforced on create and rename
-- **Local DNS hostrecords** — optional `peer.interface.lan` hostname via dnsmasq, with auto or custom name
-- **Manage hostnames** — add, change, or remove DNS records from the peer menu (`h`)
-- **DNS diagnostics** — inline warnings when hostname won't resolve (DNS mismatch, zone blocks port 53, dnsmasq/Sing-Box issues)
-- **Routing mode presets** — Full tunnel, LAN only, WAN only, or custom AllowedIPs
-- **PreSharedKey** generation for extra security
-- **Live status** — Online/Offline detection via latest handshake (≤120s threshold)
-- **Handshake color-coding** — green ≤30s, amber ≤120s, red >120s
-- **Per-peer info** — DNS (with Sing-Box chain indicator), endpoint, handshake, Rx/Tx, keepalive, public key, hostname
-- **Edit per-peer settings** — AllowedIPs, Keepalive, Hostname
-- **Export configs** — WireGuard config, QR code, download link, `vpn://` AmneziaVPN key
-- **Show All** — config + QR + vpn:// + download in one view
-- **Rename / Regenerate keys / Disable / Enable / Delete** peers
-- **Auto-navigate** to peer menu after creation
+### Interfaces
 
-### Live Dashboard
-- **Real-time monitoring** with auto-refresh (3s interval)
-- **Per-peer table** — name, status, address, endpoint, handshake, Rx/Tx
-- All interfaces and peers on a single screen
+- Create with guided wizard — subnet auto-picked from free `10.x.0.1/24` range, firewall zone/rules/forwarding generated automatically
+- LAN IP, LAN/WAN zones detected from UCI — manual input only when auto-detect fails
+- Rename — propagates to peers, firewall zone, rules, forwardings, DNS records, Podkop
+- Edit DNS, MTU, listen port, endpoint override from the interface menu
+- Toggle LAN/WAN forwarding, link/unlink Podkop per interface
+- Disable, enable, restart, delete with full cleanup
+- Supports non-Liminal AWG interfaces (created outside the script) in read-only mode
 
-### Connectivity Check
-- **Per-interface diagnostics** — device status, AWG, port, firewall zone, forwarding rules
-- **Ping test** for online peers
+### Peers
 
-### Export / Import
-- **Export** full configuration to JSON (interfaces + peers + keys)
-- **Import** from a previously exported JSON file
-- Useful for migration between routers or disaster recovery
+- Add with auto IP allocation from the interface subnet
+- AllowedIPs set automatically based on firewall forwarding state (WAN present → `0.0.0.0/0`, LAN only → LAN CIDR, nothing → VPN subnet only)
+- PreSharedKey generated for every peer
+- Endpoint selection — interface override, WAN IP auto-detect, or manual
+- Config export: WireGuard `.conf`, QR code, download link, `vpn://` key for AmneziaVPN
+- Optional DNS hostrecord (`peer.interface.lan`) via dnsmasq — auto-name or custom
+- Edit AllowedIPs, keepalive, hostname after creation
+- Rename, regenerate keys, disable/enable, delete
+- Online/offline status via handshake age, per-peer traffic stats
 
-### Backup System
-- **Automatic backups** before interface creation and deletion (toggleable)
-- **Manual backups** on demand
-- **Restore** from any backup with one click
-- **Manage** — list, inspect (with size), delete individual or all backups
-- Backups include `network`, `firewall`, `dhcp`, and `podkop` configs
+### Monitoring
 
-### Self-Update
-- **Check for updates** from GitHub directly from the main menu
-- Version comparison and one-click update with automatic restart
+- Live dashboard — all interfaces and peers on one screen, auto-refresh every 3s
+- Connectivity check — device status, port listening, firewall zone, forwarding, ping to online peers
+- Inline diagnostics on interface and peer screens — warns about down device, closed port, missing forwarding, DNS chain issues
 
-### Installer
-- **Install All Missing** — one button to install everything at once
-- Individual installers for AmneziaWG, Podkop, qrencode, jq, base64
-- Dependency status shown on the main screen with version info
+### Podkop / Sing-Box
 
-### UI
-- **Box-drawing frames** and **status icons** (● ○ ✓ ✗ !) across all menus
-- **Breadcrumb navigation** — always know where you are
-- **Animated spinner** for long operations
-- **Soft color palette** — white-blue-violet theme
+- Detect Sing-Box DNS (127.0.0.42:53) and dnsmasq forwarding chain
+- Link/unlink interfaces to Podkop source list
+- DNS chain status shown on interface and peer screens
 
-### Safety
-- `_liminal_iface` tag on all firewall/DNS objects — links each UCI object to its parent interface
-- Ctrl+C safe — never kills the script; goes back to parent menu or prompts to exit
-- Input sanitization and name validation
-- Subnet/address overlap validation across all network interfaces
-- DNS safety checks — dnsmasq status, zone input, Sing-Box chain, localservice, rebind protection
+### Backup & Export
 
-## Requirements
+- Auto-backup before create/delete/rename (toggleable)
+- Manual backup, restore from any point, delete individual or all
+- Export full config to JSON (interfaces + peers + keys), import on another router
 
-- **OpenWrt 24.10+** (BusyBox ash)
-- **AmneziaWG** — can be installed from the main menu
+### Other
 
-### Optional dependencies
+- Self-update from GitHub with version check
+- Install missing packages from the menu (AmneziaWG, Podkop, qrencode, jq, base64)
+- CLI mode: `liminal status`, `liminal peers <iface>`, `liminal export`, `liminal check`
 
-| Package | Used for |
-|---------|----------|
-| `qrencode` | QR code generation |
-| `jq` | AmneziaVPN `vpn://` key generation, export/import |
-| `coreutils-base64` | Config encoding for download links and VPN keys |
-| `podkop` | Split-tunnel routing integration |
-
-All packages can be installed directly from the main menu (individually or all at once).
-
-## Installation
+## Install
 
 ```bash
 wget -O /usr/bin/liminal https://raw.githubusercontent.com/tickcount/openwrt-liminal/main/liminal.sh
@@ -134,73 +72,31 @@ chmod +x /usr/bin/liminal
 liminal
 ```
 
-Or run directly without installing:
+Or run once without installing:
 
 ```bash
 sh <(wget -O - https://raw.githubusercontent.com/tickcount/openwrt-liminal/main/liminal.sh)
 ```
 
+## Requirements
+
+- OpenWrt 24.10+ (BusyBox ash)
+- AmneziaWG (installable from the menu)
+
+Optional: `qrencode`, `jq`, `coreutils-base64`, `podkop` — all installable from the menu.
+
 ## Usage
 
-```bash
-liminal
-```
+1. Run `liminal`, press `+` to create an interface
+2. Enter a name and port — subnet, firewall zone, LAN/WAN detected automatically
+3. Add a peer — get QR / vpn:// key / config
+4. Connect with AmneziaVPN or any WireGuard-compatible client
 
-### Navigation
-
-```
-Main Menu
-├── Interfaces (inline list with status)
-│   ├── + ) Create Interface
-│   └── 1..N ) Select interface
-│       ├── Peers (inline list with status)
-│       │   ├── + ) Add Peer
-│       │   └── 1..N ) Select peer
-│       │       ├── Config: Show Config / Download Link / vpn:// Key / QR Code / Show All
-│       │       ├── Settings: AllowedIPs / Keepalive / Hostname (DNS record)
-│       │       └── Actions: Rename / Regenerate Keys / Disable|Enable / Delete
-│       ├── Settings: DNS+MTU / Port / Endpoint / LAN Fwd / WAN Fwd / Podkop
-│       ├── Info: Public Key
-│       └── Interface: Rename / Restart / Disable|Enable / Delete
-├── m ) Live Dashboard
-├── e ) Export / Import
-├── b ) Manage Backups
-│   ├── c ) Create Backup
-│   ├── t ) Toggle Auto-Backup
-│   ├── d ) Delete All
-│   └── 1..N ) Select backup → Restore / Delete
-├── f ) Full Reset
-├── u ) Check for Updates
-└── Install missing packages (shown only when needed)
-```
-
-### Creating a tunnel
-
-1. Run `liminal` and press `+` to **Create Interface**
-2. Enter interface name, address (e.g. `10.10.10.1/24`), port
-3. Router LAN IP and firewall zones are auto-detected
-4. Review the planned config and confirm
-5. Add peers — choose routing mode, generate PSK, get config + QR + `vpn://` key
-
-### Connecting a client
-
-Use any of the export options from the peer menu:
-- **AmneziaVPN** (Android/iOS/Desktop) — scan QR or import `vpn://` key
-- **WireGuard-compatible client** — import the `.conf` file or scan QR
+> Static public IP (or DDNS) and NAT port forwarding (UDP) on the upstream router are required for external access.
 
 ## How it works
 
-Liminal creates standard AmneziaWG interfaces via UCI with:
-- A firewall zone with configurable LAN/WAN forwarding
-- An incoming UDP rule for the listen port
-- WAN masquerading for internet access
-- Optional Podkop source interface registration
-
-All firewall and DNS objects are tagged with `_liminal_iface=<interface>` so Liminal can safely manage only what it created, and knows exactly which interface each object belongs to.
-
-## Note
-
-> A **static public IP address** (or DDNS hostname) and **NAT port forwarding** (UDP) on your upstream router are required for external clients to connect.
+All objects created by Liminal (firewall zones, rules, forwardings, DNS records) are tagged with `_liminal_iface` in UCI. This lets the script track what belongs to which interface and clean up safely on delete/rename without touching anything else.
 
 ## Credits
 

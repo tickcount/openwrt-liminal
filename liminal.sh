@@ -139,6 +139,12 @@ log()  { printf '%s\n' "$*"; }
 warn() { echo -e "  ${ERR}${ICO_WARN} warning:${NC} $*" >&2; }
 die()  { echo -e "  ${ERR}${ICO_ERR} error:${NC} $*" >&2; exit 1; }
 PAUSE() { echo -ne "\n  ${DIM2}Press Enter...${NC}"; read dummy || true; }
+section() {
+    _stitle="$1"; _slen=${#_stitle}; _spad=$((34 - _slen))
+    [ "$_spad" -lt 1 ] && _spad=1
+    _sline=""; _si=0; while [ "$_si" -lt "$_spad" ]; do _sline="${_sline}─"; _si=$((_si+1)); done
+    echo -e "\n  ${DIM}──${NC} ${V}${_stitle}${NC} ${DIM}${_sline}${NC}\n"
+}
 
 # read_choice VAR — read a single menu choice, strip invisible/control chars
 read_choice() {
@@ -223,9 +229,9 @@ sigint_caught() {
 prompt() {
     _var="$1"; _q="$2"; _def="${3:-}"
     if [ -n "$_def" ]; then
-        printf "%s [%s]: " "$_q" "$_def"
+        printf "  %s [%b%s%b]: " "$_q" "$DIM2" "$_def" "$NC"
     else
-        printf "%s: " "$_q"
+        printf "  %s: " "$_q"
     fi
     read -r _ans || true
     # Check if Ctrl+C was pressed during read
@@ -239,9 +245,9 @@ prompt() {
 confirm() {
     _q="$1"; _def="${2:-y}"
     if [ "$_def" = "y" ]; then
-        echo -ne "${_q} [${OK}Y${NC}/${DIM2}n${NC}] "
+        echo -ne "  ${_q} [${OK}Y${NC}/${DIM2}n${NC}] "
     else
-        echo -ne "${_q} [${DIM2}y${NC}/${ERR}N${NC}] "
+        echo -ne "  ${_q} [${DIM2}y${NC}/${ERR}N${NC}] "
     fi
     read -r _ans || true
     _ans="$(printf '%s' "${_ans:-}" | tr -d '\001-\037\177')"
@@ -825,6 +831,47 @@ detect_router_lan_ip() {
     _ip="${_ip%/*}"
     [ -n "$_ip" ] && { printf '%s\n' "$_ip"; return 0; }
 
+    return 1
+}
+
+find_free_subnet() {
+    # Try 10.x.0.1/24 where x = 10,20,30..250, then 10.x.y.1/24
+    for _x in 10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180 190 200 210 220 230 240 250; do
+        _candidate="10.${_x}.0.1/24"
+        _cand_subnet="$(network_base_from_cidr "$_candidate")"
+        _cand_ip="${_candidate%/*}"
+        _conflict=""
+        _all_ifs="$(uci show network 2>/dev/null \
+            | sed -n "s/^network\.\([^.]*\)\.addresses=.*/\1/p" \
+            | sort -u)"
+        for _eif in $_all_ifs; do
+            for _ev in $(uci -q get "network.${_eif}.addresses" 2>/dev/null); do
+                case "$_ev" in */*) ;; *) continue ;; esac
+                _esubnet="$(network_base_from_cidr "$_ev")"
+                if [ "$_esubnet" = "$_cand_subnet" ] || cidr_contains_ip "$_ev" "$_cand_ip"; then
+                    _conflict=1; break 2
+                fi
+            done
+        done
+        # Also check against LAN subnet
+        _lan_ip="$(uci -q get network.lan.ipaddr 2>/dev/null || true)"
+        _lan_mask="$(uci -q get network.lan.netmask 2>/dev/null || true)"
+        if [ -n "$_lan_ip" ] && [ -n "$_lan_mask" ]; then
+            _lbits=0; OLDIFS="$IFS"; IFS='.'
+            for _oct in $_lan_mask; do
+                case "$_oct" in
+                    255) _lbits=$((_lbits+8)) ;; 254) _lbits=$((_lbits+7)) ;;
+                    252) _lbits=$((_lbits+6)) ;; 248) _lbits=$((_lbits+5)) ;;
+                    240) _lbits=$((_lbits+4)) ;; 224) _lbits=$((_lbits+3)) ;;
+                    192) _lbits=$((_lbits+2)) ;; 128) _lbits=$((_lbits+1)) ;;
+                esac
+            done; IFS="$OLDIFS"
+            _lan_cidr_chk="${_lan_ip}/${_lbits}"
+            _lan_base="$(network_base_from_cidr "$_lan_cidr_chk")"
+            [ "$_lan_base" = "$_cand_subnet" ] && _conflict=1
+        fi
+        [ -z "$_conflict" ] && { printf '%s\n' "$_candidate"; return 0; }
+    done
     return 1
 }
 
@@ -1820,7 +1867,7 @@ do_peer_menu() {
                 PAUSE
                 crumb_pop; return ;;
             a) # Edit AllowedIPs
-                echo ""
+                section "Edit AllowedIPs"
                 _cur_caip="$(uci -q get "network.@${_pt}[$_idx].client_allowed_ips" || echo "0.0.0.0/0, ::/0")"
                 echo -e "  ${A}Current:${NC} ${W}${_cur_caip}${NC}"
                 echo ""
@@ -1851,18 +1898,18 @@ do_peer_menu() {
                 PAUSE ;;
 
             h) # Manage Hostname
-                echo ""
+                section "Manage Hostname"
                 _cur_hr="$(get_peer_hostrecord_fqdn "$_iface" "$_desc" 2>/dev/null || true)"
                 _peer_ip_bare="${_aip%%/*}"
                 if [ -n "$_cur_hr" ]; then
                     echo -e "  ${A}Current:${NC} ${W}${_cur_hr}${NC} → ${W}${_peer_ip_bare}${NC}"
                     echo ""
-                    echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Change${NC} hostname"
-                    echo -e "  ${B}2${NC} ${DIM2}›${NC} ${ERR}Remove${NC} hostname"
-                    echo -e "  ${DIM2}Enter › Cancel${NC}"
+                    echo -e "    ${B}1${NC} ${DIM2}›${NC} ${W}Change${NC} hostname"
+                    echo -e "    ${B}2${NC} ${DIM2}›${NC} ${ERR}Remove${NC} hostname"
+                    echo -e "    ${DIM2}Enter › Cancel${NC}"
                     echo ""
                     echo -ne "  ${A}>${NC} "; read -r _h_choice || true
-                    sigint_caught && { PAUSE; continue; }
+                    sigint_caught && continue
                     case "${_h_choice:-}" in
                         1)  _h_domain="$(sanitize_hostname "$_iface").$(get_lan_domain)"
                             while true; do
@@ -1885,15 +1932,16 @@ do_peer_menu() {
                                 break
                             done ;;
                         2)  remove_peer_hostrecord "$_iface" "$_desc" ;;
+                        *)  continue ;;
                     esac
                 else
                     echo -e "  ${A}No DNS record for this peer${NC}"
                     echo ""
                     _h_auto="$(build_peer_fqdn "$_iface" "$_desc" 2>/dev/null || true)"
                     _h_domain="$(sanitize_hostname "$_iface").$(get_lan_domain)"
-                    echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}${_h_auto}${NC}"
-                    echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter hostname.${_h_domain})${NC}"
-                    echo -e "  ${DIM2}Enter › Cancel${NC}"
+                    echo -e "    ${B}1${NC} ${DIM2}›${NC} ${W}${_h_auto}${NC}"
+                    echo -e "    ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter hostname.${_h_domain})${NC}"
+                    echo -e "    ${DIM2}Enter › Skip${NC}"
                     echo ""
                     echo -ne "  ${A}>${NC} "; read -r _h_choice || true
                     sigint_caught && { PAUSE; continue; }
@@ -1914,6 +1962,7 @@ do_peer_menu() {
                                 fi
                                 break
                             done ;;
+                        *)  continue ;;
                     esac
                     if [ -n "$_h_fqdn" ]; then
                         if hostrecord_fqdn_exists "$_h_fqdn"; then
@@ -1927,7 +1976,7 @@ do_peer_menu() {
                 PAUSE ;;
 
             k) # Edit Keepalive
-                echo ""
+                section "Edit Keepalive"
                 _cur_ka="$(uci -q get "network.@${_pt}[$_idx].persistent_keepalive" || echo "25")"
                 echo -e "  ${A}Current:${NC} ${W}${_cur_ka}s${NC}"
                 echo -e "  ${DIM2}0 = off, 25 = recommended for NAT${NC}"
@@ -2033,7 +2082,10 @@ do_add_peer() {
     trap_cancel
     echo ""
     echo -e "  ${DIM2}(Ctrl+C = cancel)${NC}"
-    echo ""
+
+    # ── Peer ─────────────────────────────────────────────────────────
+    section "Peer"
+
     while true; do
         prompt PEER_NAME "Peer name" "" || { trap_restore; return; }
         is_cancelled && { trap_restore; return; }
@@ -2059,31 +2111,32 @@ do_add_peer() {
     if ! cidr_contains_ip "$_iface_subnet" "$_peer_ip_bare"; then
         die "Generated peer IP $_peer_ip is outside interface subnet $_iface_subnet"
     fi
-    echo -e "  ${ICO_OK} ${OK}Assigned IP:${NC} $_peer_ip ${DIM2}(subnet: ${_iface_subnet})${NC}"
+    echo -e "  ${ICO_OK} ${OK}IP:${NC} ${W}$_peer_ip${NC} ${DIM2}(subnet: ${_iface_subnet})${NC}"
 
-    # Endpoint selection
+    # ── Connection ───────────────────────────────────────────────────
+    section "Connection"
+
     _ep_iface="$(uci -q get "network.${_iface}.endpoint_host" || true)"
     _ep_wan="$(detect_wan_ip || true)"
 
-    echo ""
-    echo -e "  ${A}Select endpoint for client config:${NC}"
+    echo -e "  ${A}Endpoint for client config:${NC}"
     echo ""
     _ep_n=0
     _ep_list=""
     if [ -n "$_ep_iface" ]; then
         _ep_n=$((_ep_n + 1))
-        echo -e "  ${B}${_ep_n}${NC} ${DIM2}›${NC} ${W}Interface endpoint${NC}  ${DIM2}${_ep_iface}${NC}"
+        echo -e "    ${B}${_ep_n}${NC} ${DIM2}›${NC} ${W}Interface endpoint${NC}  ${DIM2}${_ep_iface}${NC}"
         _ep_list="${_ep_list} ${_ep_iface}"
     fi
     if [ -n "$_ep_wan" ]; then
         _ep_n=$((_ep_n + 1))
         _ep_same=""
         if [ "$_ep_wan" = "$_ep_iface" ]; then _ep_same="  ${DIM2}(same)${NC}"; fi
-        echo -e "  ${B}${_ep_n}${NC} ${DIM2}›${NC} ${W}WAN IP${NC}  ${DIM2}${_ep_wan}${NC}${_ep_same}"
+        echo -e "    ${B}${_ep_n}${NC} ${DIM2}›${NC} ${W}WAN IP${NC}  ${DIM2}${_ep_wan}${NC}${_ep_same}"
         _ep_list="${_ep_list} ${_ep_wan}"
     fi
     _ep_n=$((_ep_n + 1))
-    echo -e "  ${B}${_ep_n}${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter manually)${NC}"
+    echo -e "    ${B}${_ep_n}${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter manually)${NC}"
     echo ""
     _ep_max="$_ep_n"
 
@@ -2111,21 +2164,20 @@ do_add_peer() {
         done
         [ -n "$_endpoint_host" ] && break
     done
-    echo -e "  ${ICO_OK} ${OK}Endpoint:${NC} $_endpoint_host"
+    echo -e "  ${ICO_OK} ${OK}Endpoint:${NC} ${W}$_endpoint_host${NC}"
 
     _port="$(uci -q get "network.${_iface}.listen_port" || echo "51820")"
-
-    # DNS from interface
     _dns="$(uci -q get "network.${_iface}.dns" || true)"
     [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "1.1.1.1")"
-    echo -e "  ${OK}DNS:${NC} $_dns"
-
     _keepalive="25"
-
-    # MTU
     _mtu="$(uci -q get "network.${_iface}.mtu" || echo "1280")"
 
-    # Detect forwarding capabilities and interface existence
+    echo -e "  ${ICO_OK} ${OK}DNS:${NC} ${W}$_dns${NC}"
+    echo -e "  ${ICO_OK} ${OK}MTU:${NC} ${W}$_mtu${NC}"
+
+    # ── Routing ──────────────────────────────────────────────────────
+    section "Routing"
+
     _vpn_zone="$(find_zone_for_interface "$_iface" 2>/dev/null || true)"
     _has_wan_fwd=0; _has_lan_fwd=0
     if [ -n "$_vpn_zone" ]; then
@@ -2133,13 +2185,11 @@ do_add_peer() {
         forwarding_exists "$_vpn_zone" "lan" && _has_lan_fwd=1
     fi
 
-    # Verify actual network interfaces exist
     _wan_proto="$(uci -q get "network.wan.proto" || true)"
     _lan_proto="$(uci -q get "network.lan.proto" || true)"
     [ -z "$_wan_proto" ] && _has_wan_fwd=0
     [ -z "$_lan_proto" ] && _has_lan_fwd=0
 
-    # Warn about missing capabilities
     if [ "$_has_wan_fwd" = "0" ] && [ "$_has_lan_fwd" = "0" ]; then
         warn "No LAN or WAN access from this interface"
         warn "Client will only have access to the VPN subnet"
@@ -2148,7 +2198,6 @@ do_add_peer() {
         [ "$_has_lan_fwd" = "0" ] && warn "No LAN access — client will NOT access server LAN via VPN"
     fi
 
-    # Build LAN CIDR if LAN is available
     _lan_cidr=""
     if [ "$_has_lan_fwd" = "1" ]; then
         _lan_subnet="$(uci -q get network.lan.ipaddr 2>/dev/null || true)"
@@ -2167,61 +2216,21 @@ do_add_peer() {
         fi
     fi
 
-    # Default AllowedIPs based on capabilities
     if [ "$_has_wan_fwd" = "1" ]; then
-        _default_allowed="0.0.0.0/0, ::/0"
-    elif [ -n "$_lan_cidr" ]; then
-        _default_allowed="$_lan_cidr"
+        _client_allowed_ips="0.0.0.0/0, ::/0"
+    elif [ "$_has_lan_fwd" = "1" ] && [ -n "$_lan_cidr" ]; then
+        _client_allowed_ips="$_lan_cidr"
     else
-        _default_allowed="$_peer_ip"
+        _client_allowed_ips="$_peer_ip"
     fi
+    echo -e "  ${ICO_OK} ${OK}AllowedIPs:${NC} ${W}$_client_allowed_ips${NC}"
 
-    # Routing mode — show only options matching available forwardings
-    echo ""
-    echo -e "  ${A}Routing mode:${NC}"
-    _opt=1; _opt_lan=0; _opt_wan=0; _opt_full=0; _opt_custom=0
-    if [ "$_has_lan_fwd" = "1" ] && [ "$_has_wan_fwd" = "1" ]; then
-        echo -e "  ${B}${_opt}${NC} ${DIM2}›${NC} ${W}Full tunnel${NC}   ${DIM2}— all traffic via VPN (0.0.0.0/0, ::/0)${NC}"
-        _opt_full=$_opt; _opt=$((_opt+1))
-    fi
-    if [ "$_has_lan_fwd" = "1" ] && [ -n "$_lan_cidr" ]; then
-        echo -e "  ${B}${_opt}${NC} ${DIM2}›${NC} ${W}LAN only${NC}     ${DIM2}— server LAN only (${_lan_cidr})${NC}"
-        _opt_lan=$_opt; _opt=$((_opt+1))
-    fi
-    if [ "$_has_wan_fwd" = "1" ]; then
-        echo -e "  ${B}${_opt}${NC} ${DIM2}›${NC} ${W}WAN only${NC}     ${DIM2}— internet only (0.0.0.0/0, ::/0)${NC}"
-        _opt_wan=$_opt; _opt=$((_opt+1))
-    fi
-    echo -e "  ${B}${_opt}${NC} ${DIM2}›${NC} ${W}Custom${NC}       ${DIM2}— specify AllowedIPs manually${NC}"
-    _opt_custom=$_opt
-    echo ""
+    # ── Security ─────────────────────────────────────────────────────
+    section "Security"
 
-    _routing_mode=""
-    while true; do
-        prompt _routing_mode "Select" "1" || return
-        if [ "$_routing_mode" = "$_opt_full" ] && [ "$_opt_full" != "0" ]; then
-            _client_allowed_ips="0.0.0.0/0, ::/0"; break
-        elif [ "$_routing_mode" = "$_opt_lan" ] && [ "$_opt_lan" != "0" ]; then
-            _client_allowed_ips="$_lan_cidr"; break
-        elif [ "$_routing_mode" = "$_opt_wan" ] && [ "$_opt_wan" != "0" ]; then
-            _client_allowed_ips="0.0.0.0/0, ::/0"; break
-        elif [ "$_routing_mode" = "$_opt_custom" ]; then
-            prompt _client_allowed_ips "AllowedIPs (comma-separated CIDRs)" "$_default_allowed" || return
-            break
-        else
-            warn "Invalid choice"
-        fi
-    done
-    echo -e "  ${ICO_OK} ${OK}AllowedIPs:${NC} $_client_allowed_ips"
+    _psk="$(awg genpsk)" || die "PSK generation failed"
+    echo -e "  ${ICO_OK} ${OK}PreSharedKey:${NC} generated"
 
-    # PreSharedKey
-    _psk=""
-    if confirm "Generate PreSharedKey (extra security)?" "y"; then
-        _psk="$(awg genpsk)" || die "PSK generation failed"
-        echo -e "  ${ICO_OK} ${OK}PreSharedKey:${NC} generated"
-    fi
-
-    # Generate keys
     _client_priv="$(awg genkey)" || die "Key generation failed"
     _client_pub="$(printf '%s' "$_client_priv" | awg pubkey)" \
         || die "Public key derivation failed"
@@ -2229,19 +2238,21 @@ do_add_peer() {
     _server_priv="$(uci -q get "network.${_iface}.private_key" || true)"
     [ -z "$_server_priv" ] && die "Missing interface private key"
     _server_pub="$(printf '%s' "$_server_priv" | awg pubkey)"
+    echo -e "  ${ICO_OK} ${OK}Keys:${NC} generated"
 
-    echo ""
-    echo -e "  ${V}New peer:${NC}"
+    # ── Summary ──────────────────────────────────────────────────────
+    section "Summary"
+
     echo -e "  ${A}Name${NC}         ${W}$PEER_NAME${NC}"
     echo -e "  ${A}IP${NC}           ${W}$_peer_ip${NC}"
     echo -e "  ${A}Endpoint${NC}     ${W}${_endpoint_host}:${_port}${NC}"
     echo -e "  ${A}DNS${NC}          ${W}$_dns${NC}"
     echo -e "  ${A}MTU${NC}          ${W}$_mtu${NC}"
     echo -e "  ${A}AllowedIPs${NC}   ${W}$_client_allowed_ips${NC}"
-    [ -n "$_psk" ] && echo -e "  ${A}PSK${NC}          ${W}yes${NC}"
+    echo -e "  ${A}PSK${NC}          ${W}yes${NC}"
     echo ""
 
-    confirm "Create peer?" "y" || return
+    confirm "Create peer?" "y" || { echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; return 0; }
 
     echo -e "  ${B}Adding${NC} peer ${W}$PEER_NAME${NC}..."
     _sec="$(uci add network "$_pt")"
@@ -2282,8 +2293,7 @@ PresharedKey = $_psk"
     _hr_auto="$(build_peer_fqdn "$_iface" "$PEER_NAME" 2>/dev/null || true)"
     if [ -n "$_hr_auto" ]; then
         _hr_domain="$(sanitize_hostname "$_iface").$(get_lan_domain)"
-        echo ""
-        echo -e "  ${A}Local DNS record:${NC}"
+        section "Local DNS"
         echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}${_hr_auto}${NC}"
         echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter hostname.${_hr_domain})${NC}"
         echo -e "  ${DIM2}Enter › Skip${NC}"
@@ -2594,7 +2604,7 @@ do_manage_interface() {
                 fi ;;
 
             e|E) # Edit DNS / MTU
-                echo ""
+                section "Edit DNS / MTU"
                 _cur_dns="$(uci -q get "network.${_iface}.dns" || echo "")"
                 _cur_mtu="$(uci -q get "network.${_iface}.mtu" || echo "1280")"
                 _changed=0; _mtu_changed=0; _dns_changed=0
@@ -2606,7 +2616,7 @@ do_manage_interface() {
                         _changed=1; _dns_changed=1
                     fi
                 fi
-
+                echo ""
                 prompt _new_mtu "MTU" "$_cur_mtu" || continue
                 sigint_caught && continue
                 if [ -n "$_new_mtu" ] && [ "$_new_mtu" != "$_cur_mtu" ]; then
@@ -2616,6 +2626,7 @@ do_manage_interface() {
                 fi
 
                 if [ "$_changed" -eq 1 ]; then
+                    echo ""
                     confirm "Apply changes?" "y" || { uci revert network 2>/dev/null; echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; continue; }
                     uci commit network
                     spinner_start "Restarting ${_iface}..."
@@ -2634,7 +2645,7 @@ do_manage_interface() {
                 PAUSE ;;
 
             p|P) # Change Port
-                echo ""
+                section "Change Port"
                 _cur_port="$(uci -q get "network.${_iface}.listen_port" || echo "")"
                 echo -e "  ${WARN_C}All existing peer configs will need to be updated${NC}"
                 echo -e "  ${WARN_C}with the new port after this change.${NC}"
@@ -2672,7 +2683,7 @@ do_manage_interface() {
                 PAUSE ;;
 
             n|N) # Edit Endpoint
-                echo ""
+                section "Edit Endpoint"
                 _cur_ep="$(uci -q get "network.${_iface}.endpoint_host" || true)"
                 if [ -n "$_cur_ep" ]; then
                     echo -e "  ${A}Current endpoint:${NC} ${W}${_cur_ep}${NC}"
@@ -2958,9 +2969,9 @@ do_rename_interface() {
     echo ""
     echo -e "  ${A}Current name:${NC} ${W}${_old}${NC}"
     echo -e "  ${DIM2}(Ctrl+C = cancel)${NC}"
-    echo ""
 
-    # ── Prompt for new name ──
+    section "New name"
+
     while true; do
         prompt _new "New interface name" "" || return 1
         sigint_caught && return 1
@@ -2977,14 +2988,12 @@ do_rename_interface() {
     _has_podkop=0
     podkop_present && podkop_has_interface "$_old" 2>/dev/null && _has_podkop=1
 
-    # ── Generate new zone & rule names ──
     _new_zone="$(generate_zone_name "$_new")"
     _new_rule="Allow-AWG-${_new}"
     rule_exists_by_name "$_new_rule" && _new_rule="$(generate_rule_name "$_new")"
 
-    # ── Summary ──
-    echo ""
-    echo -e "  ${A}Will be renamed:${NC}"
+    section "Changes"
+
     echo -e "  ${B}•${NC} Interface        ${W}${_old}${NC} → ${OK}${_new}${NC}"
     echo -e "  ${B}•${NC} Peer sections    ${W}amneziawg_${_old}${NC} → ${OK}amneziawg_${_new}${NC}"
     if [ -n "$_old_zone" ]; then
@@ -3131,8 +3140,8 @@ do_delete_interface() {
     DEL_PORT="$(uci -q get "network.${DEL_IFACE}.listen_port" || true)"
     DEL_ZONE="$(find_zone_for_interface "$DEL_IFACE" 2>/dev/null || true)"
 
-    echo ""
-    echo -e "  ${A}Will be removed:${NC}"
+    section "Will be removed"
+
     echo -e "  ${ERR}-${NC} Interface        ${W}$DEL_IFACE${NC}"
     echo -e "  ${ERR}-${NC} All peers        ${W}$DEL_IFACE${NC}"
     [ -n "$DEL_ZONE" ] && \
@@ -3142,7 +3151,6 @@ do_delete_interface() {
     if podkop_present && podkop_has_interface "$DEL_IFACE" 2>/dev/null; then
         echo -e "  ${ERR}-${NC} Podkop           ${W}$DEL_IFACE${NC}"
     fi
-    # Count DNS hostrecords
     _del_hr=0; _del_hi=0
     while uci -q get "dhcp.@hostrecord[$_del_hi]" >/dev/null 2>&1; do
         _del_hli="$(uci -q get "dhcp.@hostrecord[$_del_hi]._liminal_iface" || true)"
@@ -3247,18 +3255,16 @@ do_create() {
     trap_cancel
     clear
     echo -e "${W}Create Interface${NC}"
-    echo ""
     echo -e "${DIM}──────────────────────────────────────${NC}"
     echo ""
-
     echo -e "  ${WARN_C}NOTE: A static public IP address (or a DDNS hostname) and${NC}"
     echo -e "  ${WARN_C}NAT port forwarding (UDP) on your upstream router are${NC}"
     echo -e "  ${WARN_C}required for external clients to connect to this tunnel.${NC}"
-    echo ""
     echo -e "  ${DIM2}(Ctrl+C = cancel)${NC}"
-    echo ""
 
-    # ── Interface name ──
+    # ── Network ──────────────────────────────────────────────────────
+    section "Network"
+
     while true; do
         prompt IFNAME "Interface name" "awg0" || { trap_restore; return; }
         is_cancelled && { trap_restore; return; }
@@ -3268,38 +3274,69 @@ do_create() {
         break
     done
 
-    # ── Address ──
-    while true; do
-        prompt IFADDR "Interface address with CIDR (e.g. 10.10.10.1/24)" "" || { trap_restore; return; }
-        is_cancelled && { trap_restore; return; }
-        [ -z "$IFADDR" ] && { warn "Required field"; continue; }
-        validate_cidr_ipv4 "$IFADDR" || continue
-        # Check for address/subnet overlap with all network interfaces
-        _addr_conflict=""
-        _new_subnet="$(network_base_from_cidr "$IFADDR")"
-        _new_ip="${IFADDR%/*}"
-        _all_ifaces="$(uci show network 2>/dev/null \
-            | sed -n "s/^network\.\([^.]*\)\.addresses=.*/\1/p" \
-            | sort -u)"
-        for _eif in $_all_ifaces; do
-            for _ev in $(uci -q get "network.${_eif}.addresses" 2>/dev/null); do
-                case "$_ev" in */*) ;; *) continue ;; esac
-                _esubnet="$(network_base_from_cidr "$_ev")"
-                if [ "$_esubnet" = "$_new_subnet" ] || cidr_contains_ip "$_ev" "$_new_ip"; then
-                    _addr_conflict="$_eif"; break 2
+    _auto_addr="$(find_free_subnet || true)"
+    if [ -n "$_auto_addr" ]; then
+        IFADDR="$_auto_addr"
+        echo -e "  ${ICO_OK} ${OK}Subnet:${NC} ${W}$IFADDR${NC}"
+        if ! confirm "Use this address?" "y"; then
+            while true; do
+                prompt IFADDR "Interface address with CIDR" "$_auto_addr" || { trap_restore; return; }
+                is_cancelled && { trap_restore; return; }
+                [ -z "$IFADDR" ] && { warn "Required field"; continue; }
+                validate_cidr_ipv4 "$IFADDR" || continue
+                _addr_conflict=""
+                _new_subnet="$(network_base_from_cidr "$IFADDR")"
+                _new_ip="${IFADDR%/*}"
+                _all_ifaces="$(uci show network 2>/dev/null \
+                    | sed -n "s/^network\.\([^.]*\)\.addresses=.*/\1/p" \
+                    | sort -u)"
+                for _eif in $_all_ifaces; do
+                    for _ev in $(uci -q get "network.${_eif}.addresses" 2>/dev/null); do
+                        case "$_ev" in */*) ;; *) continue ;; esac
+                        _esubnet="$(network_base_from_cidr "$_ev")"
+                        if [ "$_esubnet" = "$_new_subnet" ] || cidr_contains_ip "$_ev" "$_new_ip"; then
+                            _addr_conflict="$_eif"; break 2
+                        fi
+                    done
+                done
+                if [ -n "$_addr_conflict" ]; then
+                    warn "Address ${IFADDR} overlaps with interface '${_addr_conflict}'"
+                    continue
                 fi
+                break
             done
-        done
-        if [ -n "$_addr_conflict" ]; then
-            warn "Address ${IFADDR} overlaps with interface '${_addr_conflict}'"
-            continue
         fi
-        break
-    done
+    else
+        while true; do
+            prompt IFADDR "Interface address with CIDR (e.g. 10.10.10.1/24)" "" || { trap_restore; return; }
+            is_cancelled && { trap_restore; return; }
+            [ -z "$IFADDR" ] && { warn "Required field"; continue; }
+            validate_cidr_ipv4 "$IFADDR" || continue
+            _addr_conflict=""
+            _new_subnet="$(network_base_from_cidr "$IFADDR")"
+            _new_ip="${IFADDR%/*}"
+            _all_ifaces="$(uci show network 2>/dev/null \
+                | sed -n "s/^network\.\([^.]*\)\.addresses=.*/\1/p" \
+                | sort -u)"
+            for _eif in $_all_ifaces; do
+                for _ev in $(uci -q get "network.${_eif}.addresses" 2>/dev/null); do
+                    case "$_ev" in */*) ;; *) continue ;; esac
+                    _esubnet="$(network_base_from_cidr "$_ev")"
+                    if [ "$_esubnet" = "$_new_subnet" ] || cidr_contains_ip "$_ev" "$_new_ip"; then
+                        _addr_conflict="$_eif"; break 2
+                    fi
+                done
+            done
+            if [ -n "$_addr_conflict" ]; then
+                warn "Address ${IFADDR} overlaps with interface '${_addr_conflict}'"
+                continue
+            fi
+            break
+        done
+    fi
     IF_IP="${IFADDR%/*}"
     IF_SUBNET="$(network_base_from_cidr "$IFADDR")"
 
-    # ── Port ──
     while true; do
         prompt PORT "Listen port" "51820" || { trap_restore; return; }
         is_cancelled && { trap_restore; return; }
@@ -3310,98 +3347,6 @@ do_create() {
         break
     done
 
-    # ── Router LAN IP (auto-detect) ──
-    ROUTER_LAN_IP="$(detect_router_lan_ip || true)"
-    if [ -z "$ROUTER_LAN_IP" ]; then
-        while true; do
-            prompt ROUTER_LAN_IP "Could not detect router LAN IP — enter manually" "" || { trap_restore; return; }
-            is_cancelled && { trap_restore; return; }
-            [ -z "$ROUTER_LAN_IP" ] && { warn "Required field"; continue; }
-            validate_ipv4 "$ROUTER_LAN_IP" && break
-        done
-    else
-        echo -e "  ${OK}Detected LAN IP:${NC} $ROUTER_LAN_IP"
-        if ! confirm "Use this address?" "y"; then
-            while true; do
-                prompt ROUTER_LAN_IP "Enter router LAN IP" "$ROUTER_LAN_IP" || { trap_restore; return; }
-                is_cancelled && { trap_restore; return; }
-                validate_ipv4 "$ROUTER_LAN_IP" && break
-            done
-        fi
-    fi
-
-    if cidr_contains_ip "$IF_SUBNET" "$ROUTER_LAN_IP"; then
-        warn "AWG subnet '$IF_SUBNET' overlaps with router LAN IP '$ROUTER_LAN_IP'"
-        PAUSE; return
-    fi
-
-    # ── Firewall zone (auto-name) ──
-    ZONE_NAME="$(generate_zone_name "$IFNAME")"
-    echo -e "  ${OK}Auto FW zone:${NC} $ZONE_NAME"
-    if ! confirm "Use this name?" "y"; then
-        while true; do
-            prompt ZONE_NAME "Enter FW zone name" "$ZONE_NAME" || { trap_restore; return; }
-            is_cancelled && { trap_restore; return; }
-            validate_zone_name "$ZONE_NAME" || continue
-            zone_exists "$ZONE_NAME" && { warn "FW zone '$ZONE_NAME' already exists"; continue; }
-            break
-        done
-    fi
-
-    # ── LAN / WAN zones ──
-    _zones="$(list_zones)"
-    echo ""
-    echo -e "  ${A}Available firewall zones:${NC}"
-    _zi=0
-    for _z in $_zones; do
-        _zi=$((_zi + 1))
-        echo -e "  ${B}${_zi}${NC} ${DIM2}›${NC} ${W}${_z}${NC}"
-    done
-    echo ""
-
-    while true; do
-        prompt _lan_pick "Select LAN zone number" "" || { trap_restore; return; }
-        is_cancelled && { trap_restore; return; }
-        [ -z "$_lan_pick" ] && { warn "Required field"; continue; }
-        _zn=0; LAN_ZONE=""
-        for _z in $_zones; do
-            _zn=$((_zn + 1))
-            [ "$_zn" = "$_lan_pick" ] && { LAN_ZONE="$_z"; break; }
-        done
-        [ -z "$LAN_ZONE" ] && { warn "Invalid selection"; continue; }
-        break
-    done
-    echo -e "  ${OK}LAN zone:${NC} $LAN_ZONE"
-
-    while true; do
-        prompt _wan_pick "Select WAN zone number" "" || { trap_restore; return; }
-        is_cancelled && { trap_restore; return; }
-        [ -z "$_wan_pick" ] && { warn "Required field"; continue; }
-        _zn=0; WAN_ZONE=""
-        for _z in $_zones; do
-            _zn=$((_zn + 1))
-            [ "$_zn" = "$_wan_pick" ] && { WAN_ZONE="$_z"; break; }
-        done
-        [ -z "$WAN_ZONE" ] && { warn "Invalid selection"; continue; }
-        [ "$WAN_ZONE" = "$LAN_ZONE" ] && { warn "WAN zone cannot be same as LAN zone"; continue; }
-        break
-    done
-    echo -e "  ${OK}WAN zone:${NC} $WAN_ZONE"
-
-    # ── Forwarding ──
-    ALLOW_LAN_FORWARD="0"; ALLOW_WAN_FORWARD="0"
-    confirm "Allow routing to LAN?" "y" && ALLOW_LAN_FORWARD="1"
-    confirm "Allow routing to WAN?" "y" && ALLOW_WAN_FORWARD="1"
-    if [ "$ALLOW_LAN_FORWARD" = "0" ] && [ "$ALLOW_WAN_FORWARD" = "0" ]; then
-        warn "At least one routing direction (LAN or WAN) required"
-        PAUSE; return
-    fi
-
-    # ── Firewall rule name (auto-name) ──
-    INCOMING_RULE_NAME="$(generate_rule_name "$IFNAME")"
-    echo -e "  ${OK}Auto FW rule:${NC} $INCOMING_RULE_NAME"
-
-    # ── MTU ──
     while true; do
         prompt MTU_VALUE "MTU" "1380" || { trap_restore; return; }
         is_cancelled && { trap_restore; return; }
@@ -3411,27 +3356,125 @@ do_create() {
         break
     done
 
-    # ── Podkop / DNS ──
+    # ── Firewall ─────────────────────────────────────────────────────
+    section "Firewall"
+
+    ROUTER_LAN_IP="$(detect_router_lan_ip || true)"
+    if [ -z "$ROUTER_LAN_IP" ]; then
+        while true; do
+            prompt ROUTER_LAN_IP "Could not detect router LAN IP — enter manually" "" || { trap_restore; return; }
+            is_cancelled && { trap_restore; return; }
+            [ -z "$ROUTER_LAN_IP" ] && { warn "Required field"; continue; }
+            validate_ipv4 "$ROUTER_LAN_IP" && break
+        done
+    else
+        echo -e "  ${ICO_OK} ${OK}LAN IP:${NC}   ${W}$ROUTER_LAN_IP${NC}"
+    fi
+
+    if cidr_contains_ip "$IF_SUBNET" "$ROUTER_LAN_IP"; then
+        warn "AWG subnet '$IF_SUBNET' overlaps with router LAN IP '$ROUTER_LAN_IP'"
+        PAUSE; return
+    fi
+
+    ZONE_NAME="$(generate_zone_name "$IFNAME")"
+    INCOMING_RULE_NAME="$(generate_rule_name "$IFNAME")"
+    echo -e "  ${ICO_OK} ${OK}FW zone:${NC}  ${W}$ZONE_NAME${NC}"
+    echo -e "  ${ICO_OK} ${OK}FW rule:${NC}  ${W}$INCOMING_RULE_NAME${NC}"
+
+    # Auto-detect LAN/WAN zones
+    _zones="$(list_zones)"
+    if zone_exists "lan"; then
+        LAN_ZONE="lan"
+    else
+        echo ""
+        echo -e "  ${A}Available firewall zones:${NC}"
+        _zi=0
+        for _z in $_zones; do
+            _zi=$((_zi + 1))
+            echo -e "    ${B}${_zi}${NC} ${DIM2}›${NC} ${W}${_z}${NC}"
+        done
+        echo ""
+        while true; do
+            prompt _lan_pick "Select LAN zone number" "" || { trap_restore; return; }
+            is_cancelled && { trap_restore; return; }
+            [ -z "$_lan_pick" ] && { warn "Required field"; continue; }
+            _zn=0; LAN_ZONE=""
+            for _z in $_zones; do
+                _zn=$((_zn + 1))
+                [ "$_zn" = "$_lan_pick" ] && { LAN_ZONE="$_z"; break; }
+            done
+            [ -z "$LAN_ZONE" ] && { warn "Invalid selection"; continue; }
+            break
+        done
+    fi
+    echo -e "  ${ICO_OK} ${OK}LAN zone:${NC} ${W}$LAN_ZONE${NC}"
+
+    if zone_exists "wan"; then
+        WAN_ZONE="wan"
+    else
+        _remaining=""
+        for _z in $_zones; do
+            [ "$_z" = "$LAN_ZONE" ] && continue
+            _remaining="${_remaining} ${_z}"
+        done
+        echo ""
+        echo -e "  ${A}Available WAN zones:${NC}"
+        _zi=0
+        for _z in $_remaining; do
+            _zi=$((_zi + 1))
+            echo -e "    ${B}${_zi}${NC} ${DIM2}›${NC} ${W}${_z}${NC}"
+        done
+        echo ""
+        while true; do
+            prompt _wan_pick "Select WAN zone number" "" || { trap_restore; return; }
+            is_cancelled && { trap_restore; return; }
+            [ -z "$_wan_pick" ] && { warn "Required field"; continue; }
+            _zn=0; WAN_ZONE=""
+            for _z in $_remaining; do
+                _zn=$((_zn + 1))
+                [ "$_zn" = "$_wan_pick" ] && { WAN_ZONE="$_z"; break; }
+            done
+            [ -z "$WAN_ZONE" ] && { warn "Invalid selection"; continue; }
+            break
+        done
+    fi
+    echo -e "  ${ICO_OK} ${OK}WAN zone:${NC} ${W}$WAN_ZONE${NC}"
+
+    # ── Routing ──────────────────────────────────────────────────────
+    section "Routing"
+
+    ALLOW_LAN_FORWARD="0"; ALLOW_WAN_FORWARD="0"
+    confirm "Allow routing to LAN?" "y" && ALLOW_LAN_FORWARD="1"
+    confirm "Allow routing to WAN?" "y" && ALLOW_WAN_FORWARD="1"
+    if [ "$ALLOW_LAN_FORWARD" = "0" ] && [ "$ALLOW_WAN_FORWARD" = "0" ]; then
+        warn "At least one routing direction (LAN or WAN) required"
+        PAUSE; return
+    fi
+
+    # ── DNS ──────────────────────────────────────────────────────────
+    section "DNS"
+
     USE_PODKOP="0"; DNS_IP=""
     if podkop_present; then
-        echo -e "  ${OK}Podkop found${NC}"
+        echo -e "  ${ICO_OK} ${OK}Podkop found${NC}"
         if [ "$SB_RUNNING" -eq 1 ] && [ "$SB_DNS" -eq 1 ]; then
-            echo -e "  ${DIM2}Sing-Box listening on 127.0.0.42:53${NC}"
+            echo -e "  ${DIM2}  Sing-Box listening on 127.0.0.42:53${NC}"
             if [ "$DM_FWD" -eq 1 ]; then
-                echo -e "  ${DIM2}DNS chain: peer → dnsmasq → Sing-Box → internet${NC}"
+                echo -e "  ${DIM2}  DNS chain: peer → dnsmasq → Sing-Box → internet${NC}"
             else
-                echo -e "  ${WARN_C}dnsmasq is not forwarding to Sing-Box (missing server 127.0.0.42)${NC}"
+                echo -e "  ${WARN_C}  dnsmasq is not forwarding to Sing-Box (missing server 127.0.0.42)${NC}"
             fi
         elif [ "$SB_RUNNING" -eq 0 ]; then
-            echo -e "  ${WARN_C}Sing-Box is not running${NC}"
+            echo -e "  ${WARN_C}  Sing-Box is not running${NC}"
         fi
+        echo ""
         if confirm "Configure Podkop-aware routing?" "y"; then
             USE_PODKOP="1"
             DNS_IP="$ROUTER_LAN_IP"
             if [ "$SB_DNS" -eq 1 ] && [ "$DM_FWD" -eq 1 ]; then
-                echo -e "  ${OK}Client DNS:${NC} ${W}$DNS_IP${NC} ${DIM2}→ dnsmasq → Sing-Box${NC}"
+                echo -e "  ${ICO_OK} ${OK}Client DNS:${NC} ${W}$DNS_IP${NC} ${DIM2}→ dnsmasq → Sing-Box${NC}"
             else
-                echo -e "  ${OK}Client DNS:${NC} ${W}$DNS_IP${NC} ${DIM2}(router LAN)${NC}"
+                echo -e "  ${ICO_OK} ${OK}Client DNS:${NC} ${W}$DNS_IP${NC} ${DIM2}(router LAN)${NC}"
             fi
         fi
     fi
@@ -3443,16 +3486,15 @@ do_create() {
 
     check_dangerous_forwarding "$ZONE_NAME"
 
-    # ── Key generation ──
-    echo ""
+    # ── Summary ──────────────────────────────────────────────────────
+    section "Summary"
+
     echo -e "  ${B}Generating${NC} keys..."
     KEYS="$(generate_awg_keys)"
     SERVER_PRIVKEY="$(printf '%s\n' "$KEYS" | sed -n '1p')"
     SERVER_PUBKEY="$(printf  '%s\n' "$KEYS" | sed -n '2p')"
-
-    # ── Confirmation ──
     echo ""
-    echo -e "  ${V}Planned config:${NC}"
+
     echo -e "  ${A}Interface${NC}    ${W}$IFNAME${NC}"
     echo -e "  ${A}Address${NC}      ${W}$IFADDR${NC}"
     echo -e "  ${A}Subnet${NC}       ${W}$IF_SUBNET${NC}"
@@ -3969,9 +4011,10 @@ do_export_config() {
 do_import_config() {
     have_cmd jq || { warn "jq is required for import"; PAUSE; return; }
 
-    echo ""
+    section "Import"
+
     prompt _import_file "Path to export JSON file" "" || return
-    [ -z "${_import_file:-}" ] && { echo -e "${DIM2}Cancelled${NC}"; PAUSE; return; }
+    [ -z "${_import_file:-}" ] && { echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; return; }
     [ -f "$_import_file" ] || { warn "File not found: $_import_file"; PAUSE; return; }
 
     _ver="$(jq -r '.liminal_version // empty' "$_import_file" 2>/dev/null || true)"
@@ -3981,7 +4024,8 @@ do_import_config() {
     _icount="$(jq '.interfaces | length' "$_import_file")"
     _pcount="$(jq '[.interfaces[].peers | length] | add // 0' "$_import_file")"
 
-    echo ""
+    section "Summary"
+
     echo -e "  ${A}Export version${NC}  ${W}${_ver}${NC}"
     echo -e "  ${A}Exported at${NC}    ${W}${_exported}${NC}"
     echo -e "  ${A}Interfaces${NC}     ${W}${_icount}${NC}"
