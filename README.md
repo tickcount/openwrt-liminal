@@ -4,8 +4,6 @@ A menu-driven AmneziaWG tunnel manager for OpenWrt routers.
 
 Create encrypted tunnels from your devices (phone, laptop, etc.) back to your home router, routing traffic through your LAN and out to the internet — all managed from an interactive SSH terminal UI.
 
-Universal proxy for all your devices through your home router — whether it's a phone on mobile data or another computer needing LAN/WAN access.
-
 ```
 ┌─────────────┐       ┌──────────────────┐       ┌─────────────────┐       ┌──────────────┐       ┌──────────┐
 │   Client    │──────>│   Home Router    │──────>│   LAN / WAN     │──────>│   Podkop     │──────>│ Internet │
@@ -39,31 +37,68 @@ Universal proxy for all your devices through your home router — whether it's a
 ### Interface Management
 - **Create** AmneziaWG interfaces with automatic firewall zone, rules, and forwarding setup
 - **Auto-detect** router LAN IP, WAN IP (endpoint), and firewall zones
-- **Podkop integration** — optional Podkop-aware routing with one toggle
+- **Inline peer list** on interface page with direct numeric selection
+- **Edit settings** — DNS, MTU, listen port, endpoint host override
+- **Toggle LAN/WAN forwarding** directly from the interface menu
+- **Podkop integration** — link/unlink with one toggle
+- **Inline diagnostics** — warnings for down device, closed port, missing zone/forwarding
+- **Interface info** — uptime, total traffic (Rx/Tx), public key, Podkop status
 - **Disable / Enable / Delete** interfaces with full cleanup
 - **Non-Liminal interface support** — manage interfaces created outside Liminal (read-only, no delete)
 
 ### Peer Management
-- **Add peers** with automatic IP allocation from the interface subnet
+- **Add peers** with automatic IP allocation and subnet validation
+- **Routing mode presets** — Full tunnel, LAN only, WAN only, or custom AllowedIPs
+- **PreSharedKey** generation for extra security
 - **Live status** — Online/Offline detection via latest handshake (≤120s threshold)
+- **Handshake color-coding** — green ≤30s, amber ≤120s, red >120s
 - **Per-peer info** — endpoint, handshake time, Rx/Tx transfer, keepalive, public key
+- **Edit per-peer settings** — AllowedIPs, Keepalive
 - **Export configs** — WireGuard config, QR code, download link, `vpn://` AmneziaVPN key
 - **Show All** — config + QR + vpn:// + download in one view
 - **Rename / Regenerate keys / Disable / Enable / Delete** peers
+- **Auto-navigate** to peer menu after creation
+
+### Live Dashboard
+- **Real-time monitoring** with auto-refresh (3s interval)
+- **Per-peer table** — name, status, address, endpoint, handshake, Rx/Tx
+- All interfaces and peers on a single screen
+
+### Connectivity Check
+- **Per-interface diagnostics** — device status, AWG, port, firewall zone, forwarding rules
+- **Ping test** for online peers
+
+### Export / Import
+- **Export** full configuration to JSON (interfaces + peers + keys)
+- **Import** from a previously exported JSON file
+- Useful for migration between routers or disaster recovery
 
 ### Backup System
 - **Automatic backups** before interface creation and deletion (toggleable)
 - **Manual backups** on demand
 - **Restore** from any backup with one click
-- **Manage** — list, inspect, delete individual or all backups
+- **Manage** — list, inspect (with size), delete individual or all backups
 - Backups include `network`, `firewall`, and `podkop` configs
 
+### Self-Update
+- **Check for updates** from GitHub directly from the main menu
+- Version comparison and one-click update with automatic restart
+
 ### Installer
-- **One-click install** for AmneziaWG, Podkop, and dependencies (`qrencode`, `jq`, `base64`)
-- Dependency status shown on the main screen
+- **Install All Missing** — one button to install everything at once
+- Individual installers for AmneziaWG, Podkop, qrencode, jq, base64
+- Dependency status shown on the main screen with version info
+
+### UI
+- **Box-drawing frames** and **status icons** (● ○ ✓ ✗ !) across all menus
+- **Breadcrumb navigation** — always know where you are
+- **Animated spinner** for long operations
+- **Soft color palette** — white-blue-violet theme
 
 ### Safety
 - `_is_liminal` flag on all created UCI objects — Liminal never touches configs it didn't create
+- Input sanitization and name validation
+- Subnet validation for generated peer IPs
 
 ## Requirements
 
@@ -75,11 +110,11 @@ Universal proxy for all your devices through your home router — whether it's a
 | Package | Used for |
 |---------|----------|
 | `qrencode` | QR code generation |
-| `jq` | AmneziaVPN `vpn://` key generation |
+| `jq` | AmneziaVPN `vpn://` key generation, export/import |
 | `coreutils-base64` | Config encoding for download links and VPN keys |
 | `podkop` | Split-tunnel routing integration |
 
-All packages above can be installed directly from the main menu.
+All packages can be installed directly from the main menu (individually or all at once).
 
 ## Installation
 
@@ -105,44 +140,37 @@ liminal
 
 ```
 Main Menu
-├── 1) Create Interface
-├── 2) Manage Interfaces
-│   └── Select interface
-│       ├── 1) Add Peer
-│       ├── 2) List Peers
-│       │   └── Select peer
-│       │       ├── 1) Show Setup Config
-│       │       ├── 2) Show Download Link
-│       │       ├── 3) Show vpn:// Key
-│       │       ├── 4) Show QR Code
-│       │       ├── 5) Show All
-│       │       ├── 6) Rename Peer
-│       │       ├── 7) Regenerate Keys
-│       │       ├── 8) Disable/Enable Peer
-│       │       └── 9) Delete Peer
-│       ├── 3) Restart Interface
-│       ├── 4) Disable/Enable Interface
-│       └── 5) Delete Interface
-├── 3) Manage Backups
-│   ├── c) Create Backup
-│   ├── t) Toggle Auto-Backup
-│   ├── d) Delete All
-│   └── Select backup → Restore / Delete
-├── 4) Full Reset
-├── a) Install AmneziaWG
-├── p) Install Podkop
-├── q) Install qrencode
-├── j) Install jq
-└── b) Install coreutils-base64
+├── Interfaces (inline list with status)
+│   ├── + ) Create Interface
+│   └── 1..N ) Select interface
+│       ├── Peers (inline list with status)
+│       │   ├── + ) Add Peer
+│       │   └── 1..N ) Select peer
+│       │       ├── Config: Show Config / Download Link / vpn:// Key / QR Code / Show All
+│       │       ├── Settings: AllowedIPs / Keepalive
+│       │       └── Actions: Rename / Regenerate Keys / Disable|Enable / Delete
+│       ├── Settings: DNS+MTU / Port / Endpoint / LAN Fwd / WAN Fwd / Podkop
+│       ├── Info: Public Key
+│       └── Interface: Restart / Disable|Enable / Delete
+├── m ) Live Dashboard
+├── e ) Export / Import
+├── b ) Manage Backups
+│   ├── c ) Create Backup
+│   ├── t ) Toggle Auto-Backup
+│   ├── d ) Delete All
+│   └── 1..N ) Select backup → Restore / Delete
+├── f ) Full Reset
+├── u ) Check for Updates
+└── Install missing packages (shown only when needed)
 ```
 
 ### Creating a tunnel
 
-1. Run `liminal` and select **Create Interface**
+1. Run `liminal` and press `+` to **Create Interface**
 2. Enter interface name, address (e.g. `10.10.10.1/24`), port
 3. Router LAN IP and firewall zones are auto-detected
 4. Review the planned config and confirm
-5. Add peers — each peer gets a config, QR code, and `vpn://` key
+5. Add peers — choose routing mode, generate PSK, get config + QR + `vpn://` key
 
 ### Connecting a client
 
@@ -153,7 +181,7 @@ Use any of the export options from the peer menu:
 ## How it works
 
 Liminal creates standard AmneziaWG interfaces via UCI with:
-- A firewall zone with LAN/WAN forwarding
+- A firewall zone with configurable LAN/WAN forwarding
 - An incoming UDP rule for the listen port
 - WAN masquerading for internet access
 - Optional Podkop source interface registration
