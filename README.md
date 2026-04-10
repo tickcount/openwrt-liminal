@@ -2,7 +2,7 @@
 
 AmneziaWG tunnel manager for OpenWrt routers. Runs over SSH as an interactive TUI.
 
-Sets up encrypted VPN tunnels so your devices (phone, laptop, etc.) can route traffic through your home router — accessing your LAN and going out to the internet through your home IP.
+Sets up encrypted VPN tunnels so your devices (phone, laptop, etc.) can route traffic through your home router — accessing your LAN and going out to the internet through your home IP (or any other proxy such as sing-box/podkop/etc).
 
 ![Shell Script](https://img.shields.io/badge/shell-ash%2Fbusybox-blue)
 ![Platform](https://img.shields.io/badge/platform-OpenWrt%2024.10-green)
