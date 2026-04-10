@@ -11,7 +11,7 @@ Sets up encrypted VPN tunnels so your devices (phone, laptop, etc.) can route tr
 ## Preview
 <center>
 <img width="525" height="542" alt="main" src="https://github.com/user-attachments/assets/9c816a9a-5785-43f2-be18-02b58da7ea5e" />
-<img width="680" height="687" alt="interface" src="https://github.com/user-attachments/assets/5b7bb1de-7993-4c69-ad55-d0521318b5f3" />
+<img width="1090" height="674" alt="Untitled" src="https://github.com/user-attachments/assets/d624a352-d252-431d-9485-639ccb61034a" />
 </center>
 
 ## What it does
