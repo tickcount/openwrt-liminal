@@ -545,14 +545,24 @@ confirm() {
 
 # ─── DNS selector ─────────────────────────────────────────────────────
 
-# _dns_test IP — ping DNS server, print latency in ms (or "ok"/"fail")
+# _uptime_ms — current uptime in milliseconds (via /proc/uptime, ~10ms precision)
+_uptime_ms() {
+    awk '{split($1,a,"."); printf "%d\n", a[1]*1000 + a[2]*10}' /proc/uptime 2>/dev/null || echo ""
+}
+
+# _dns_test IP — test DNS server with actual query, print latency in ms (or "ok"/"fail")
+# Verifies the IP is a real DNS server (resolves a domain), not just pingable.
 _dns_test() {
     _dt_ip="$1"
-    _dt_out="$(ping -c1 -W2 "$_dt_ip" 2>/dev/null)" || { echo "fail"; return; }
-    # Parse "time=12.3 ms" from ping output
-    _dt_ms="$(echo "$_dt_out" | sed -n 's/.*time=\([0-9]*\).*/\1/p' | head -n1)"
-    if [ -n "$_dt_ms" ]; then
-        echo "$_dt_ms"
+    _dt_start="$(_uptime_ms)"
+    # Actual DNS query — proves this is a DNS server, not just a live host
+    _dt_ips="$(_nslookup_ips "google.com" "$_dt_ip")"
+    [ -z "$_dt_ips" ] && { echo "fail"; return; }
+    _dt_end="$(_uptime_ms)"
+    if [ -n "$_dt_start" ] && [ -n "$_dt_end" ]; then
+        _dt_ms=$((_dt_end - _dt_start))
+        [ "$_dt_ms" -lt 0 ] && _dt_ms=0
+        echo "${_dt_ms}ms"
     else
         echo "ok"
     fi
@@ -573,7 +583,7 @@ _dns_fmt_latency() {
     case "$1" in
         fail) printf '%b' "${ERR}✗${NC}" ;;
         ok)   printf '%b' "${OK}✓${NC}" ;;
-        *)    printf '%b' "${OK}✓${NC} ${DIM2}${1}ms${NC}" ;;
+        *)    printf '%b' "${OK}✓${NC} ${DIM2}${1}${NC}" ;;
     esac
 }
 
@@ -636,8 +646,10 @@ select_dns() {
             _sd_eip="${_sd_entry##*|}"
             _sd_rl="$(_sd_lat "$_sd_eip")"
             case "$_sd_rl" in fail|ok) continue ;; esac
-            if [ "$_sd_rl" -lt "$_sd_best_ms" ] 2>/dev/null; then
-                _sd_best_ms="$_sd_rl"; _sd_best_ip="$_sd_eip"
+            _sd_rl_num="$(echo "$_sd_rl" | tr -dc '0-9')"
+            [ -z "$_sd_rl_num" ] && continue
+            if [ "$_sd_rl_num" -lt "$_sd_best_ms" ] 2>/dev/null; then
+                _sd_best_ms="$_sd_rl_num"; _sd_best_ip="$_sd_eip"
             fi
         done
         IFS="$_sd_ifs"
@@ -750,11 +762,12 @@ select_dns() {
         [ -n "$_sd_cur" ] && [ "$_sd_cur" = "$_sd_ip" ] && continue
         [ -n "$_sd_rec" ] && [ "$_sd_rec" = "$_sd_ip" ] && continue
         _sd_ms="$(_sd_lat "$_sd_ip")"
-        # Pad for sort: numbers get zero-padded, fail/ok go last
+        # Pad for sort: strip unit suffix, zero-pad, fail/ok go last
+        _sd_ms_num="$(echo "$_sd_ms" | tr -dc '0-9')"
         case "$_sd_ms" in
             fail) _sd_sort_key="99998" ;;
             ok)   _sd_sort_key="99997" ;;
-            *)    _sd_sort_key="$(printf '%05d' "$_sd_ms" 2>/dev/null || echo "99999")" ;;
+            *)    _sd_sort_key="$(printf '%05d' "$_sd_ms_num" 2>/dev/null || echo "99999")" ;;
         esac
         _sd_sortbuf="${_sd_sortbuf:+${_sd_sortbuf}
 }${_sd_sort_key}|${_sd_name}|${_sd_ip}"
@@ -801,72 +814,58 @@ select_dns() {
         done
     fi
 
-    if [ -n "$_sd_def_n" ]; then
-        echo -ne "  ${A}>${NC} ${DIM2}[${_sd_def_n}]${NC} "; read -r _sd_choice || true
-    else
-        echo -ne "  ${A}>${NC} "; read -r _sd_choice || true
-    fi
-    sigint_caught && { rm -rf "$_sd_tmp"; return 1; }
-    _sd_choice="$(printf '%s' "${_sd_choice:-}" | tr -d '\001-\037\177')"
-
-    # Empty = select recommendation (or cancel if no recommendation)
-    if [ -z "$_sd_choice" ]; then
+    while true; do
         if [ -n "$_sd_def_n" ]; then
-            _sd_choice="$_sd_def_n"
+            echo -ne "  ${A}>${NC} ${DIM2}[${_sd_def_n}]${NC} "; read -r _sd_choice || true
         else
-            rm -rf "$_sd_tmp"; return 1
+            echo -ne "  ${A}>${NC} "; read -r _sd_choice || true
         fi
-    fi
+        sigint_caught && { rm -rf "$_sd_tmp"; return 1; }
+        _sd_choice="$(printf '%s' "${_sd_choice:-}" | tr -d '\001-\037\177')"
 
-    # Custom
-    if [ "$_sd_choice" = "0" ]; then
-        rm -rf "$_sd_tmp"
-        while true; do
-            prompt _sd_custom "DNS server (IPv4)" "" || return 1
-            sigint_caught && return 1
-            [ -z "$_sd_custom" ] && return 1
-            validate_ipv4 "$_sd_custom" || continue
-
-            # Test custom DNS
-            echo ""
-            echo -ne "  ${DIM2}Ping${NC}${_C3}"
-            _sd_cping="$(_dns_test "$_sd_custom")"
-            echo -e "$(_dns_fmt_latency "$_sd_cping")"
-
-            echo -ne "  ${DIM2}DNS resolve${NC}${_C3}"
-            if check_dns_server "$_sd_custom"; then
-                echo -e "${OK}✓${NC}"
+        # Empty = select recommendation (or cancel if no recommendation)
+        if [ -z "$_sd_choice" ]; then
+            if [ -n "$_sd_def_n" ]; then
+                _sd_choice="$_sd_def_n"
             else
-                echo -e "${ERR}✗${NC}"
-                warn "DNS server ${_sd_custom} is not responding"
-                confirm "Use anyway?" "n" || continue
+                rm -rf "$_sd_tmp"; return 1
             fi
-            break
+        fi
+
+        # Custom prompt
+        if [ "$_sd_choice" = "0" ]; then
+            rm -rf "$_sd_tmp"
+            while true; do
+                prompt _sd_custom "DNS server (IPv4)" "" || return 1
+                sigint_caught && return 1
+                [ -z "$_sd_custom" ] && return 1
+                validate_ipv4 "$_sd_custom" || continue
+                break
+            done
+            eval "$_sd_var=\$_sd_custom"
+            return 0
+        fi
+
+        # Validate numeric choice
+        case "$_sd_choice" in *[!0-9]*) warn "Invalid selection"; continue ;; esac
+        if [ "$_sd_choice" -lt 1 ] 2>/dev/null; then warn "Invalid selection"; continue; fi
+        if [ "$_sd_choice" -gt "$_sd_max" ] 2>/dev/null; then warn "Invalid selection"; continue; fi
+
+        # Map choice to IP from ordered list
+        _sd_i=0; _sd_result=""
+        for _sd_ip in $_sd_list; do
+            _sd_i=$((_sd_i + 1))
+            if [ "$_sd_i" = "$_sd_choice" ]; then _sd_result="$_sd_ip"; fi
         done
-        eval "$_sd_var=\$_sd_custom"
-        return 0
-    fi
 
-    # Validate choice
-    case "$_sd_choice" in *[!0-9]*) warn "Invalid selection"; rm -rf "$_sd_tmp"; return 1 ;; esac
-    if [ "$_sd_choice" -lt 1 ] 2>/dev/null; then warn "Invalid selection"; rm -rf "$_sd_tmp"; return 1; fi
-    if [ "$_sd_choice" -gt "$_sd_max" ] 2>/dev/null; then warn "Invalid selection"; rm -rf "$_sd_tmp"; return 1; fi
+        if [ -z "$_sd_result" ]; then
+            warn "Invalid selection"; continue
+        fi
 
-    # Map choice to IP from ordered list
-    _sd_i=0; _sd_result=""
-    for _sd_ip in $_sd_list; do
-        _sd_i=$((_sd_i + 1))
-        if [ "$_sd_i" = "$_sd_choice" ]; then _sd_result="$_sd_ip"; fi
+        rm -rf "$_sd_tmp"
+        eval "$_sd_var=\$_sd_result"
+        break
     done
-
-    rm -rf "$_sd_tmp"
-
-    if [ -z "$_sd_result" ]; then
-        warn "Invalid selection"; return 1
-    fi
-
-    # Already tested — check cached result
-    eval "$_sd_var=\$_sd_result"
     return 0
 }
 
@@ -3487,29 +3486,26 @@ do_manage_interface() {
 
                 _new_dns=""
                 if select_dns _new_dns "$_cur_dns"; then
-                    if [ -n "$_new_dns" ] && [ "$_new_dns" != "$_cur_dns" ]; then
+                    if [ -n "$_new_dns" ] && [ "$_new_dns" = "$_cur_dns" ]; then
+                        echo -e "  ${DIM2}DNS unchanged${NC}"
+                    elif [ -n "$_new_dns" ] && [ "$_new_dns" != "$_cur_dns" ]; then
                         _TC="\033[36G"
                         echo ""
-                        echo -ne "  ${DIM2}Ping${NC}${_TC}"
-                        _ed_ping="$(_dns_test "$_new_dns")"
-                        echo -e "$(_dns_fmt_latency "$_ed_ping")"
-                        echo -ne "  ${DIM2}DNS resolve${NC}${_TC}"
-                        if check_dns_server "$_new_dns"; then
-                            echo -e "${OK}✓${NC}"
-                        else
-                            echo -e "${ERR}✗${NC}"
-                            warn "DNS server ${_new_dns} is not responding"
+                        _ed_test="$(_dns_test "$_new_dns")"
+                        if [ "$_ed_test" = "fail" ]; then
+                            echo -e "  ${ICO_ERR} ${ERR}${_new_dns} is not a DNS server or is not responding${NC}"
                             confirm "Use anyway?" "n" || { PAUSE; continue; }
+                        else
+                            echo -e "  ${ICO_OK} ${OK}DNS responds${NC}  $(_dns_fmt_latency "$_ed_test")"
                         fi
-                        echo -ne "  ${DIM2}DNS poisoning${NC}${_TC}"
                         check_dns_poisoning "facebook.com" "$_new_dns"
                         _ed_pr=$?
                         if [ "$_ed_pr" -eq 0 ]; then
-                            echo -e "${OK}✓ Clean${NC}"
+                            echo -e "  ${ICO_OK} ${OK}DNS clean${NC}"
                         elif [ "$_ed_pr" -eq 1 ]; then
-                            echo -e "${ERR}✗ 127.x.x.x detected${NC}"
+                            echo -e "  ${ICO_ERR} ${ERR}DNS poisoning detected (127.x.x.x)${NC}"
                         else
-                            echo -e "${WARN_C}? Can't check${NC}"
+                            echo -e "  ${ICO_WARN} ${WARN_C}DNS poisoning check unavailable${NC}"
                         fi
                         uci set "network.${_iface}.dns=$_new_dns"
                         _changed=1; _dns_changed=1
@@ -4383,7 +4379,26 @@ do_create() {
     fi
     if [ "$USE_PODKOP" != "1" ]; then
         while true; do
-            select_dns DNS_IP && [ -n "$DNS_IP" ] && break
+            select_dns DNS_IP && [ -n "$DNS_IP" ] || continue
+            _TC="\033[36G"
+            echo ""
+            _cd_test="$(_dns_test "$DNS_IP")"
+            if [ "$_cd_test" = "fail" ]; then
+                echo -e "  ${ICO_ERR} ${ERR}${DNS_IP} is not a DNS server or is not responding${NC}"
+                confirm "Use anyway?" "n" || continue
+            else
+                echo -e "  ${ICO_OK} ${OK}DNS responds${NC}  $(_dns_fmt_latency "$_cd_test")"
+            fi
+            check_dns_poisoning "facebook.com" "$DNS_IP"
+            _cd_pr=$?
+            if [ "$_cd_pr" -eq 0 ]; then
+                echo -e "  ${ICO_OK} ${OK}DNS clean${NC}"
+            elif [ "$_cd_pr" -eq 1 ]; then
+                echo -e "  ${ICO_ERR} ${ERR}DNS poisoning detected (127.x.x.x)${NC}"
+            else
+                echo -e "  ${ICO_WARN} ${WARN_C}DNS poisoning check unavailable${NC}"
+            fi
+            break
         done
     fi
 
