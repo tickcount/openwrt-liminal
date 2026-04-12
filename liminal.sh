@@ -9,9 +9,157 @@ set -eu
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 BACKUP_DIR=""
-LIMINAL_VERSION="1.2"
+LIMINAL_VERSION="1.3"
 LIMINAL_REPO="tickcount/openwrt-liminal"
 LIMINAL_RAW_URL="https://raw.githubusercontent.com/${LIMINAL_REPO}/refs/heads/main/liminal.sh"
+
+# ─── UCI config: /etc/config/liminal ────────────────────────────────
+
+# ensure_liminal_config — create /etc/config/liminal with defaults if absent;
+#                         migrate existing config (add missing settings section / dns_presets)
+ensure_liminal_config() {
+    if [ -f /etc/config/liminal ]; then
+        # Migrate: ensure 'settings' named section exists
+        uci -q get liminal.settings >/dev/null 2>&1 || {
+            uci set liminal.settings=liminal
+            uci commit liminal
+        }
+        return 0
+    fi
+    cat > /etc/config/liminal <<'UCICFG'
+config liminal 'settings'
+    option backup_dir '/root/liminal-backups'
+    option export_dir '/root/liminal-exports'
+    option auto_backup '1'
+    option default_mtu '1280'
+    option mtu_suggestion '1380'
+    option default_port '51820'
+    option default_keepalive '25'
+    option default_dns '1.1.1.1'
+    option singbox_dns_ip '127.0.0.42'
+
+config dns_preset
+    option name 'Cloudflare'
+    option ip '1.1.1.1'
+
+config dns_preset
+    option name 'Google'
+    option ip '8.8.8.8'
+
+config dns_preset
+    option name 'Quad9'
+    option ip '9.9.9.9'
+
+config dns_preset
+    option name 'OpenDNS'
+    option ip '208.67.222.222'
+
+config dns_preset
+    option name 'AdGuard'
+    option ip '94.140.14.14'
+
+config dns_preset
+    option name 'Yandex'
+    option ip '77.88.8.8'
+UCICFG
+}
+
+# _lcfg KEY DEFAULT — read a liminal.settings option with fallback
+_lcfg() { uci -q get "liminal.settings.$1" 2>/dev/null || echo "$2"; }
+
+# liminal_config_load — populate CFG_* variables from UCI
+liminal_config_load() {
+    # User-facing settings (from /etc/config/liminal)
+    CFG_BACKUP_DIR="$(_lcfg backup_dir        '/root/liminal-backups')"
+    CFG_EXPORT_DIR="$(_lcfg export_dir         '/root/liminal-exports')"
+    CFG_AUTO_BACKUP="$(_lcfg auto_backup       '1')"
+    CFG_DEFAULT_MTU="$(_lcfg default_mtu       '1280')"
+    CFG_MTU_SUGGESTION="$(_lcfg mtu_suggestion '1380')"
+    CFG_DEFAULT_PORT="$(_lcfg default_port     '51820')"
+    CFG_DEFAULT_KEEPALIVE="$(_lcfg default_keepalive '25')"
+    CFG_DEFAULT_DNS="$(_lcfg default_dns       '1.1.1.1')"
+    CFG_SB_DNS_IP="$(_lcfg singbox_dns_ip      '127.0.0.42')"
+
+    # Derived paths
+    BACKUP_BASE="$CFG_BACKUP_DIR"
+    EXPORT_DIR="$CFG_EXPORT_DIR"
+    DOWNLOAD_RETRIES=3
+}
+
+# Load DNS presets from UCI into _DNS_PRESETS (newline-separated "Name|IP")
+_load_dns_presets() {
+    _DNS_PRESETS=""
+    _dp_i=0
+    while uci -q get "liminal.@dns_preset[$_dp_i]" >/dev/null 2>&1; do
+        _dp_name="$(uci -q get "liminal.@dns_preset[$_dp_i].name" || true)"
+        _dp_ip="$(uci -q get "liminal.@dns_preset[$_dp_i].ip" || true)"
+        if [ -n "$_dp_name" ] && [ -n "$_dp_ip" ]; then
+            _DNS_PRESETS="${_DNS_PRESETS:+${_DNS_PRESETS}
+}${_dp_name}|${_dp_ip}"
+        fi
+        _dp_i=$((_dp_i + 1))
+    done
+    # Fallback if no presets in UCI (e.g. config created before dns_preset support)
+    if [ -z "$_DNS_PRESETS" ]; then
+        _DNS_PRESETS="Cloudflare|1.1.1.1
+Google|8.8.8.8
+Quad9|9.9.9.9
+OpenDNS|208.67.222.222
+AdGuard|94.140.14.14
+Yandex|77.88.8.8"
+    fi
+}
+
+ensure_liminal_config
+liminal_config_load
+_load_dns_presets
+
+# ─── Package manager abstraction ────────────────────────────────────
+
+PKG_IS_APK=0
+command -v apk >/dev/null 2>&1 && PKG_IS_APK=1
+
+pkg_update() {
+    if [ "$PKG_IS_APK" -eq 1 ]; then
+        apk update
+    else
+        opkg update
+    fi
+}
+
+pkg_install() {
+    if [ "$PKG_IS_APK" -eq 1 ]; then
+        apk add --allow-untrusted "$@"
+    else
+        opkg install "$@"
+    fi
+}
+
+pkg_remove() {
+    if [ "$PKG_IS_APK" -eq 1 ]; then
+        apk del "$@"
+    else
+        opkg remove --force-depends "$@"
+    fi
+}
+
+# pkg_is_installed PKG — check if a package is installed via package manager
+pkg_is_installed() {
+    if [ "$PKG_IS_APK" -eq 1 ]; then
+        apk list --installed 2>/dev/null | grep -q "$1"
+    else
+        opkg list-installed 2>/dev/null | grep -q "$1"
+    fi
+}
+
+# pkg_version PKG — print installed package version (empty if not installed)
+pkg_version() {
+    if [ "$PKG_IS_APK" -eq 1 ]; then
+        apk list --installed 2>/dev/null | grep "$1" | head -n1 | awk '{print $1}' | sed "s/^${1}-//"
+    else
+        opkg list-installed 2>/dev/null | grep "$1" | head -n1 | awk '{print $3}'
+    fi
+}
 
 # ─── Colors (soft white-blue-violet palette) ─────────────────────────
 
@@ -126,9 +274,9 @@ hs_colored() {
     _val="$1"; _sec="${2:-9999}"
     if [ "$_val" = "-" ] || [ "$_val" = "never" ] || [ -z "$_val" ]; then
         printf '%b' "${DIM2}never${NC}"
-    elif [ "$_sec" -le 30 ] 2>/dev/null; then
+    elif [ "$_sec" -le "30" ] 2>/dev/null; then
         printf '%b' "${OK}${_val}${NC}"
-    elif [ "$_sec" -le 120 ] 2>/dev/null; then
+    elif [ "$_sec" -le "120" ] 2>/dev/null; then
         printf '%b' "${WARN_C}${_val}${NC}"
     else
         printf '%b' "${ERR}${_val}${NC}"
@@ -155,25 +303,158 @@ read_choice() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# ─── Download with retries ──────────────────────────────────────────
+
+# wget_retry URL DEST [retries]
+# Downloads URL to DEST with retries and non-empty file check.
+wget_retry() {
+    _wr_url="$1"; _wr_dest="$2"; _wr_max="${3:-$DOWNLOAD_RETRIES}"
+    _wr_attempt=0
+    while [ "$_wr_attempt" -lt "$_wr_max" ]; do
+        if wget -qO "$_wr_dest" "$_wr_url" 2>/dev/null; then
+            if [ -s "$_wr_dest" ]; then
+                return 0
+            fi
+        fi
+        rm -f "$_wr_dest"
+        _wr_attempt=$((_wr_attempt + 1))
+    done
+    return 1
+}
+
+# ─── DNS connectivity check ─────────────────────────────────────────
+
+check_dns() {
+    nslookup google.com >/dev/null 2>&1
+}
+
+# check_dns_server IP — test if a specific DNS server responds
+check_dns_server() {
+    _cds_ip="$1"
+    nslookup google.com "$_cds_ip" >/dev/null 2>&1
+}
+
+# check_internet — basic internet reachability (ping, then curl fallback)
+check_internet() {
+    ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && return 0
+    ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 && return 0
+    have_cmd curl && curl -so /dev/null --connect-timeout 3 http://connectivitycheck.gstatic.com/generate_204 2>/dev/null && return 0
+    return 1
+}
+
+# _nslookup_ips DOMAIN [SERVER] — resolve domain, print IPs (BusyBox-safe)
+# BusyBox nslookup outputs "Address N: X.X.X.X" not "Address: X.X.X.X"
+# Skip the first Address line (that's the DNS server itself)
+_nslookup_ips() {
+    _ni_out=""
+    if [ -n "${2:-}" ]; then
+        _ni_out="$(nslookup "$1" "$2" 2>/dev/null || true)"
+    else
+        _ni_out="$(nslookup "$1" 2>/dev/null || true)"
+    fi
+    # Extract IPs: skip the server line (before first empty line), then grab all IPs
+    echo "$_ni_out" | awk '
+        /^$/ { body=1; next }
+        body && /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {
+            for(i=1;i<=NF;i++) if($i~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i
+        }'
+}
+
+# check_dns_port53 IP — test if port 53 is reachable (not blocked by ISP)
+check_dns_port53() {
+    _cd53_ip="$1"
+    _cd53_ips="$(_nslookup_ips "google.com" "$_cd53_ip")"
+    [ -n "$_cd53_ips" ] && return 0
+    return 1
+}
+
+# check_dns_poisoning DOMAIN [SERVER] — detect DNS poisoning (127.x.x.x response)
+check_dns_poisoning() {
+    _cdp_ips="$(_nslookup_ips "$1" "${2:-}")"
+    # No response at all
+    [ -z "$_cdp_ips" ] && return 2
+    # Check for 127.x.x.x in response (common poisoning/blocking pattern)
+    echo "$_cdp_ips" | grep -qE '^127\.' && return 1
+    return 0
+}
+
+# check_dns_same_ip DOMAIN1 DOMAIN2 [SERVER] — detect if two different domains resolve to same IP
+check_dns_same_ip() {
+    _cdsi_ip1="$(_nslookup_ips "$1" "${3:-}" | head -1)"
+    _cdsi_ip2="$(_nslookup_ips "$2" "${3:-}" | head -1)"
+    [ -z "$_cdsi_ip1" ] || [ -z "$_cdsi_ip2" ] && return 2  # can't resolve
+    [ "$_cdsi_ip1" = "$_cdsi_ip2" ] && return 1              # same IP = suspicious
+    return 0
+}
+
+# check_doh DOMAIN — resolve via DoH (Cloudflare), returns IP or empty
+check_doh() {
+    have_cmd curl || return 1
+    _cdoh_out="$(curl -s --connect-timeout 3 -H "accept: application/dns-json" \
+        "https://1.1.1.1/dns-query?name=${1}&type=A" 2>/dev/null || true)"
+    echo "$_cdoh_out" | sed -n 's/.*"data":"\([0-9.]*\)".*/\1/p' | head -1
+}
+
+# check_dns_vs_doh DOMAIN [SERVER] — compare plain DNS vs DoH answer
+# Returns 0=match, 1=mismatch (poisoning), 2=can't check
+check_dns_vs_doh() {
+    _cdd_doh="$(check_doh "$1")"
+    [ -z "$_cdd_doh" ] && return 2
+    _cdd_plain="$(_nslookup_ips "$1" "${2:-}" | head -1)"
+    [ -z "$_cdd_plain" ] && return 2
+    [ "$_cdd_doh" = "$_cdd_plain" ] && return 0
+    return 1
+}
+
+# ─── Disk space check ───────────────────────────────────────────────
+
+# ensure_disk_space [required_kb]
+# Checks /overlay (or / if /overlay absent) for available space.
+ensure_disk_space() {
+    _eds_required="${1:-15360}" # default 15MB in KB
+    if df /overlay >/dev/null 2>&1; then
+        _eds_avail="$(df /overlay | awk 'NR==2 {print $4}')"
+    else
+        _eds_avail="$(df / | awk 'NR==2 {print $4}')"
+    fi
+    [ -z "$_eds_avail" ] && return 0 # can't determine — skip
+    if [ "$_eds_avail" -lt "$_eds_required" ] 2>/dev/null; then
+        die "Insufficient disk space: $((_eds_avail / 1024))MB available, $((_eds_required / 1024))MB required"
+    fi
+}
+
+# ─── Semver comparison ───────────────────────────────────────────────
+
+# version_newer NEW OLD — returns 0 if NEW > OLD (semver)
+version_newer() {
+    _vn_new="$(echo "$1" | sed 's/^v//')"; _vn_old="$(echo "$2" | sed 's/^v//')"
+    [ "$_vn_new" = "$_vn_old" ] && return 1
+    _vn_oldest="$(printf '%s\n%s\n' "$_vn_new" "$_vn_old" | sort -V | head -n1)"
+    [ "$_vn_oldest" = "$_vn_old" ]
+}
+
+# version_major VER — returns the major number
+version_major() { echo "$1" | sed 's/^v//' | cut -d. -f1; }
+
 # ─── Backup / Restore ────────────────────────────────────────────────
 
 init_backup() {
     _reason="${1:-Manual}"
     TS="$(date +%Y%m%d-%H%M%S)"
-    BACKUP_DIR="/root/liminal-backups/${TS}"
+    BACKUP_DIR="${BACKUP_BASE}/${TS}"
     mkdir -p "$BACKUP_DIR"
     cp /etc/config/network  "$BACKUP_DIR/network.bak"
     cp /etc/config/firewall "$BACKUP_DIR/firewall.bak"
     [ -f /etc/config/dhcp ]   && cp /etc/config/dhcp   "$BACKUP_DIR/dhcp.bak" || true
-    [ -f /etc/config/podkop ] && cp /etc/config/podkop "$BACKUP_DIR/podkop.bak" || true
+    [ -f /etc/config/podkop ]  && cp /etc/config/podkop  "$BACKUP_DIR/podkop.bak" || true
+    [ -f /etc/config/liminal ] && cp /etc/config/liminal "$BACKUP_DIR/liminal.bak" || true
     echo "$_reason" > "$BACKUP_DIR/.reason"
     date '+%Y-%m-%d %H:%M:%S' > "$BACKUP_DIR/.date"
 }
 
-BACKUP_BASE="/root/liminal-backups"
-AUTOBACKUP_OFF="/root/liminal-backups/.noautobackup"
+# BACKUP_BASE, EXPORT_DIR set by liminal_config_load()
 
-autobackup_enabled() { ! [ -f "$AUTOBACKUP_OFF" ]; }
+autobackup_enabled() { [ "$CFG_AUTO_BACKUP" = "1" ]; }
 
 restore_backups() {
     echo -e "  ${B}Restoring${NC} backups from $BACKUP_DIR ..."
@@ -181,6 +462,7 @@ restore_backups() {
     [ -f "$BACKUP_DIR/firewall.bak" ] && cp "$BACKUP_DIR/firewall.bak" /etc/config/firewall
     [ -f "$BACKUP_DIR/dhcp.bak" ]     && cp "$BACKUP_DIR/dhcp.bak"     /etc/config/dhcp || true
     [ -f "$BACKUP_DIR/podkop.bak" ]   && cp "$BACKUP_DIR/podkop.bak"   /etc/config/podkop || true
+    [ -f "$BACKUP_DIR/liminal.bak" ]  && cp "$BACKUP_DIR/liminal.bak"  /etc/config/liminal && liminal_config_load || true
     echo -e "  ${B}Reloading${NC} network..."
     /etc/init.d/network reload   >/dev/null 2>&1 || true
     echo -e "  ${B}Restarting${NC} firewall..."
@@ -263,8 +545,40 @@ confirm() {
 
 # ─── DNS selector ─────────────────────────────────────────────────────
 
+# _dns_test IP — ping DNS server, print latency in ms (or "ok"/"fail")
+_dns_test() {
+    _dt_ip="$1"
+    _dt_out="$(ping -c1 -W2 "$_dt_ip" 2>/dev/null)" || { echo "fail"; return; }
+    # Parse "time=12.3 ms" from ping output
+    _dt_ms="$(echo "$_dt_out" | sed -n 's/.*time=\([0-9]*\).*/\1/p' | head -n1)"
+    if [ -n "$_dt_ms" ]; then
+        echo "$_dt_ms"
+    else
+        echo "ok"
+    fi
+}
+
+# _dns_test_all — test all DNS servers in parallel, write results to temp dir
+_dns_test_all() {
+    _dta_dir="$1"
+    shift
+    for _dta_ip in "$@"; do
+        ( _r="$(_dns_test "$_dta_ip")"; echo "$_r" > "${_dta_dir}/${_dta_ip}" ) &
+    done
+    wait
+}
+
+# _dns_fmt_latency RESULT — format latency result for display
+_dns_fmt_latency() {
+    case "$1" in
+        fail) printf '%b' "${ERR}✗${NC}" ;;
+        ok)   printf '%b' "${OK}✓${NC}" ;;
+        *)    printf '%b' "${OK}✓${NC} ${DIM2}${1}ms${NC}" ;;
+    esac
+}
+
 # select_dns VAR [current_dns]
-# Shows a numbered list of popular DNS servers. Sets VAR to the chosen IP.
+# Shows a numbered list of DNS servers with latency. Sets VAR to the chosen IP.
 # Returns 1 if cancelled.
 select_dns() {
     _sd_var="$1"; _sd_cur="${2:-}"
@@ -276,114 +590,267 @@ select_dns() {
         _sd_sb_active=1
     fi
 
+    # ── Collect all IPs to test ──
+    _sd_all_ips=""
+    [ -n "$_sd_lan" ] && _sd_all_ips="$_sd_lan"
+    _sd_ifs="$IFS"; IFS='
+'
+    for _sd_entry in $_DNS_PRESETS; do
+        IFS="$_sd_ifs"
+        _sd_eip="${_sd_entry##*|}"
+        _sd_all_ips="${_sd_all_ips:+${_sd_all_ips} }${_sd_eip}"
+    done
+    IFS="$_sd_ifs"
+    [ -n "$_sd_cur" ] && case " $_sd_all_ips " in
+        *" $_sd_cur "*) ;;
+        *) _sd_all_ips="${_sd_all_ips:+${_sd_all_ips} }${_sd_cur}" ;;
+    esac
+
+    # ── Test latency in parallel ──
+    echo -ne "  ${DIM2}Testing DNS servers...${NC}"
+    _sd_tmp="$(mktemp -d 2>/dev/null || echo "/tmp/liminal-dns-$$")"
+    mkdir -p "$_sd_tmp"
+    _dns_test_all "$_sd_tmp" $_sd_all_ips
+    echo -ne "\r\033[K"
+
+    # Helper: read latency result for an IP
+    _sd_lat() { cat "${_sd_tmp}/${1}" 2>/dev/null || echo "fail"; }
+
+    # ── Determine recommendation ──
+    _sd_rec=""
+    _sd_rec_reason=""
+    if [ "$_sd_sb_active" -eq 1 ] && [ -n "$_sd_lan" ]; then
+        _sd_rl="$(_sd_lat "$_sd_lan")"
+        if [ "$_sd_rl" != "fail" ]; then
+            _sd_rec="$_sd_lan"
+            _sd_rec_reason="routes through Sing-Box"
+        fi
+    fi
+    # If no recommendation yet, pick fastest responding preset
+    if [ -z "$_sd_rec" ]; then
+        _sd_best_ms=99999; _sd_best_ip=""
+        _sd_ifs="$IFS"; IFS='
+'
+        for _sd_entry in $_DNS_PRESETS; do
+            IFS="$_sd_ifs"
+            _sd_eip="${_sd_entry##*|}"
+            _sd_rl="$(_sd_lat "$_sd_eip")"
+            case "$_sd_rl" in fail|ok) continue ;; esac
+            if [ "$_sd_rl" -lt "$_sd_best_ms" ] 2>/dev/null; then
+                _sd_best_ms="$_sd_rl"; _sd_best_ip="$_sd_eip"
+            fi
+        done
+        IFS="$_sd_ifs"
+        if [ -n "$_sd_best_ip" ]; then
+            _sd_rec="$_sd_best_ip"
+            _sd_rec_reason="fastest"
+        fi
+    fi
+
+    # ── Display ──
     echo ""
     echo -e "  ${A}Select DNS server:${NC}"
-    if [ "$_sd_sb_active" -eq 1 ] && [ "${PK_INSTALLED:-0}" -eq 1 ]; then
-        echo -e "  ${DIM2}Podkop: dnsmasq → Sing-Box (127.0.0.42:53)${NC}"
-    elif [ "$_sd_sb_active" -eq 1 ]; then
-        echo -e "  ${DIM2}Sing-Box DNS active (127.0.0.42:53)${NC}"
-    elif [ "${SB_RUNNING:-0}" -eq 1 ]; then
-        echo -e "  ${WARN_C}Sing-Box running but DNS not listening${NC}"
-    fi
     echo ""
 
-    # Build ordered list: current first (if set), then presets, then Router LAN
     _sd_n=0
     _sd_list=""
-    _sd_cur_shown=0
-
-    # Show current DNS first if it's set and not in the preset list
-    if [ -n "$_sd_cur" ]; then
-        _sd_cur_in_presets=0
-        for _sd_entry in \
-            "Cloudflare|1.1.1.1" \
-            "Google|8.8.8.8" \
-            "Quad9|9.9.9.9" \
-            "OpenDNS|208.67.222.222" \
-            "AdGuard|94.140.14.14" \
-            "Comss.one|92.223.109.31"; do
-            _sd_ip="${_sd_entry##*|}"
-            if [ "$_sd_cur" = "$_sd_ip" ]; then _sd_cur_in_presets=1; fi
-        done
-        if [ -n "$_sd_lan" ] && [ "$_sd_cur" = "$_sd_lan" ]; then _sd_cur_in_presets=1; fi
-    fi
 
     # Column positions (ANSI escape)
-    _C1="\033[17G"  # name column
-    _C2="\033[30G"  # ip column
-    _C3="\033[48G"  # note column
+    _C1="\033[8G"   # name column
+    _C2="\033[22G"  # ip column
+    _C3="\033[42G"  # latency column
+    _C4="\033[54G"  # note column
 
     # Helper: print one DNS row
-    # _sd_print NAME IP NOTE MARK
-    _sd_print() {
-        echo -e "  ${B}${_sd_n}${NC} ${DIM2}›${NC}${_C1}${W}${1}${NC}${_C2}${DIM2}${2}${NC}${_C3}${3}${4}"
+    # _sd_row NAME IP LATENCY NOTE
+    _sd_row() {
+        _sd_out="  ${B}${_sd_n}${NC} ${DIM2}›${NC}${_C1}${W}${1}${NC}${_C2}${DIM2}${2}${NC}${_C3}${3}"
+        [ -n "${4}" ] && _sd_out="${_sd_out}${_C4}${4}"
+        echo -e "$_sd_out"
     }
 
-    # If current is custom (not in any preset), show it as #1
-    if [ "$_sd_cur_shown" -eq 0 ] && [ -n "$_sd_cur" ] && [ "$_sd_cur_in_presets" -eq 0 ]; then
+    # ── Group: Current ──
+    if [ -n "$_sd_cur" ]; then
         _sd_n=$((_sd_n + 1))
-        _sd_print "$_sd_cur" "" "" "${OK}current${NC}"
+        _sd_cur_name=""
+        _sd_cur_note="${OK}current${NC}"
+        if [ -n "$_sd_lan" ] && [ "$_sd_cur" = "$_sd_lan" ]; then
+            _sd_cur_name="Router LAN"
+        else
+            _sd_ifs="$IFS"; IFS='
+'
+            for _sd_entry in $_DNS_PRESETS; do
+                IFS="$_sd_ifs"
+                _sd_eip="${_sd_entry##*|}"
+                [ "$_sd_cur" = "$_sd_eip" ] && { _sd_cur_name="${_sd_entry%%|*}"; break; }
+            done
+            IFS="$_sd_ifs"
+        fi
+        [ -z "$_sd_cur_name" ] && _sd_cur_name="Custom"
+        _sd_cl="$(_dns_fmt_latency "$(_sd_lat "$_sd_cur")")"
+        _sd_row "$_sd_cur_name" "$_sd_cur" "$_sd_cl" "$_sd_cur_note"
         _sd_list="${_sd_list} ${_sd_cur}"
-        _sd_cur_shown=1
     fi
 
-    # Preset list: name|ip
-    for _sd_entry in \
-        "Cloudflare|1.1.1.1" \
-        "Google|8.8.8.8" \
-        "Quad9|9.9.9.9" \
-        "OpenDNS|208.67.222.222" \
-        "AdGuard|94.140.14.14" \
-        "Comss.one|92.223.109.31"; do
+    # ── Group: Recommended (if different from current) ──
+    if [ -n "$_sd_rec" ]; then
+        if [ -z "$_sd_cur" ] || [ "$_sd_rec" != "$_sd_cur" ]; then
+            echo ""
+            echo -e "  ${DIM2}Recommended${NC}"
+            _sd_n=$((_sd_n + 1))
+            _sd_rec_name=""
+            if [ -n "$_sd_lan" ] && [ "$_sd_rec" = "$_sd_lan" ]; then
+                _sd_rec_name="Router LAN"
+            else
+                _sd_ifs="$IFS"; IFS='
+'
+                for _sd_entry in $_DNS_PRESETS; do
+                    IFS="$_sd_ifs"
+                    _sd_eip="${_sd_entry##*|}"
+                    [ "$_sd_rec" = "$_sd_eip" ] && { _sd_rec_name="${_sd_entry%%|*}"; break; }
+                done
+                IFS="$_sd_ifs"
+            fi
+            [ -z "$_sd_rec_name" ] && _sd_rec_name="$_sd_rec"
+            _sd_cl="$(_dns_fmt_latency "$(_sd_lat "$_sd_rec")")"
+            _sd_row "$_sd_rec_name" "$_sd_rec" "$_sd_cl" "${V}★ ${_sd_rec_reason}${NC}"
+            _sd_list="${_sd_list} ${_sd_rec}"
+        fi
+    fi
+
+    # ── Group: Router LAN (if not already shown) ──
+    _sd_lan_shown=0
+    if [ -n "$_sd_lan" ]; then
+        if [ "$_sd_cur" = "$_sd_lan" ] || { [ -n "$_sd_rec" ] && [ "$_sd_rec" = "$_sd_lan" ]; }; then
+            _sd_lan_shown=1
+        fi
+        if [ "$_sd_lan_shown" -eq 0 ]; then
+            echo ""
+            if [ "$_sd_sb_active" -eq 1 ]; then
+                echo -e "  ${DIM2}Local${NC}  ${DIM2}(→ Sing-Box)${NC}"
+            else
+                echo -e "  ${DIM2}Local${NC}"
+            fi
+            _sd_n=$((_sd_n + 1))
+            _sd_cl="$(_dns_fmt_latency "$(_sd_lat "$_sd_lan")")"
+            _sd_row "Router LAN" "$_sd_lan" "$_sd_cl" ""
+            _sd_list="${_sd_list} ${_sd_lan}"
+        fi
+    fi
+
+    # ── Group: Public DNS (skip current & recommended, sorted by latency) ──
+    # Build sortable list: "latency_padded|Name|IP" then sort
+    _sd_sortbuf=""
+    _sd_ifs="$IFS"; IFS='
+'
+    for _sd_entry in $_DNS_PRESETS; do
+        IFS="$_sd_ifs"
         _sd_name="${_sd_entry%%|*}"
         _sd_ip="${_sd_entry##*|}"
+        [ -n "$_sd_cur" ] && [ "$_sd_cur" = "$_sd_ip" ] && continue
+        [ -n "$_sd_rec" ] && [ "$_sd_rec" = "$_sd_ip" ] && continue
+        _sd_ms="$(_sd_lat "$_sd_ip")"
+        # Pad for sort: numbers get zero-padded, fail/ok go last
+        case "$_sd_ms" in
+            fail) _sd_sort_key="99998" ;;
+            ok)   _sd_sort_key="99997" ;;
+            *)    _sd_sort_key="$(printf '%05d' "$_sd_ms" 2>/dev/null || echo "99999")" ;;
+        esac
+        _sd_sortbuf="${_sd_sortbuf:+${_sd_sortbuf}
+}${_sd_sort_key}|${_sd_name}|${_sd_ip}"
+    done
+    IFS="$_sd_ifs"
+    _sd_sorted="$(echo "$_sd_sortbuf" | sort -t'|' -k1,1n)"
+
+    _sd_pub_header=0
+    _sd_ifs="$IFS"; IFS='
+'
+    for _sd_sline in $_sd_sorted; do
+        IFS="$_sd_ifs"
+        [ -z "$_sd_sline" ] && continue
+        _sd_name="$(echo "$_sd_sline" | cut -d'|' -f2)"
+        _sd_ip="$(echo "$_sd_sline" | cut -d'|' -f3)"
+        if [ "$_sd_pub_header" -eq 0 ]; then
+            echo ""
+            if [ "$_sd_sb_active" -eq 1 ]; then
+                echo -e "  ${DIM2}Public DNS${NC}  ${WARN_C}(bypasses Sing-Box)${NC}"
+            else
+                echo -e "  ${DIM2}Public DNS${NC}"
+            fi
+            _sd_pub_header=1
+        fi
         _sd_n=$((_sd_n + 1))
-        _sd_note=""
-        _sd_mark=""
-        if [ "$_sd_sb_active" -eq 1 ]; then _sd_note="${WARN_C}bypasses Sing-Box${NC}"; fi
-        if [ -n "$_sd_cur" ] && [ "$_sd_cur" = "$_sd_ip" ]; then _sd_mark="${OK}current${NC}"; _sd_note=""; fi
-        _sd_print "$_sd_name" "$_sd_ip" "$_sd_note" "$_sd_mark"
+        _sd_cl="$(_dns_fmt_latency "$(_sd_lat "$_sd_ip")")"
+        _sd_row "$_sd_name" "$_sd_ip" "$_sd_cl" ""
         _sd_list="${_sd_list} ${_sd_ip}"
     done
+    IFS="$_sd_ifs"
 
-    # Router LAN IP
-    if [ -n "$_sd_lan" ]; then
-        _sd_n=$((_sd_n + 1))
-        _sd_note=""
-        _sd_mark=""
-        if [ "$_sd_sb_active" -eq 1 ]; then _sd_note="${OK}→ Sing-Box + local DNS${NC}"; fi
-        if [ -n "$_sd_cur" ] && [ "$_sd_cur" = "$_sd_lan" ]; then _sd_mark="${OK}current${NC}"; fi
-        _sd_print "Router LAN" "$_sd_lan" "$_sd_note" "$_sd_mark"
-        _sd_list="${_sd_list} ${_sd_lan}"
-    fi
-
-    echo -e "  ${B}0${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter manually)${NC}"
+    echo ""
+    echo -e "  ${B}0${NC} ${DIM2}›${NC}${_C1}${W}Custom${NC}${_C2}${DIM2}enter manually${NC}"
     echo ""
 
+    # Prompt with default recommendation
     _sd_max="$_sd_n"
-    echo -ne "  ${A}>${NC} "; read -r _sd_choice || true
-    sigint_caught && return 1
+    _sd_def_n=""
+    if [ -n "$_sd_rec" ]; then
+        _sd_ri=0
+        for _sd_rip in $_sd_list; do
+            _sd_ri=$((_sd_ri + 1))
+            [ "$_sd_rip" = "$_sd_rec" ] && { _sd_def_n="$_sd_ri"; break; }
+        done
+    fi
+
+    if [ -n "$_sd_def_n" ]; then
+        echo -ne "  ${A}>${NC} ${DIM2}[${_sd_def_n}]${NC} "; read -r _sd_choice || true
+    else
+        echo -ne "  ${A}>${NC} "; read -r _sd_choice || true
+    fi
+    sigint_caught && { rm -rf "$_sd_tmp"; return 1; }
     _sd_choice="$(printf '%s' "${_sd_choice:-}" | tr -d '\001-\037\177')"
 
-    # Empty = cancel
-    [ -z "$_sd_choice" ] && return 1
+    # Empty = select recommendation (or cancel if no recommendation)
+    if [ -z "$_sd_choice" ]; then
+        if [ -n "$_sd_def_n" ]; then
+            _sd_choice="$_sd_def_n"
+        else
+            rm -rf "$_sd_tmp"; return 1
+        fi
+    fi
 
     # Custom
     if [ "$_sd_choice" = "0" ]; then
+        rm -rf "$_sd_tmp"
         while true; do
             prompt _sd_custom "DNS server (IPv4)" "" || return 1
             sigint_caught && return 1
             [ -z "$_sd_custom" ] && return 1
-            validate_ipv4 "$_sd_custom" && break
+            validate_ipv4 "$_sd_custom" || continue
+
+            # Test custom DNS
+            echo ""
+            echo -ne "  ${DIM2}Ping${NC}${_C3}"
+            _sd_cping="$(_dns_test "$_sd_custom")"
+            echo -e "$(_dns_fmt_latency "$_sd_cping")"
+
+            echo -ne "  ${DIM2}DNS resolve${NC}${_C3}"
+            if check_dns_server "$_sd_custom"; then
+                echo -e "${OK}✓${NC}"
+            else
+                echo -e "${ERR}✗${NC}"
+                warn "DNS server ${_sd_custom} is not responding"
+                confirm "Use anyway?" "n" || continue
+            fi
+            break
         done
         eval "$_sd_var=\$_sd_custom"
         return 0
     fi
 
     # Validate choice
-    case "$_sd_choice" in *[!0-9]*) warn "Invalid selection"; return 1 ;; esac
-    if [ "$_sd_choice" -lt 1 ] 2>/dev/null; then warn "Invalid selection"; return 1; fi
-    if [ "$_sd_choice" -gt "$_sd_max" ] 2>/dev/null; then warn "Invalid selection"; return 1; fi
+    case "$_sd_choice" in *[!0-9]*) warn "Invalid selection"; rm -rf "$_sd_tmp"; return 1 ;; esac
+    if [ "$_sd_choice" -lt 1 ] 2>/dev/null; then warn "Invalid selection"; rm -rf "$_sd_tmp"; return 1; fi
+    if [ "$_sd_choice" -gt "$_sd_max" ] 2>/dev/null; then warn "Invalid selection"; rm -rf "$_sd_tmp"; return 1; fi
 
     # Map choice to IP from ordered list
     _sd_i=0; _sd_result=""
@@ -392,12 +859,337 @@ select_dns() {
         if [ "$_sd_i" = "$_sd_choice" ]; then _sd_result="$_sd_ip"; fi
     done
 
+    rm -rf "$_sd_tmp"
+
     if [ -z "$_sd_result" ]; then
         warn "Invalid selection"; return 1
     fi
 
+    # Already tested — check cached result
     eval "$_sd_var=\$_sd_result"
     return 0
+}
+
+# ─── DNS & Network diagnostics (unified) ──────────────────────────────
+
+# do_dns_network_test IFACE [PEER_IP] [HOSTNAME] [IS_ONLINE]
+# Full DNS & network diagnostic. Called from both peer and interface menus.
+do_dns_network_test() {
+    _dt_iface="$1"
+    _dt_pip="${2:-}"        # peer VPN IP (empty = interface-level test)
+    _dt_fqdn="${3:-}"       # peer hostname (empty = skip hostname check)
+    _dt_online="${4:-0}"    # 1 if peer is online
+
+    _dt_dns="$(uci -q get "network.${_dt_iface}.dns" || true)"
+    _dt_lan="$(detect_router_lan_ip 2>/dev/null || true)"
+    _dt_is_local=0
+    [ -n "$_dt_lan" ] && [ -n "$_dt_dns" ] && [ "$_dt_dns" = "$_dt_lan" ] && _dt_is_local=1
+    _dt_sb_chain=0
+    [ "${SB_DNS:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 1 ] && _dt_sb_chain=1
+    _TC="\033[36G"
+
+    echo ""
+    echo -e "  ${V}── DNS & Network Diagnostics ──${NC}"
+    echo ""
+
+    # Header
+    if [ -n "$_dt_pip" ]; then
+        echo -e "  ${A}Interface:${NC} ${W}${_dt_iface}${NC}  ${A}Peer:${NC} ${W}${_dt_pip}${NC}"
+    else
+        echo -e "  ${A}Interface:${NC} ${W}${_dt_iface}${NC}"
+    fi
+    if [ -n "$_dt_dns" ]; then
+        if [ "$_dt_sb_chain" -eq 1 ] && [ "${PK_LINKED:-0}" -eq 1 ]; then
+            echo -e "  ${A}DNS:${NC}       ${W}${_dt_dns}${NC}  ${DIM2}│ peer → dnsmasq → Sing-Box${NC}"
+        elif [ "$_dt_sb_chain" -eq 1 ]; then
+            echo -e "  ${A}DNS:${NC}       ${W}${_dt_dns}${NC}  ${DIM2}│ dnsmasq → Sing-Box${NC}"
+        elif [ "${DM_DNSCRYPT:-0}" -eq 1 ]; then
+            echo -e "  ${A}DNS:${NC}       ${W}${_dt_dns}${NC}  ${DIM2}│ dnsmasq → DNSCrypt${NC}"
+        elif [ "${DM_STUBBY:-0}" -eq 1 ]; then
+            echo -e "  ${A}DNS:${NC}       ${W}${_dt_dns}${NC}  ${DIM2}│ dnsmasq → Stubby${NC}"
+        else
+            echo -e "  ${A}DNS:${NC}       ${W}${_dt_dns}${NC}"
+        fi
+    else
+        echo -e "  ${A}DNS:${NC}       ${DIM2}not configured${NC}"
+    fi
+
+    # ── 1. Internet ──
+    echo ""
+    echo -e "  ${A}1. Internet${NC}"
+    echo -ne "  ${DIM2}Connectivity${NC}${_TC}"
+    if check_internet; then
+        echo -e "${ICO_OK} ${OK}Available${NC}"
+    else
+        echo -e "${ICO_ERR} ${ERR}No internet${NC}"
+        echo -e "  ${WARN_C}All DNS tests may fail — check WAN connection${NC}"
+    fi
+
+    # ── 2. DNS Server ──
+    echo ""
+    echo -e "  ${A}2. DNS Server${NC}"
+    if [ -n "$_dt_dns" ]; then
+        echo -ne "  ${DIM2}Responds to queries${NC}${_TC}"
+        if check_dns_server "$_dt_dns"; then
+            echo -e "${ICO_OK} ${OK}Yes${NC}"
+        else
+            echo -e "${ICO_ERR} ${ERR}No${NC}"
+        fi
+    else
+        echo -e "  ${DIM2}No DNS configured for this interface${NC}"
+    fi
+
+    # ── 3. Port 53 (ISP blocking) ──
+    echo ""
+    echo -e "  ${A}3. Port 53 Blocking${NC}"
+    _dt_p53_ok=0
+    for _dt_ext in 1.1.1.1 8.8.8.8; do
+        echo -ne "  ${DIM2}${_dt_ext}${NC}${_TC}"
+        if check_dns_port53 "$_dt_ext"; then
+            echo -e "${ICO_OK} ${OK}Open${NC}"
+            _dt_p53_ok=1
+        else
+            echo -e "${ICO_WARN} ${WARN_C}Blocked / timeout${NC}"
+        fi
+    done
+    [ "$_dt_p53_ok" -eq 0 ] && \
+        echo -e "  ${WARN_C}ISP may be blocking DNS port 53${NC}"
+
+    # ── 4. DNS Poisoning ──
+    echo ""
+    echo -e "  ${A}4. DNS Poisoning${NC}"
+    _dt_poison_ok=1
+    for _dt_dom in facebook.com instagram.com; do
+        echo -ne "  ${DIM2}${_dt_dom}${NC}${_TC}"
+        check_dns_poisoning "$_dt_dom"
+        _dt_pr=$?
+        if [ "$_dt_pr" -eq 0 ]; then
+            echo -e "${ICO_OK} ${OK}Clean${NC}"
+        elif [ "$_dt_pr" -eq 1 ]; then
+            echo -e "${ICO_ERR} ${ERR}127.x.x.x detected${NC}"
+            _dt_poison_ok=0
+        else
+            echo -e "${ICO_WARN} ${WARN_C}No response${NC}"
+        fi
+    done
+    echo -ne "  ${DIM2}facebook ≠ instagram IP${NC}${_TC}"
+    check_dns_same_ip "facebook.com" "instagram.com"
+    _dt_si=$?
+    if [ "$_dt_si" -eq 0 ]; then
+        echo -e "${ICO_OK} ${OK}Different${NC}"
+    elif [ "$_dt_si" -eq 1 ]; then
+        echo -e "${ICO_ERR} ${ERR}Same IP — poisoned${NC}"
+        _dt_poison_ok=0
+    else
+        echo -e "${ICO_WARN} ${WARN_C}Can't check${NC}"
+    fi
+    [ "$_dt_poison_ok" -eq 0 ] && \
+        echo -e "  ${WARN_C}DNS responses appear tampered${NC}"
+
+    # ── 5. DoH vs Plain DNS ──
+    # Only meaningful when DNS is a direct external server (not via router/VPN/Sing-Box).
+    # If DNS = Router LAN, Sing-Box chain, DNSCrypt, Stubby, or any local resolver —
+    # the router resolves through its own chain (VPN, Sing-Box, etc.) so the IP will
+    # differ from Cloudflare DoH. That's normal, not poisoning.
+    if have_cmd curl; then
+        _dt_doh_skip=""
+        [ "$_dt_is_local" -eq 1 ] && _dt_doh_skip="DNS via router (resolves through local chain)"
+        [ "$_dt_sb_chain" -eq 1 ] && _dt_doh_skip="DNS via Sing-Box"
+        [ "${DM_DNSCRYPT:-0}" -eq 1 ] && [ "$_dt_is_local" -eq 1 ] && _dt_doh_skip="DNS via DNSCrypt"
+        [ "${DM_STUBBY:-0}" -eq 1 ] && [ "$_dt_is_local" -eq 1 ] && _dt_doh_skip="DNS via Stubby"
+
+        echo ""
+        echo -e "  ${A}5. DoH Comparison${NC}"
+        if [ -n "$_dt_doh_skip" ]; then
+            echo -e "  ${DIM2}Skipped — ${_dt_doh_skip} (mismatch expected)${NC}"
+        else
+            echo -ne "  ${DIM2}DoH available${NC}${_TC}"
+            _dt_doh_ip="$(check_doh "facebook.com")"
+            if [ -n "$_dt_doh_ip" ]; then
+                echo -e "${ICO_OK} ${OK}Yes${NC}"
+                echo -ne "  ${DIM2}Plain DNS = DoH${NC}${_TC}"
+                _dt_doh_r=2
+                _dt_plain="$(_nslookup_ips "facebook.com" | head -1)"
+                if [ -n "$_dt_doh_ip" ] && [ -n "$_dt_plain" ]; then
+                    if [ "$_dt_doh_ip" = "$_dt_plain" ]; then _dt_doh_r=0; else _dt_doh_r=1; fi
+                fi
+                if [ "$_dt_doh_r" -eq 0 ]; then
+                    echo -e "${ICO_OK} ${OK}Match${NC}"
+                elif [ "$_dt_doh_r" -eq 1 ]; then
+                    echo -e "${ICO_ERR} ${ERR}Mismatch — DNS may be tampered${NC}"
+                else
+                    echo -e "${ICO_WARN} ${WARN_C}Can't compare${NC}"
+                fi
+            else
+                echo -e "${ICO_WARN} ${WARN_C}Unavailable${NC}"
+            fi
+        fi
+    fi
+
+    # ── 6. Firewall ──
+    _dt_zone="$(find_zone_for_interface "$_dt_iface" 2>/dev/null || true)"
+    if [ -n "$_dt_zone" ] && [ "$_dt_is_local" -eq 1 ]; then
+        echo ""
+        echo -e "  ${A}6. Firewall${NC}"
+        _dt_zi="$(find_zone_index "$_dt_zone" || true)"
+        if [ -n "$_dt_zi" ]; then
+            _dt_input="$(uci -q get "firewall.@zone[$_dt_zi].input" || echo "DROP")"
+            echo -ne "  ${DIM2}Zone allows DNS${NC}${_TC}"
+            if [ "$_dt_input" = "ACCEPT" ]; then
+                echo -e "${ICO_OK} ${OK}Yes${NC} ${DIM2}(input=ACCEPT)${NC}"
+            else
+                _dt_dns_ok=0; _dt_ri=0
+                while uci -q get "firewall.@rule[$_dt_ri]" >/dev/null 2>&1; do
+                    _dt_src="$(uci -q get "firewall.@rule[$_dt_ri].src" || true)"
+                    _dt_dp="$(uci -q get "firewall.@rule[$_dt_ri].dest_port" || true)"
+                    _dt_tgt="$(uci -q get "firewall.@rule[$_dt_ri].target" || true)"
+                    [ "$_dt_src" = "$_dt_zone" ] && [ "$_dt_dp" = "53" ] && [ "$_dt_tgt" = "ACCEPT" ] && { _dt_dns_ok=1; break; }
+                    _dt_ri=$((_dt_ri + 1))
+                done
+                if [ "$_dt_dns_ok" -eq 1 ]; then
+                    echo -e "${ICO_OK} ${OK}Yes${NC} ${DIM2}(port 53 rule)${NC}"
+                else
+                    echo -e "${ICO_ERR} ${ERR}No${NC} ${DIM2}(${_dt_input}, no port 53)${NC}"
+                fi
+            fi
+        fi
+    fi
+
+    # ── 7. DNS Chain ──
+    echo ""
+    echo -e "  ${A}7. DNS Chain${NC}"
+    echo -ne "  ${DIM2}dnsmasq running${NC}${_TC}"
+    if pgrep -x dnsmasq >/dev/null 2>&1; then
+        echo -e "${ICO_OK} ${OK}Yes${NC}"
+    else
+        echo -e "${ICO_ERR} ${ERR}No${NC}"
+    fi
+
+    if [ "$_dt_sb_chain" -eq 1 ] || [ "${SB_RUNNING:-0}" -eq 1 ]; then
+        echo -ne "  ${DIM2}Sing-Box process${NC}${_TC}"
+        if [ "${SB_RUNNING:-0}" -eq 1 ]; then
+            echo -e "${ICO_OK} ${OK}Running${NC}"
+        else
+            echo -e "${ICO_ERR} ${ERR}Not running${NC}"
+        fi
+        echo -ne "  ${DIM2}Sing-Box DNS :53${NC}${_TC}"
+        if [ "${SB_DNS:-0}" -eq 1 ]; then
+            echo -e "${ICO_OK} ${OK}Listening${NC}"
+        else
+            echo -e "${ICO_ERR} ${ERR}Not listening${NC}"
+        fi
+        if [ "${SB_CFG_OK:-0}" -eq 1 ]; then
+            echo -e "  ${DIM2}Sing-Box config${NC}${_TC}${ICO_OK} ${OK}Valid${NC}"
+        elif [ -f /etc/sing-box/config.json ]; then
+            echo -e "  ${DIM2}Sing-Box config${NC}${_TC}${ICO_ERR} ${ERR}Invalid${NC}"
+        fi
+        if ip link show tun0 >/dev/null 2>&1; then
+            if [ "${SB_ROUTE_OK:-0}" -eq 1 ]; then
+                echo -e "  ${DIM2}VPN routing table${NC}${_TC}${ICO_OK} ${OK}Exists${NC}"
+            else
+                echo -e "  ${DIM2}VPN routing table${NC}${_TC}${ICO_WARN} ${WARN_C}Missing${NC}"
+            fi
+        fi
+        echo -ne "  ${DIM2}dnsmasq → ${CFG_SB_DNS_IP}${NC}${_TC}"
+        if [ "${DM_FWD:-0}" -eq 1 ]; then
+            echo -e "${ICO_OK} ${OK}Configured${NC}"
+        else
+            echo -e "${ICO_ERR} ${ERR}Not forwarding${NC}"
+        fi
+        if [ "$_dt_is_local" -eq 0 ] && [ -n "$_dt_dns" ]; then
+            echo -e "  ${WARN_C}DNS ${_dt_dns} bypasses the Sing-Box chain${NC}"
+        fi
+    fi
+
+    # DNSCrypt / Stubby
+    if [ "${DM_DNSCRYPT:-0}" -eq 1 ]; then
+        echo -ne "  ${DIM2}DNSCrypt (127.0.0.53)${NC}${_TC}"
+        if pgrep -f "dnscrypt-proxy" >/dev/null 2>&1; then
+            echo -e "${ICO_OK} ${OK}Running${NC}"
+        else
+            echo -e "${ICO_ERR} ${ERR}Not running${NC}"
+        fi
+    fi
+    if [ "${DM_STUBBY:-0}" -eq 1 ]; then
+        echo -ne "  ${DIM2}Stubby (127.0.0.1#5453)${NC}${_TC}"
+        if pgrep -f "stubby" >/dev/null 2>&1; then
+            echo -e "${ICO_OK} ${OK}Running${NC}"
+        else
+            echo -e "${ICO_ERR} ${ERR}Not running${NC}"
+        fi
+    fi
+
+    # ── 8. Podkop ──
+    if [ "${PK_INSTALLED:-0}" -eq 1 ]; then
+        echo ""
+        echo -e "  ${A}8. Podkop${NC}"
+        echo -ne "  ${DIM2}Linked to ${_dt_iface}${NC}${_TC}"
+        if [ "${PK_LINKED:-0}" -eq 1 ]; then
+            echo -e "${ICO_OK} ${OK}Yes${NC}"
+        else
+            echo -e "${DIM2}No${NC}"
+        fi
+        echo -ne "  ${DIM2}nftables PodkopTable${NC}${_TC}"
+        if [ "${PK_NFT_ACTIVE:-0}" -eq 1 ]; then
+            echo -e "${ICO_OK} ${OK}Active${NC}"
+        else
+            echo -e "${ICO_WARN} ${WARN_C}Missing${NC}"
+        fi
+    fi
+
+    # ── 9. Hostname ──
+    if [ -n "$_dt_fqdn" ]; then
+        echo ""
+        echo -e "  ${A}9. Hostname${NC}  ${W}${_dt_fqdn}${NC}"
+        if [ "$_dt_is_local" -eq 1 ]; then
+            echo -ne "  ${DIM2}Will resolve via dnsmasq${NC}${_TC}"
+            if pgrep -x dnsmasq >/dev/null 2>&1; then
+                echo -e "${ICO_OK} ${OK}Yes${NC}"
+            else
+                echo -e "${ICO_ERR} ${ERR}dnsmasq not running${NC}"
+            fi
+        else
+            echo -e "  ${DIM2}DNS → router${NC}${_TC}${ICO_ERR} ${ERR}No — won't resolve${NC}"
+            [ -n "$_dt_lan" ] && echo -e "  ${DIM2}Change DNS to ${_dt_lan} for hostnames to work${NC}"
+        fi
+    elif [ -z "$_dt_pip" ]; then
+        # Interface-level: check if any hostrecords exist for this interface
+        _dt_has_hr=0; _dt_hi=0
+        while uci -q get "dhcp.@hostrecord[$_dt_hi]" >/dev/null 2>&1; do
+            _dt_hli="$(uci -q get "dhcp.@hostrecord[$_dt_hi]._liminal_iface" || true)"
+            [ "$_dt_hli" = "$_dt_iface" ] && { _dt_has_hr=1; break; }
+            _dt_hi=$((_dt_hi + 1))
+        done
+        if [ "$_dt_has_hr" -eq 1 ]; then
+            echo ""
+            echo -e "  ${A}9. Hostnames${NC}"
+            if [ "$_dt_is_local" -eq 1 ]; then
+                echo -ne "  ${DIM2}Will resolve via dnsmasq${NC}${_TC}"
+                if pgrep -x dnsmasq >/dev/null 2>&1; then
+                    echo -e "${ICO_OK} ${OK}Yes${NC}"
+                else
+                    echo -e "${ICO_ERR} ${ERR}dnsmasq not running${NC}"
+                fi
+            else
+                echo -e "  ${DIM2}DNS → router${NC}${_TC}${ICO_ERR} ${ERR}No — won't resolve${NC}"
+                [ -n "$_dt_lan" ] && echo -e "  ${DIM2}Change DNS to ${_dt_lan} for hostrecords to work${NC}"
+            fi
+        fi
+    fi
+
+    # ── 10. Connectivity ──
+    if [ "$_dt_online" -eq 1 ] && [ -n "$_dt_pip" ]; then
+        echo ""
+        echo -e "  ${A}10. Peer Connectivity${NC}"
+        echo -ne "  ${DIM2}Ping ${_dt_pip}${NC}${_TC}"
+        if ping -c1 -W2 "$_dt_pip" >/dev/null 2>&1; then
+            echo -e "${ICO_OK} ${OK}Reachable${NC}"
+        else
+            echo -e "${ICO_WARN} ${WARN_C}No reply${NC}"
+        fi
+    fi
+
+    echo ""
 }
 
 # ─── DNS hostrecord helpers ────────────────────────────────────────────
@@ -612,22 +1404,22 @@ check_hostrecord_warnings() {
             warn "${_chw_label}: Sing-Box is not running"
             _chw_ok=1
         elif [ "${SB_DNS:-0}" -eq 0 ]; then
-            warn "${_chw_label}: Sing-Box not listening on 127.0.0.42:53"
+            warn "${_chw_label}: Sing-Box not listening on ${CFG_SB_DNS_IP}:53"
             _chw_ok=1
         elif [ "${DM_FWD:-0}" -eq 0 ]; then
-            warn "${_chw_label}: dnsmasq missing server 127.0.0.42"
+            warn "${_chw_label}: dnsmasq missing server ${CFG_SB_DNS_IP}"
             _chw_ok=1
         elif [ "${PK_DNS_VIA_ROUTER:-0}" -eq 1 ]; then
             echo -e "  ${ICO_OK} ${DIM2}${_chw_label}: peer → dnsmasq → Sing-Box (hostrecords OK)${NC}"
         fi
         if [ "${DM_NORESOLV:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 0 ]; then
-            warn "${_chw_label}: noresolv=1 but no server 127.0.0.42 — DNS broken"
+            warn "${_chw_label}: noresolv=1 but no server ${CFG_SB_DNS_IP} — DNS broken"
             _chw_ok=1
         fi
         if [ "${PK_DTD:-0}" -eq 1 ]; then
             warn "Podkop: dont_touch_dhcp=1 — verify dnsmasq config manually"
             if [ "${DM_FWD:-0}" -eq 0 ]; then
-                warn "Add 'list server 127.0.0.42' to dhcp config"
+                warn "Add 'list server ${CFG_SB_DNS_IP}' to dhcp config"
                 _chw_ok=1
             fi
         fi
@@ -913,6 +1705,7 @@ ensure_required_tools() {
     have_cmd awk  || die "Missing command: awk"
     have_cmd ip   || die "Missing command: ip"
     (have_cmd ss || have_cmd netstat) || die "Need 'ss' or 'netstat'"
+    ensure_disk_space 15360
 }
 
 ensure_base_firewall() {
@@ -977,7 +1770,7 @@ remove_podkop_interface() {
 #   detect_podkop_state IFACE — lightweight per-interface UCI lookup.
 #
 # SB_RUNNING    — Sing-Box process alive
-# SB_DNS        — Sing-Box listening on 127.0.0.42:53
+# SB_DNS        — Sing-Box listening on ${CFG_SB_DNS_IP}:53
 # SB_TPROXY     — Sing-Box listening on 127.0.0.1:1602
 # PK_INSTALLED  — podkop UCI config exists
 # PK_ENABLED    — podkop service enabled (/etc/rc.d/S99podkop)
@@ -992,9 +1785,10 @@ remove_podkop_interface() {
 
 # Heavy checks — call once at startup and after service restarts
 podkop_refresh() {
-    SB_RUNNING=0; SB_DNS=0; SB_TPROXY=0
+    SB_RUNNING=0; SB_DNS=0; SB_TPROXY=0; SB_CFG_OK=0; SB_ROUTE_OK=0
     PK_INSTALLED=0; PK_ENABLED=0; PK_NFT_ACTIVE=0; PK_DTD=0
     DM_FWD=0; DM_NORESOLV=0; DM_OK=0
+    DM_DNSCRYPT=0; DM_STUBBY=0
     PK_LINKED=0; PK_DNS_VIA_ROUTER=0
 
     # Sing-Box (standalone or via podkop)
@@ -1002,15 +1796,32 @@ podkop_refresh() {
 
     if [ "$SB_RUNNING" -eq 1 ]; then
         _dpk_ports="$(netstat -ln 2>/dev/null || true)"
-        if echo "$_dpk_ports" | grep -q '127\.0\.0\.42:53'; then SB_DNS=1; fi
-        if echo "$_dpk_ports" | grep -q '127\.0\.0\.1:1602'; then SB_TPROXY=1; fi
+        if echo "$_dpk_ports" | grep -q "${CFG_SB_DNS_IP}:53"; then SB_DNS=1; fi
+        if echo "$_dpk_ports" | grep -q "127\.0\.0\.1:1602"; then SB_TPROXY=1; fi
+    fi
+
+    # Sing-Box config validation
+    if [ -f /etc/sing-box/config.json ] && have_cmd sing-box; then
+        if sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 \
+           || sing-box -c /etc/sing-box/config.json check >/dev/null 2>&1; then
+            SB_CFG_OK=1
+        fi
+    elif [ "$SB_RUNNING" -eq 1 ]; then
+        SB_CFG_OK=1  # running = config was valid at start
+    fi
+
+    # Sing-Box / VPN routing table
+    if ip route show table vpn 2>/dev/null | grep -q "default dev tun0"; then
+        SB_ROUTE_OK=1
     fi
 
     # dnsmasq configuration (independent of podkop)
     _dpk_cachesize="$(uci -q get "dhcp.@dnsmasq[0].cachesize" 2>/dev/null || true)"
     if [ "$(uci -q get "dhcp.@dnsmasq[0].noresolv" 2>/dev/null || true)" = "1" ]; then DM_NORESOLV=1; fi
     for _dpk_srv in $(uci -q get "dhcp.@dnsmasq[0].server" 2>/dev/null || true); do
-        case "$_dpk_srv" in 127.0.0.42|127.0.0.42\#*) DM_FWD=1 ;; esac
+        case "$_dpk_srv" in ${CFG_SB_DNS_IP}|${CFG_SB_DNS_IP}\#*) DM_FWD=1 ;; esac
+        case "$_dpk_srv" in 127.0.0.53|127.0.0.53\#*) DM_DNSCRYPT=1 ;; esac
+        case "$_dpk_srv" in 127.0.0.1\#5453) DM_STUBBY=1 ;; esac
     done
     if [ "$DM_FWD" -eq 1 ] && [ "$DM_NORESOLV" -eq 1 ] && [ "$_dpk_cachesize" = "0" ]; then DM_OK=1; fi
 
@@ -1159,7 +1970,7 @@ active_peer_names() {
                     if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
                     else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
                 print t;exit}')"
-        [ "${_sec:-9999999}" -le 120 ] 2>/dev/null && \
+        [ "${_sec:-9999999}" -le "120" ] 2>/dev/null && \
             _names="${_names:+${_names}, }${_desc}"
         _pi=$((_pi+1))
     done
@@ -1297,7 +2108,7 @@ emit_peer_config() {
     _H4="$(awg_iface_show_val "$_iface" "h4")"; [ -n "$_H4" ] || _H4="4"
     _I1="$(awg_iface_show_val "$_iface" "i1")"; [ -n "$_I1" ] || _I1="0"
 
-    _MTU="$(uci -q get "network.${_iface}.mtu" || echo "1280")"
+    _MTU="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
 
     _conf_crlf="$(printf "%s" "$_conf" | sed 's/$/\r/')"
 
@@ -1384,17 +2195,17 @@ reconstruct_peer_config() {
     [ -z "$_client_priv" ] && { echo ""; return 1; }
 
     _peer_ip="$(uci -q get "network.@${_pt}[$_idx].allowed_ips" || echo "?")"
-    _keepalive="$(uci -q get "network.@${_pt}[$_idx].persistent_keepalive" || echo "25")"
+    _keepalive="$(uci -q get "network.@${_pt}[$_idx].persistent_keepalive" || echo "$CFG_DEFAULT_KEEPALIVE")"
     _psk="$(uci -q get "network.@${_pt}[$_idx].preshared_key" || true)"
     _client_allowed_ips="$(uci -q get "network.@${_pt}[$_idx].client_allowed_ips" || echo "0.0.0.0/0, ::/0")"
 
     _server_priv="$(uci -q get "network.${_iface}.private_key" || true)"
     _server_pub="$(printf '%s' "$_server_priv" | awg pubkey 2>/dev/null || true)"
 
-    _port="$(uci -q get "network.${_iface}.listen_port" || echo "51820")"
+    _port="$(uci -q get "network.${_iface}.listen_port" || echo "$CFG_DEFAULT_PORT")"
     _dns="$(uci -q get "network.${_iface}.dns" || true)"
-    [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "1.1.1.1")"
-    _mtu="$(uci -q get "network.${_iface}.mtu" || echo "1280")"
+    [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "$CFG_DEFAULT_DNS")"
+    _mtu="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
 
     _endpoint_host="$(uci -q get "network.${_iface}.endpoint_host" || true)"
     if [ -z "$_endpoint_host" ]; then
@@ -1417,9 +2228,9 @@ build_vpn_key() {
     _server_priv="$(uci -q get "network.${_iface}.private_key" || true)"
     _server_pub="$(printf '%s' "$_server_priv" | awg pubkey 2>/dev/null || true)"
 
-    _port="$(uci -q get "network.${_iface}.listen_port" || echo "51820")"
+    _port="$(uci -q get "network.${_iface}.listen_port" || echo "$CFG_DEFAULT_PORT")"
     _dns="$(uci -q get "network.${_iface}.dns" || true)"
-    [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "1.1.1.1")"
+    [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "$CFG_DEFAULT_DNS")"
     _endpoint_host="$(uci -q get "network.${_iface}.endpoint_host" || true)"
     if [ -z "$_endpoint_host" ]; then
         _endpoint_host="$(detect_wan_ip || true)"
@@ -1433,7 +2244,7 @@ build_vpn_key() {
     _H3="$(awg_iface_show_val "$_iface" "h3")"; [ -n "$_H3" ] || _H3="3"
     _H4="$(awg_iface_show_val "$_iface" "h4")"; [ -n "$_H4" ] || _H4="4"
     _I1="$(awg_iface_show_val "$_iface" "i1")"; [ -n "$_I1" ] || _I1="0"
-    _MTU="$(uci -q get "network.${_iface}.mtu" || echo "1280")"
+    _MTU="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
 
     _conf_crlf="$(printf "%s" "$_conf" | sed 's/$/\r/')"
 
@@ -1676,7 +2487,7 @@ do_peer_menu() {
                             if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
                             else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
                         print t;exit}')"
-                if [ "${_hs_sec:-9999}" -le 120 ] 2>/dev/null; then
+                if [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null; then
                     _st_ico="${ICO_ON}"; _online="${OK}Online${NC}"
                     _is_online=1
                 fi
@@ -1769,16 +2580,16 @@ do_peer_menu() {
                     echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: Sing-Box is not running${NC}"
                     _dns_warns=1
                 elif [ "${SB_DNS:-0}" -eq 0 ]; then
-                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: Sing-Box not listening on 127.0.0.42:53${NC}"
+                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: Sing-Box not listening on ${CFG_SB_DNS_IP}:53${NC}"
                     _dns_warns=1
                 elif [ "${DM_FWD:-0}" -eq 0 ]; then
-                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: dnsmasq missing server 127.0.0.42${NC}"
+                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: dnsmasq missing server ${CFG_SB_DNS_IP}${NC}"
                     _dns_warns=1
                 elif [ "${PK_DNS_VIA_ROUTER:-0}" -eq 1 ]; then
                     echo -e "  ${ICO_OK} ${DIM2}${_sb_label}: peer → dnsmasq → Sing-Box (hostrecords OK)${NC}"
                 fi
                 if [ "${DM_NORESOLV:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 0 ]; then
-                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: noresolv=1 but no server 127.0.0.42${NC}"
+                    echo -e "  ${ICO_WARN} ${WARN_C}${_sb_label}: noresolv=1 but no server ${CFG_SB_DNS_IP}${NC}"
                     _dns_warns=1
                 fi
                 if [ "${PK_DTD:-0}" -eq 1 ]; then
@@ -1811,6 +2622,10 @@ do_peer_menu() {
             echo -e "  ${B}h${NC} ${DIM2}›${NC} ${W}Hostname${NC}    ${DIM2}${_hr_fqdn}${NC}"
         else
             echo -e "  ${B}h${NC} ${DIM2}›${NC} ${W}Hostname${NC}    ${DIM2}none${NC}"
+        fi
+        echo -e "  ${B}g${NC} ${DIM2}›${NC} ${W}Test${NC} DNS & Network"
+        if [ "$_is_online" -eq 1 ]; then
+            echo -e "  ${B}p${NC} ${DIM2}›${NC} ${W}Test${NC} Connection"
         fi
         echo ""
         echo -e "  ${DIM2}Actions${NC}"
@@ -1978,7 +2793,7 @@ do_peer_menu() {
 
             k) # Edit Keepalive
                 section "Edit Keepalive"
-                _cur_ka="$(uci -q get "network.@${_pt}[$_idx].persistent_keepalive" || echo "25")"
+                _cur_ka="$(uci -q get "network.@${_pt}[$_idx].persistent_keepalive" || echo "$CFG_DEFAULT_KEEPALIVE")"
                 echo -e "  ${A}Current:${NC} ${W}${_cur_ka}s${NC}"
                 echo -e "  ${DIM2}0 = off, 25 = recommended for NAT${NC}"
                 prompt _new_ka "Keepalive" "$_cur_ka" || continue
@@ -1996,6 +2811,60 @@ do_peer_menu() {
                 else
                     echo -e "  ${DIM2}No change${NC}"
                 fi
+                PAUSE ;;
+
+            g|G) # Test DNS & Network Diagnostics
+                do_dns_network_test "$_iface" "${_aip%%/*}" "$_hr_fqdn" "$_is_online"
+                PAUSE ;;
+
+            p|P) # Test Connection
+                if [ "$_is_online" -eq 0 ]; then
+                    warn "Peer is offline — no connection to test"
+                    PAUSE; continue
+                fi
+                echo ""
+                echo -e "  ${V}── Connection Test ──${NC}"
+                echo ""
+                _test_pip="${_aip%%/*}"
+                _TC="\033[36G"
+
+                # VPN tunnel ping
+                echo -ne "  ${DIM2}VPN Ping ${_test_pip}${NC}${_TC}"
+                _tp_out="$(ping -c3 -W2 "$_test_pip" 2>/dev/null)" && _tp_ok=1 || _tp_ok=0
+                if [ "$_tp_ok" -eq 1 ]; then
+                    _tp_stats="$(echo "$_tp_out" | sed -n 's|.*/\([0-9.]*\)/.*|\1|p')"
+                    if [ -n "$_tp_stats" ]; then
+                        echo -e "${ICO_OK} ${OK}Reachable${NC}  ${DIM2}avg ${_tp_stats}ms${NC}"
+                    else
+                        echo -e "${ICO_OK} ${OK}Reachable${NC}"
+                    fi
+                else
+                    echo -e "${ICO_WARN} ${WARN_C}No reply${NC}"
+                fi
+
+                # Peer endpoint UDP reachability (live endpoint from awg show)
+                if [ -n "$_ep" ] && [ "$_ep" != "(none)" ]; then
+                    _tp_ep_host="${_ep%%:*}"
+                    _tp_ep_port="${_ep##*:}"
+                    echo -ne "  ${DIM2}UDP ${_ep}${NC}${_TC}"
+                    if ( echo -n "" > /dev/udp/"$_tp_ep_host"/"$_tp_ep_port" ) 2>/dev/null; then
+                        echo -e "${ICO_OK} ${OK}Open${NC}"
+                    elif have_cmd nc && nc -uzw2 "$_tp_ep_host" "$_tp_ep_port" </dev/null >/dev/null 2>&1; then
+                        echo -e "${ICO_OK} ${OK}Open${NC}"
+                    else
+                        echo -e "${ICO_WARN} ${WARN_C}Open or filtered${NC}"
+                    fi
+                fi
+
+                # Handshake freshness (best indicator of real connectivity)
+                echo -ne "  ${DIM2}Handshake${NC}${_TC}"
+                if [ "$_hs_sec" -le 120 ] 2>/dev/null; then
+                    echo -e "${ICO_OK} ${OK}${_hs_sec}s ago${NC}"
+                else
+                    echo -e "${ICO_WARN} ${WARN_C}${_hs:--}${NC}"
+                fi
+
+                echo ""
                 PAUSE ;;
 
             "") crumb_pop; return ;;
@@ -2037,7 +2906,7 @@ do_list_peers() {
                             if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
                             else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
                         print t;exit}' 2>/dev/null)"
-                if [ "${_hs_sec:-9999}" -le 120 ] 2>/dev/null; then
+                if [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null; then
                     echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${ICO_ON} ${W}${_desc}${NC}  ${DIM2}${_aip}${NC}"
                 else
                     echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${ICO_OFF} ${W}${_desc}${NC}  ${DIM2}last: ${WARN_C}${_hs}${NC}  ${DIM2}${_aip}${NC}"
@@ -2167,11 +3036,11 @@ do_add_peer() {
     done
     echo -e "  ${ICO_OK} ${OK}Endpoint:${NC} ${W}$_endpoint_host${NC}"
 
-    _port="$(uci -q get "network.${_iface}.listen_port" || echo "51820")"
+    _port="$(uci -q get "network.${_iface}.listen_port" || echo "$CFG_DEFAULT_PORT")"
     _dns="$(uci -q get "network.${_iface}.dns" || true)"
-    [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "1.1.1.1")"
-    _keepalive="25"
-    _mtu="$(uci -q get "network.${_iface}.mtu" || echo "1280")"
+    [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "$CFG_DEFAULT_DNS")"
+    _keepalive="$CFG_DEFAULT_KEEPALIVE"
+    _mtu="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
 
     echo -e "  ${ICO_OK} ${OK}DNS:${NC} ${W}$_dns${NC}"
     echo -e "  ${ICO_OK} ${OK}MTU:${NC} ${W}$_mtu${NC}"
@@ -2464,7 +3333,7 @@ do_manage_interface() {
                 box_line "  ${A}Podkop${NC}       ${ERR}Linked but Sing-Box stopped${NC}"
             fi
         elif [ "${SB_DNS:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 1 ]; then
-            box_line "  ${A}Sing-Box${NC}     ${OK}Active${NC}  ${DIM2}dnsmasq → 127.0.0.42${NC}"
+            box_line "  ${A}Sing-Box${NC}     ${OK}Active${NC}  ${DIM2}dnsmasq → ${CFG_SB_DNS_IP}${NC}"
         elif [ "${SB_RUNNING:-0}" -eq 1 ]; then
             box_line "  ${A}Sing-Box${NC}     ${WARN_C}Running${NC}  ${DIM2}DNS not configured${NC}"
         fi
@@ -2535,7 +3404,7 @@ do_manage_interface() {
                                 if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
                                 else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
                             print t;exit}' 2>/dev/null)"
-                    if [ "${_hs_sec:-9999}" -le 120 ] 2>/dev/null; then
+                    if [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null; then
                         echo -e "  ${B}${_pn}${NC} ${DIM2}›${NC} ${ICO_ON}${_PC}${W}${_pdesc}${NC}${_PS}${DIM2}#${_phost}${NC}"
                     else
                         echo -e "  ${B}${_pn}${NC} ${DIM2}›${NC} ${ICO_OFF}${_PC}${W}${_pdesc}${NC}${_PS}${DIM2}#${_phost}  ${WARN_C}${_hs}${NC}"
@@ -2583,6 +3452,7 @@ do_manage_interface() {
         # ── Info ──
         echo -e "  ${DIM2}Info${NC}"
         echo -e "  ${B}i${NC} ${DIM2}›${NC} ${W}Show${NC} Public Key"
+        echo -e "  ${B}g${NC} ${DIM2}›${NC} ${W}Test${NC} DNS & Network"
         echo ""
 
         # ── Interface ──
@@ -2612,12 +3482,35 @@ do_manage_interface() {
             e|E) # Edit DNS / MTU
                 section "Edit DNS / MTU"
                 _cur_dns="$(uci -q get "network.${_iface}.dns" || echo "")"
-                _cur_mtu="$(uci -q get "network.${_iface}.mtu" || echo "1280")"
+                _cur_mtu="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
                 _changed=0; _mtu_changed=0; _dns_changed=0
 
                 _new_dns=""
                 if select_dns _new_dns "$_cur_dns"; then
                     if [ -n "$_new_dns" ] && [ "$_new_dns" != "$_cur_dns" ]; then
+                        _TC="\033[36G"
+                        echo ""
+                        echo -ne "  ${DIM2}Ping${NC}${_TC}"
+                        _ed_ping="$(_dns_test "$_new_dns")"
+                        echo -e "$(_dns_fmt_latency "$_ed_ping")"
+                        echo -ne "  ${DIM2}DNS resolve${NC}${_TC}"
+                        if check_dns_server "$_new_dns"; then
+                            echo -e "${OK}✓${NC}"
+                        else
+                            echo -e "${ERR}✗${NC}"
+                            warn "DNS server ${_new_dns} is not responding"
+                            confirm "Use anyway?" "n" || { PAUSE; continue; }
+                        fi
+                        echo -ne "  ${DIM2}DNS poisoning${NC}${_TC}"
+                        check_dns_poisoning "facebook.com" "$_new_dns"
+                        _ed_pr=$?
+                        if [ "$_ed_pr" -eq 0 ]; then
+                            echo -e "${OK}✓ Clean${NC}"
+                        elif [ "$_ed_pr" -eq 1 ]; then
+                            echo -e "${ERR}✗ 127.x.x.x detected${NC}"
+                        else
+                            echo -e "${WARN_C}? Can't check${NC}"
+                        fi
                         uci set "network.${_iface}.dns=$_new_dns"
                         _changed=1; _dns_changed=1
                     fi
@@ -2813,6 +3706,10 @@ do_manage_interface() {
                 else
                     echo -e "  ${DIM2}Could not derive public key${NC}"
                 fi
+                PAUSE ;;
+
+            g|G) # Test DNS & Network
+                do_dns_network_test "$_iface"
                 PAUSE ;;
 
             n|N) # Show WAN IP
@@ -3344,7 +4241,7 @@ do_create() {
     IF_SUBNET="$(network_base_from_cidr "$IFADDR")"
 
     while true; do
-        prompt PORT "Listen port" "51820" || { trap_restore; return; }
+        prompt PORT "Listen port" "$CFG_DEFAULT_PORT" || { trap_restore; return; }
         is_cancelled && { trap_restore; return; }
         validate_port "$PORT" || continue
         port_in_use "$PORT" && { warn "Port $PORT is already in use"; continue; }
@@ -3354,7 +4251,7 @@ do_create() {
     done
 
     while true; do
-        prompt MTU_VALUE "MTU" "1380" || { trap_restore; return; }
+        prompt MTU_VALUE "MTU" "$CFG_MTU_SUGGESTION" || { trap_restore; return; }
         is_cancelled && { trap_restore; return; }
         case "$MTU_VALUE" in *[!0-9]*) warn "MTU must be numeric"; continue ;; esac
         [ "$MTU_VALUE" -ge 1200 ] 2>/dev/null || warn "MTU below 1200 is unusual"
@@ -3464,11 +4361,11 @@ do_create() {
     if podkop_present; then
         echo -e "  ${ICO_OK} ${OK}Podkop found${NC}"
         if [ "$SB_RUNNING" -eq 1 ] && [ "$SB_DNS" -eq 1 ]; then
-            echo -e "  ${DIM2}  Sing-Box listening on 127.0.0.42:53${NC}"
+            echo -e "  ${DIM2}  Sing-Box listening on ${CFG_SB_DNS_IP}:53${NC}"
             if [ "$DM_FWD" -eq 1 ]; then
                 echo -e "  ${DIM2}  DNS chain: peer → dnsmasq → Sing-Box → internet${NC}"
             else
-                echo -e "  ${WARN_C}  dnsmasq is not forwarding to Sing-Box (missing server 127.0.0.42)${NC}"
+                echo -e "  ${WARN_C}  dnsmasq is not forwarding to Sing-Box (missing server ${CFG_SB_DNS_IP})${NC}"
             fi
         elif [ "$SB_RUNNING" -eq 0 ]; then
             echo -e "  ${WARN_C}  Sing-Box is not running${NC}"
@@ -3643,13 +4540,15 @@ do_backup_menu() {
         echo -e "  ${A}Path${NC}         ${DIM2}${_bdir}${NC}"
         echo ""
 
-        _has_net=""; _has_fw=""; _has_pk=""
+        _has_net=""; _has_fw=""; _has_pk=""; _has_lim=""
         [ -f "$_bdir/network.bak" ] && _has_net="${OK}yes${NC}" || _has_net="${DIM2}no${NC}"
         [ -f "$_bdir/firewall.bak" ] && _has_fw="${OK}yes${NC}" || _has_fw="${DIM2}no${NC}"
         [ -f "$_bdir/podkop.bak" ] && _has_pk="${OK}yes${NC}" || _has_pk="${DIM2}no${NC}"
+        [ -f "$_bdir/liminal.bak" ] && _has_lim="${OK}yes${NC}" || _has_lim="${DIM2}no${NC}"
         echo -e "  ${A}Network${NC}      ${_has_net}"
         echo -e "  ${A}Firewall${NC}     ${_has_fw}"
         echo -e "  ${A}Podkop${NC}       ${_has_pk}"
+        echo -e "  ${A}Liminal${NC}      ${_has_lim}"
         echo ""
         echo -e "${DIM}──────────────────────────────────────${NC}"
         echo ""
@@ -3745,12 +4644,15 @@ do_manage_backups() {
                 fi
                 continue ;;
             t|T)
-                mkdir -p "$BACKUP_BASE"
                 if autobackup_enabled; then
-                    touch "$AUTOBACKUP_OFF"
+                    uci set liminal.settings.auto_backup='0'
+                    uci commit liminal
+                    CFG_AUTO_BACKUP="0"
                     echo -e "  ${OK}Auto-backup disabled${NC}"
                 else
-                    rm -f "$AUTOBACKUP_OFF"
+                    uci set liminal.settings.auto_backup='1'
+                    uci commit liminal
+                    CFG_AUTO_BACKUP="1"
                     echo -e "  ${OK}Auto-backup enabled${NC}"
                 fi
                 PAUSE
@@ -3889,6 +4791,15 @@ do_full_reset() {
 
 fetch_remote_version() {
     have_cmd wget || { echo ""; return; }
+
+    # Check GitHub API rate limit before fetching raw file
+    if have_cmd curl; then
+        _fv_resp="$(curl -s "https://api.github.com/repos/${LIMINAL_REPO}/releases/latest" 2>/dev/null || true)"
+        if echo "$_fv_resp" | grep -q 'API rate limit '; then
+            echo ""; return
+        fi
+    fi
+
     wget -qO- "$LIMINAL_RAW_URL" 2>/dev/null \
         | sed -n 's/^LIMINAL_VERSION="\([^"]*\)"/\1/p' | head -n1
 }
@@ -3896,13 +4807,23 @@ fetch_remote_version() {
 do_self_update() {
     echo ""
     echo -e "  ${B}Checking for updates...${NC}"
+
+    if ! check_dns; then
+        warn "DNS is not working — cannot check for updates"
+        PAUSE; return
+    fi
+
     _remote_ver="$(fetch_remote_version)"
     if [ -z "$_remote_ver" ]; then
-        warn "Could not fetch remote version (no internet or wget missing)"
+        warn "Could not fetch remote version (rate limit, no internet, or wget missing)"
         PAUSE; return
     fi
     if [ "$_remote_ver" = "$LIMINAL_VERSION" ]; then
         echo -e "  ${OK}Already up to date${NC} (v${LIMINAL_VERSION})"
+        PAUSE; return
+    fi
+    if ! version_newer "$_remote_ver" "$LIMINAL_VERSION"; then
+        echo -e "  ${OK}Local version (v${LIMINAL_VERSION}) is newer than remote (v${_remote_ver})${NC}"
         PAUSE; return
     fi
     echo -e "  ${A}Current:${NC} v${LIMINAL_VERSION}"
@@ -3910,11 +4831,20 @@ do_self_update() {
     echo ""
     confirm "Update to v${_remote_ver}?" "y" || return
 
+    # Backup before major version change
+    _cur_major="$(version_major "$LIMINAL_VERSION")"
+    _rem_major="$(version_major "$_remote_ver")"
+    if [ "$_cur_major" != "$_rem_major" ]; then
+        echo -e "  ${WARN_C}Major version change detected (v${_cur_major}.x → v${_rem_major}.x)${NC}"
+        autobackup_enabled && init_backup "Pre-Update v${LIMINAL_VERSION}→v${_remote_ver}"
+        echo -e "  ${ICO_OK} ${OK}Backup created:${NC} ${DIM2}${BACKUP_DIR}${NC}"
+    fi
+
     _tmp="$(mktemp /tmp/liminal-update.XXXXXX)" || { warn "mktemp failed"; PAUSE; return; }
     echo -e "  ${B}Downloading...${NC}"
-    if ! wget -qO "$_tmp" "$LIMINAL_RAW_URL" 2>/dev/null; then
+    if ! wget_retry "$LIMINAL_RAW_URL" "$_tmp"; then
         rm -f "$_tmp"
-        warn "Download failed"
+        warn "Download failed after ${DOWNLOAD_RETRIES} attempts"
         PAUSE; return
     fi
 
@@ -3936,7 +4866,7 @@ do_self_update() {
 #  EXPORT / IMPORT CONFIGURATION
 # ═════════════════════════════════════════════════════════════════════
 
-EXPORT_DIR="/root/liminal-exports"
+# EXPORT_DIR set by liminal_config_load()
 
 do_export_config() {
     have_cmd jq || { warn "jq is required for export"; PAUSE; return; }
@@ -3956,7 +4886,7 @@ do_export_config() {
         _addr="$(uci -q get "network.${iface}.addresses" || echo "")"
         _port="$(uci -q get "network.${iface}.listen_port" || echo "")"
         _privkey="$(uci -q get "network.${iface}.private_key" || echo "")"
-        _mtu="$(uci -q get "network.${iface}.mtu" || echo "1280")"
+        _mtu="$(uci -q get "network.${iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
         _dns="$(uci -q get "network.${iface}.dns" || echo "")"
         _zone="$(find_zone_for_interface "$iface" 2>/dev/null || echo "")"
 
@@ -3979,7 +4909,7 @@ do_export_config() {
             _ppub="$(uci -q get "network.@${_pt}[$_pi].public_key" || echo "")"
             _ppriv="$(uci -q get "network.@${_pt}[$_pi].private_key" || echo "")"
             _paip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "")"
-            _pka="$(uci -q get "network.@${_pt}[$_pi].persistent_keepalive" || echo "25")"
+            _pka="$(uci -q get "network.@${_pt}[$_pi].persistent_keepalive" || echo "$CFG_DEFAULT_KEEPALIVE")"
             _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
 
             _peer_json="$(jq -n \
@@ -4215,7 +5145,7 @@ do_live_dashboard() {
                                     if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
                                     else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
                                 print t;exit}' 2>/dev/null)"
-                        if [ "${_hs_sec:-9999}" -le 120 ] 2>/dev/null; then
+                        if [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null; then
                             _ico="${ICO_ON}"; _status="${OK}Online${NC}"
                         fi
                     fi
@@ -4327,7 +5257,7 @@ do_connectivity_check() {
                             if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
                             else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
                         print t;exit}' 2>/dev/null)"
-                [ "${_hs_sec:-9999}" -le 120 ] 2>/dev/null && _is_online=1
+                [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null && _is_online=1
             fi
             if [ "$_is_online" -eq 0 ]; then
                 _pi=$((_pi + 1)); continue
@@ -4393,8 +5323,8 @@ show_menu() {
         _has_jq=0; have_cmd jq && _has_jq=1
         _has_b64=0; have_cmd base64 && _has_b64=1
 
-        _qr_s="${ICO_ERR}"; [ "$_has_qr"  -eq 1 ] && _qr_s="${ICO_OK}"
-        _jq_s="${ICO_ERR}"; [ "$_has_jq"  -eq 1 ] && _jq_s="${ICO_OK}"
+        _qr_s="${ICO_ERR}"; [ "$_has_qr"  -eq 1 ] && { _qr_v="$(pkg_version qrencode 2>/dev/null)"; _qr_s="${ICO_OK} ${DIM2}${_qr_v}${NC}"; }
+        _jq_s="${ICO_ERR}"; [ "$_has_jq"  -eq 1 ] && { _jq_v="$(pkg_version jq 2>/dev/null)"; _jq_s="${ICO_OK} ${DIM2}${_jq_v}${NC}"; }
         _b64_s="${ICO_ERR}"; [ "$_has_b64" -eq 1 ] && _b64_s="${ICO_OK}"
 
         box_top 56
@@ -4521,6 +5451,10 @@ show_menu() {
                 if [ "$_missing_count" -gt 0 ]; then
                     confirm "Install all ${_missing_count} missing packages?" "y" || continue
                     echo ""
+                    if ! check_dns; then
+                        warn "DNS is not working — cannot install packages"
+                        PAUSE; continue
+                    fi
                     if [ "$_has_awg" -eq 0 ]; then
                         echo -e "  ${B}Installing${NC} AmneziaWG..."
                         sh <(wget -O - https://raw.githubusercontent.com/Slava-Shchipunov/awg-openwrt/refs/heads/master/amneziawg-install.sh) 2>&1
@@ -4529,23 +5463,32 @@ show_menu() {
                     if [ "$_has_qr" -eq 0 ] || [ "$_has_jq" -eq 0 ] || [ "$_has_b64" -eq 0 ]; then
                         _need_opkg=1
                         echo -e "  ${B}Updating${NC} package list..."
-                        opkg update >/dev/null 2>&1 || apk update >/dev/null 2>&1 || true
+                        pkg_update >/dev/null 2>&1 || true
                     fi
                     if [ "$_has_podkop" -eq 0 ]; then
                         echo -e "  ${B}Installing${NC} Podkop..."
                         sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh) 2>&1
                     fi
-                    if [ "$_has_qr" -eq 0 ]; then
+                    if [ "$_has_qr" -eq 0 ] && ! pkg_is_installed qrencode; then
                         echo -e "  ${B}Installing${NC} qrencode..."
-                        opkg install qrencode 2>/dev/null || apk add qrencode 2>/dev/null || true
+                        pkg_install qrencode 2>/dev/null || true
                     fi
-                    if [ "$_has_jq" -eq 0 ]; then
+                    if [ "$_has_jq" -eq 0 ] && ! pkg_is_installed jq; then
                         echo -e "  ${B}Installing${NC} jq..."
-                        opkg install jq 2>/dev/null || apk add jq 2>/dev/null || true
+                        pkg_install jq 2>/dev/null || true
                     fi
                     if [ "$_has_b64" -eq 0 ]; then
-                        echo -e "  ${B}Installing${NC} base64..."
-                        opkg install coreutils-base64 2>/dev/null || apk add coreutils 2>/dev/null || true
+                        if [ "$PKG_IS_APK" -eq 1 ]; then
+                            if ! pkg_is_installed coreutils; then
+                                echo -e "  ${B}Installing${NC} base64..."
+                                pkg_install coreutils 2>/dev/null || true
+                            fi
+                        else
+                            if ! pkg_is_installed coreutils-base64; then
+                                echo -e "  ${B}Installing${NC} base64..."
+                                pkg_install coreutils-base64 2>/dev/null || true
+                            fi
+                        fi
                     fi
                     echo -e "  ${ICO_OK} ${OK}Done${NC}"
                     PAUSE
@@ -4553,6 +5496,7 @@ show_menu() {
             a|A)
                 if [ "$_has_awg" -eq 0 ]; then
                     confirm "Install AmneziaWG?" "y" || continue
+                    if ! check_dns; then warn "DNS is not working"; PAUSE; continue; fi
                     echo -e "  ${B}Installing${NC} AmneziaWG..."
                     sh <(wget -O - https://raw.githubusercontent.com/Slava-Shchipunov/awg-openwrt/refs/heads/master/amneziawg-install.sh) 2>&1
                     echo -e "  ${ICO_OK} ${OK}Done${NC}"
@@ -4561,6 +5505,7 @@ show_menu() {
             p|P)
                 if [ "$_has_podkop" -eq 0 ]; then
                     confirm "Install Podkop?" "y" || continue
+                    if ! check_dns; then warn "DNS is not working"; PAUSE; continue; fi
                     spinner_start "Installing Podkop..."
                     sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh) 2>&1
                     spinner_stop
@@ -4568,22 +5513,41 @@ show_menu() {
                 fi ;;
             q|Q)
                 if [ "$_has_qr" -eq 0 ]; then
+                    if pkg_is_installed qrencode; then
+                        echo -e "  ${DIM2}qrencode already installed (binary not in PATH)${NC}"; PAUSE; continue
+                    fi
+                    if ! check_dns; then warn "DNS is not working"; PAUSE; continue; fi
                     spinner_start "Installing qrencode..."
-                    opkg update >/dev/null 2>&1; opkg install qrencode 2>/dev/null || apk add qrencode 2>/dev/null
+                    pkg_update >/dev/null 2>&1; pkg_install qrencode 2>/dev/null
                     spinner_stop
                     echo -e "  ${ICO_OK} ${OK}Done${NC}"; PAUSE
                 fi ;;
             j|J)
                 if [ "$_has_jq" -eq 0 ]; then
+                    if pkg_is_installed jq; then
+                        echo -e "  ${DIM2}jq already installed (binary not in PATH)${NC}"; PAUSE; continue
+                    fi
+                    if ! check_dns; then warn "DNS is not working"; PAUSE; continue; fi
                     spinner_start "Installing jq..."
-                    opkg update >/dev/null 2>&1; opkg install jq 2>/dev/null || apk add jq 2>/dev/null
+                    pkg_update >/dev/null 2>&1; pkg_install jq 2>/dev/null
                     spinner_stop
                     echo -e "  ${ICO_OK} ${OK}Done${NC}"; PAUSE
                 fi ;;
             x|X)
                 if [ "$_has_b64" -eq 0 ]; then
+                    if [ "$PKG_IS_APK" -eq 1 ] && pkg_is_installed coreutils; then
+                        echo -e "  ${DIM2}coreutils already installed (binary not in PATH)${NC}"; PAUSE; continue
+                    elif [ "$PKG_IS_APK" -eq 0 ] && pkg_is_installed coreutils-base64; then
+                        echo -e "  ${DIM2}coreutils-base64 already installed (binary not in PATH)${NC}"; PAUSE; continue
+                    fi
+                    if ! check_dns; then warn "DNS is not working"; PAUSE; continue; fi
                     spinner_start "Installing coreutils-base64..."
-                    opkg update >/dev/null 2>&1; opkg install coreutils-base64 2>/dev/null || apk add coreutils 2>/dev/null
+                    pkg_update >/dev/null 2>&1
+                    if [ "$PKG_IS_APK" -eq 1 ]; then
+                        pkg_install coreutils 2>/dev/null
+                    else
+                        pkg_install coreutils-base64 2>/dev/null
+                    fi
                     spinner_stop
                     echo -e "  ${ICO_OK} ${OK}Done${NC}"; PAUSE
                 fi ;;
@@ -4618,7 +5582,7 @@ Commands:
   check                  Run connectivity check
   list                   List interfaces (names only)
   peers <interface>      List peers for an interface
-  export [file]          Export config to JSON (default: /root/liminal-exports/...)
+  export [file]          Export config to JSON (default: \$EXPORT_DIR/...)
   import <file>          Import config from JSON
   update                 Check for updates and install if available
   version                Print version
@@ -4670,7 +5634,7 @@ cli_status() {
                                 if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
                                 else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
                             print t;exit}' 2>/dev/null)"
-                    [ "${_hs_sec:-9999}" -le 120 ] 2>/dev/null && _online="ONLINE"
+                    [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null && _online="ONLINE"
                 fi
                 _rx="$(get_peer_rx "$iface" "$_ppub")"
                 _tx="$(get_peer_tx "$iface" "$_ppub")"
@@ -4721,7 +5685,7 @@ cli_export() {
         _addr="$(uci -q get "network.${iface}.addresses" || echo "")"
         _port="$(uci -q get "network.${iface}.listen_port" || echo "")"
         _privkey="$(uci -q get "network.${iface}.private_key" || echo "")"
-        _mtu="$(uci -q get "network.${iface}.mtu" || echo "1280")"
+        _mtu="$(uci -q get "network.${iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
         _dns="$(uci -q get "network.${iface}.dns" || echo "")"
         _zone="$(find_zone_for_interface "$iface" 2>/dev/null || echo "")"
 
@@ -4737,7 +5701,7 @@ cli_export() {
             _ppub="$(uci -q get "network.@${_pt}[$_pi].public_key" || echo "")"
             _ppriv="$(uci -q get "network.@${_pt}[$_pi].private_key" || echo "")"
             _paip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "")"
-            _pka="$(uci -q get "network.@${_pt}[$_pi].persistent_keepalive" || echo "25")"
+            _pka="$(uci -q get "network.@${_pt}[$_pi].persistent_keepalive" || echo "$CFG_DEFAULT_KEEPALIVE")"
             _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
 
             _peer_json="$(jq -n \
@@ -4756,15 +5720,29 @@ cli_export() {
 }
 
 cli_update() {
+    check_dns || die "DNS is not working"
     _remote_ver="$(fetch_remote_version)"
-    [ -z "$_remote_ver" ] && die "Could not fetch remote version"
+    [ -z "$_remote_ver" ] && die "Could not fetch remote version (rate limit or no internet)"
     if [ "$_remote_ver" = "$LIMINAL_VERSION" ]; then
         echo "Up to date (v${LIMINAL_VERSION})"
         exit 0
     fi
+    if ! version_newer "$_remote_ver" "$LIMINAL_VERSION"; then
+        echo "Local version (v${LIMINAL_VERSION}) is newer than remote (v${_remote_ver})"
+        exit 0
+    fi
     echo "Update available: v${LIMINAL_VERSION} -> v${_remote_ver}"
+
+    # Backup before major version change
+    _cur_major="$(version_major "$LIMINAL_VERSION")"
+    _rem_major="$(version_major "$_remote_ver")"
+    if [ "$_cur_major" != "$_rem_major" ]; then
+        autobackup_enabled && init_backup "Pre-Update v${LIMINAL_VERSION}→v${_remote_ver}"
+        echo "Backup created: ${BACKUP_DIR}"
+    fi
+
     _tmp="$(mktemp /tmp/liminal-update.XXXXXX)" || die "mktemp failed"
-    wget -qO "$_tmp" "$LIMINAL_RAW_URL" 2>/dev/null || { rm -f "$_tmp"; die "Download failed"; }
+    wget_retry "$LIMINAL_RAW_URL" "$_tmp" || { rm -f "$_tmp"; die "Download failed after ${DOWNLOAD_RETRIES} attempts"; }
     head -c2 "$_tmp" | grep -q '#!' || { rm -f "$_tmp"; die "Invalid download"; }
     cp "$_tmp" "$SCRIPT_PATH"
     chmod +x "$SCRIPT_PATH"
