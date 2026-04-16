@@ -166,13 +166,13 @@ pkg_version() {
 # Split into scalar and list fields because UCI lists need `add_list`.
 
 IFACE_SCHEMA_SCALAR="proto private_key listen_port mtu dns endpoint_host disabled
-    fwmark nohostroute tunlink ip4table ip6table
+    fwmark nohostroute tunlink ip4table
     awg_jc awg_jmin awg_jmax awg_s1 awg_s2 awg_s3 awg_s4
     awg_h1 awg_h2 awg_h3 awg_h4
     awg_i1 awg_i2 awg_i3 awg_i4 awg_i5
     _liminal_iface"
 
-IFACE_SCHEMA_LIST="addresses ip6prefix"
+IFACE_SCHEMA_LIST="addresses"
 
 PEER_SCHEMA_SCALAR="public_key private_key preshared_key route_allowed_ips allowed_ips
     persistent_keepalive description disabled client_allowed_ips endpoint_host
@@ -2876,6 +2876,9 @@ _resolve_endpoint_host() {
         _eh="$(uci -q get "network.@$2[$3].endpoint_host" 2>/dev/null || true)"
     fi
     [ -z "$_eh" ] && _eh="$(uci -q get "network.$1.endpoint_host" 2>/dev/null || true)"
+    # Legacy safety net: earlier versions allowed users to type "inherit" as
+    # the endpoint and saved it verbatim. Treat such values as unset.
+    case "$_eh" in inherit|INHERIT|Inherit|none|NONE) _eh="" ;; esac
     [ -z "$_eh" ] && _eh="$(detect_wan_ip 2>/dev/null || true)"
     [ -z "$_eh" ] && _eh="YOUR_SERVER_IP"
     printf '%s' "$_eh"
@@ -2896,7 +2899,7 @@ reconstruct_peer_config() {
     _peer_ip="$(peer_get "$_pt" "$_idx" "allowed_ips" "?")"
     _keepalive="$(peer_get "$_pt" "$_idx" "persistent_keepalive" "$CFG_DEFAULT_KEEPALIVE")"
     _psk="$(peer_get "$_pt" "$_idx" "preshared_key")"
-    _client_allowed_ips="$(peer_get "$_pt" "$_idx" "client_allowed_ips" "0.0.0.0/0, ::/0")"
+    _client_allowed_ips="$(peer_get "$_pt" "$_idx" "client_allowed_ips" "0.0.0.0/0")"
     _peer_obf="$(peer_get "$_pt" "$_idx" "_liminal_obfuscation")"
 
     _server_priv="$(iface_get "$_iface" "private_key")"
@@ -3181,9 +3184,13 @@ _pm_edit_endpoint() {
     echo -e "  ${DIM2}specific peer to connect via a specific one.${NC}"
     echo -e "  ${DIM2}Leave empty to inherit the interface default.${NC}"
     echo ""
-    prompt _new_ep "Endpoint (empty = inherit, 'clear' to remove)" "$_cur" || return 0
+    prompt _new_ep "Endpoint (leave blank to inherit from interface)" "$_cur" || return 0
     sigint_caught && return 0
-    case "${_new_ep:-}" in ""|clear|CLEAR) _new_ep="" ;; esac
+    # Accept common attempts to clear the override: empty, "clear", "inherit",
+    # "none". Stored as empty → _resolve_endpoint_host falls back to the iface.
+    case "${_new_ep:-}" in
+        ""|clear|CLEAR|inherit|INHERIT|Inherit|none|NONE) _new_ep="" ;;
+    esac
     if [ "$_new_ep" = "$_cur" ]; then
         echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0
     fi
@@ -3464,8 +3471,7 @@ do_peer_menu() {
         # (ANSI cursor positioning). Value column starts at ~24.
         _SV="\\033[26G"
 
-        echo -e "  ${DIM2}Settings${NC}"
-        _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0, ::/0")"
+        _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0")"
         _cur_advsec="$(peer_get "$_pt" "$_idx" _liminal_advanced_security)"
         case "${_cur_advsec:-}" in
             on|off) _as_label="${_cur_advsec}" ;;
@@ -3480,11 +3486,17 @@ do_peer_menu() {
         esac
         _cur_pep="$(peer_get "$_pt" "$_idx" endpoint_host)"
         _pep_label="${_cur_pep:-inherit}"
+
+        echo -e "  ${DIM2}Routing${NC}"
         echo -e "  ${B}a${NC} ${DIM2}›${NC} ${W}AllowedIPs${NC}${_SV}${DIM2}${_cur_caip}${NC}"
         echo -e "  ${B}k${NC} ${DIM2}›${NC} ${W}Keepalive${NC}${_SV}${DIM2}${_ka}s${NC}"
+        echo -e "  ${B}e${NC} ${DIM2}›${NC} ${W}Endpoint${NC}${_SV}${DIM2}${_pep_label}${NC}"
+        echo ""
+        echo -e "  ${DIM2}Security${NC}"
         echo -e "  ${B}s${NC} ${DIM2}›${NC} ${W}Adv. Security${NC}${_SV}${DIM2}${_as_label}${NC}"
         echo -e "  ${B}o${NC} ${DIM2}›${NC} ${W}Obfuscation${NC}${_SV}${DIM2}${_pobf_label}  ${DIM2}(in .conf)${NC}"
-        echo -e "  ${B}e${NC} ${DIM2}›${NC} ${W}Endpoint${NC}${_SV}${DIM2}${_pep_label}${NC}"
+        echo ""
+        echo -e "  ${DIM2}DNS${NC}"
         echo -e "  ${B}h${NC} ${DIM2}›${NC} ${W}Hostname${NC}${_SV}${DIM2}${_hr_disp}${NC}"
         echo -e "  ${B}g${NC} ${DIM2}›${NC} ${W}Test DNS & Network${NC}"
         echo ""
@@ -3543,11 +3555,11 @@ do_peer_menu() {
                 crumb_pop; return ;;
             a) # Edit AllowedIPs
                 section "Edit AllowedIPs"
-                _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0, ::/0")"
+                _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0")"
                 echo -e "  ${A}Current:${NC} ${W}${_cur_caip}${NC}"
                 echo ""
                 echo -e "  ${DIM2}Presets:${NC}"
-                echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Full tunnel${NC}   ${DIM2}0.0.0.0/0, ::/0${NC}"
+                echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Full tunnel${NC}   ${DIM2}0.0.0.0/0${NC}"
                 echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}       ${DIM2}enter manually${NC}"
                 echo -e "  ${DIM2}Enter › Cancel${NC}"
                 echo ""
@@ -3555,7 +3567,7 @@ do_peer_menu() {
                 sigint_caught && continue
                 [ -z "$_aip_choice" ] && { cancelled; PAUSE; continue; }
                 case "$_aip_choice" in
-                    1) _new_caip="0.0.0.0/0, ::/0" ;;
+                    1) _new_caip="0.0.0.0/0" ;;
                     2) prompt _new_caip "AllowedIPs" "$_cur_caip" || continue
                        sigint_caught && continue
                        [ -z "$_new_caip" ] && { cancelled; PAUSE; continue; } ;;
@@ -3951,7 +3963,7 @@ do_add_peer() {
     fi
 
     if [ "$_has_wan_fwd" = "1" ]; then
-        _client_allowed_ips="0.0.0.0/0, ::/0"
+        _client_allowed_ips="0.0.0.0/0"
     elif [ "$_has_lan_fwd" = "1" ] && [ -n "$_lan_cidr" ]; then
         _client_allowed_ips="$_lan_cidr"
     else
@@ -4436,27 +4448,6 @@ _mi_edit_nohostroute() {
     return 0
 }
 
-# _mi_edit_ip6prefix IFACE — set ip6prefix for IPv6 prefix delegation.
-_mi_edit_ip6prefix() {
-    _iface="$1"
-    section "IPv6 Prefix"
-    _cur="$(iface_get "$_iface" ip6prefix)"
-    echo -e "  ${A}Current:${NC} ${W}${_cur:-none}${NC}"
-    echo ""
-    echo -e "  ${DIM2}IPv6 prefix advertised via this tunnel (ip6prefix in UCI).${NC}"
-    echo -e "  ${DIM2}Format: 'fd12:3456:789a::/48' — niche; leave empty if unsure.${NC}"
-    echo ""
-    prompt _new_p6 "ip6prefix (empty = none)" "$_cur" || return 0
-    sigint_caught && return 0
-    [ "$_new_p6" = "$_cur" ] && { echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0; }
-    iface_set "$_iface" ip6prefix "$_new_p6"
-    uci commit network
-    echo -e "  ${ICO_OK} ${OK}ip6prefix set to ${_new_p6:-none}${NC}"
-    echo -e "  ${WARN_C}Run 'Restart Interface' to apply${NC}"
-    PAUSE
-    return 0
-}
-
 # _mi_edit_route_table IFACE — set ip4table for policy-based routing.
 _mi_edit_route_table() {
     _iface="$1"
@@ -4632,10 +4623,8 @@ _mi_configure() {
         _c_tunlink="$(iface_get "$_iface" tunlink)"
         _c_nohost="$(iface_get "$_iface" nohostroute)"
         case "$_c_nohost" in 1|on|true) _c_nohost_label="on" ;; *) _c_nohost_label="off" ;; esac
-        _c_p6="$(iface_get "$_iface" ip6prefix)"
         echo -e "  ${B}u${NC} ${DIM2}›${NC} ${W}tunlink${NC}          ${DIM2}${_c_tunlink:-auto}${NC}"
         echo -e "  ${B}x${NC} ${DIM2}›${NC} ${W}nohostroute${NC}      ${DIM2}${_c_nohost_label}${NC}"
-        echo -e "  ${B}6${NC} ${DIM2}›${NC} ${W}ip6prefix${NC}        ${DIM2}${_c_p6:-none}${NC}"
         echo ""
         echo -e "  ${DIM2}AmneziaWG${NC}"
         if [ -n "$_c_jc" ]; then
@@ -4669,7 +4658,6 @@ _mi_configure() {
             k|K) _mi_toggle_podkop "$_iface" ;;
             u|U) _mi_edit_tunlink     "$_iface" ;;
             x|X) _mi_edit_nohostroute "$_iface" ;;
-            6)   _mi_edit_ip6prefix   "$_iface" ;;
             i|I) _mi_show_pubkey "$_iface" ;;
             v|V) _mi_show_live_conf "$_iface" ;;
             g|G) do_dns_network_test "$_iface"; PAUSE ;;
