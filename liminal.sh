@@ -6,10 +6,9 @@
 
 set -eu
 
-SCRIPT_NAME="$(basename "$0")"
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 BACKUP_DIR=""
-LIMINAL_VERSION="1.3"
+LIMINAL_VERSION="1.4"
 LIMINAL_REPO="tickcount/openwrt-liminal"
 LIMINAL_RAW_URL="https://raw.githubusercontent.com/${LIMINAL_REPO}/refs/heads/main/liminal.sh"
 
@@ -161,14 +160,371 @@ pkg_version() {
     fi
 }
 
+# ─── UCI schema (source of truth for iface/peer fields) ─────────────
+#
+# Any new UCI field must be added here so rename/export/import pick it up.
+# Split into scalar and list fields because UCI lists need `add_list`.
+
+IFACE_SCHEMA_SCALAR="proto private_key listen_port mtu dns endpoint_host disabled
+    fwmark nohostroute tunlink ip4table ip6table
+    awg_jc awg_jmin awg_jmax awg_s1 awg_s2 awg_s3 awg_s4
+    awg_h1 awg_h2 awg_h3 awg_h4
+    awg_i1 awg_i2 awg_i3 awg_i4 awg_i5
+    _liminal_iface"
+
+IFACE_SCHEMA_LIST="addresses ip6prefix"
+
+PEER_SCHEMA_SCALAR="public_key private_key preshared_key route_allowed_ips allowed_ips
+    persistent_keepalive description disabled client_allowed_ips endpoint_host
+    _liminal_obfuscation _liminal_advanced_security"
+
+# ─── UCI helpers (reduce boilerplate, enforce schema) ────────────────
+
+# iface_get IFACE KEY [DEFAULT]   — read network.IFACE.KEY, fallback to DEFAULT
+iface_get() {
+    _v="$(uci -q get "network.$1.$2" 2>/dev/null || true)"
+    if [ -n "$_v" ]; then printf '%s' "$_v"; else printf '%s' "${3:-}"; fi
+}
+
+# iface_set IFACE KEY VALUE        — write network.IFACE.KEY (empty VALUE = delete)
+iface_set() {
+    if [ -n "${3:-}" ]; then
+        uci set "network.$1.$2=$3"
+    else
+        uci -q delete "network.$1.$2" 2>/dev/null || true
+    fi
+}
+
+# peer_get PT IDX KEY [DEFAULT]    — read network.@PT[IDX].KEY, fallback to DEFAULT
+peer_get() {
+    _v="$(uci -q get "network.@$1[$2].$3" 2>/dev/null || true)"
+    if [ -n "$_v" ]; then printf '%s' "$_v"; else printf '%s' "${4:-}"; fi
+}
+
+# peer_set PT IDX KEY VALUE        — write network.@PT[IDX].KEY (empty = delete)
+peer_set() {
+    if [ -n "${4:-}" ]; then
+        uci set "network.@$1[$2].$3=$4"
+    else
+        uci -q delete "network.@$1[$2].$3" 2>/dev/null || true
+    fi
+}
+
+# peer_count PT — number of peer sections under the given type.
+peer_count() {
+    _i=0
+    while uci -q get "network.@$1[$_i]" >/dev/null 2>&1; do
+        _i=$((_i + 1))
+    done
+    echo "$_i"
+}
+
+# peer_exists PT IDX — return 0 if section exists, 1 otherwise.
+peer_exists() { uci -q get "network.@$1[$2]" >/dev/null 2>&1; }
+
+# iface_copy_fields OLD NEW — copy all schema fields from OLD to NEW iface.
+# Driven by IFACE_SCHEMA_SCALAR/LIST so new fields auto-propagate.
+iface_copy_fields() {
+    for _f in $IFACE_SCHEMA_SCALAR; do
+        _v="$(uci -q get "network.$1.$_f" 2>/dev/null || true)"
+        [ -n "$_v" ] && uci set "network.$2.$_f=$_v"
+    done
+    for _f in $IFACE_SCHEMA_LIST; do
+        _vs="$(uci -q get "network.$1.$_f" 2>/dev/null || true)"
+        for _v in $_vs; do
+            uci add_list "network.$2.$_f=$_v"
+        done
+    done
+    return 0
+}
+
+# peer_copy_fields OLD_PT OLD_IDX NEW_SEC — copy all peer schema fields.
+peer_copy_fields() {
+    for _f in $PEER_SCHEMA_SCALAR; do
+        _v="$(uci -q get "network.@$1[$2].$_f" 2>/dev/null || true)"
+        [ -n "$_v" ] && uci set "network.$3.$_f=$_v"
+    done
+    return 0
+}
+
+# iface_to_json IFACE — build JSON object from UCI, schema-driven.
+# Includes {name, zone, peers:[]} plus every schema field that has a value.
+iface_to_json() {
+    _name="$1"
+    _zone="$(find_zone_for_interface "$_name" 2>/dev/null || echo "")"
+    _j="$(jq -n --arg n "$_name" --arg z "$_zone" '{name:$n, zone:$z, peers:[]}')"
+    for _f in $IFACE_SCHEMA_SCALAR $IFACE_SCHEMA_LIST; do
+        _v="$(uci -q get "network.${_name}.${_f}" 2>/dev/null || true)"
+        _j="$(printf '%s' "$_j" | jq --arg k "$_f" --arg v "$_v" '. + {($k): $v}')"
+    done
+    printf '%s' "$_j"
+}
+
+# peer_to_json PT IDX — build JSON object from UCI, schema-driven.
+peer_to_json() {
+    _j='{}'
+    for _f in $PEER_SCHEMA_SCALAR; do
+        _v="$(uci -q get "network.@$1[$2].${_f}" 2>/dev/null || true)"
+        _j="$(printf '%s' "$_j" | jq --arg k "$_f" --arg v "$_v" '. + {($k): $v}')"
+    done
+    printf '%s' "$_j"
+}
+
+# iface_apply_json_fields IFACE JSON — write schema fields from JSON to UCI.
+# Empty/missing values → field not set.
+iface_apply_json_fields() {
+    _name="$1"; _src="$2"
+    for _f in $IFACE_SCHEMA_SCALAR; do
+        _v="$(printf '%s' "$_src" | jq -r --arg k "$_f" '.[$k] // ""')"
+        [ -n "$_v" ] && uci set "network.${_name}.${_f}=${_v}"
+    done
+    for _f in $IFACE_SCHEMA_LIST; do
+        _v="$(printf '%s' "$_src" | jq -r --arg k "$_f" '.[$k] // ""')"
+        [ -n "$_v" ] && uci add_list "network.${_name}.${_f}=${_v}"
+    done
+    return 0
+}
+
+# peer_apply_json_fields SEC JSON — write peer schema fields to UCI section.
+# Backward compat: reads JSON `obfuscation` into `_liminal_obfuscation`.
+peer_apply_json_fields() {
+    _sec="$1"; _src="$2"
+    for _f in $PEER_SCHEMA_SCALAR; do
+        _v="$(printf '%s' "$_src" | jq -r --arg k "$_f" '.[$k] // ""')"
+        # legacy JSON key fallback
+        if [ -z "$_v" ] && [ "$_f" = "_liminal_obfuscation" ]; then
+            _v="$(printf '%s' "$_src" | jq -r '.obfuscation // ""')"
+        fi
+        [ -n "$_v" ] && [ "$_v" != "null" ] && uci set "network.${_sec}.${_f}=${_v}"
+    done
+    return 0
+}
+
+# restart_iface IFACE [MSG]        — ifdown/ifup with spinner; MSG overrides default.
+# After the interface comes back up, re-apply per-peer _liminal_advanced_security
+# flags (the netifd amneziawg.sh handler does not persist them through ifup).
+restart_iface() {
+    _msg="${2:-Restarting $1...}"
+    spinner_start "$_msg"
+    ifdown "$1" >/dev/null 2>&1 || true
+    ifup   "$1" >/dev/null 2>&1 || true
+    spinner_stop
+    apply_advsec_flags "$1" 2>/dev/null || true
+}
+
+# ─── Live AWG operations (no interface restart = no SSH drop) ────────
+# These apply changes to the running kernel state via `awg set`. The UCI
+# config must already be committed separately so the change persists
+# after reboot (netifd rebuilds kernel state from UCI on ifup).
+
+# live_peer_add IFACE PUBKEY ALLOWED_IPS [ENDPOINT] [PSK_B64] [KEEPALIVE]
+# Any positional arg can be empty to skip. PSK is passed as literal base64.
+live_peer_add() {
+    have_cmd awg || return 1
+    _lpa_if="$1"; _lpa_pk="$2"; _lpa_aip="$3"
+    _lpa_ep="${4:-}"; _lpa_psk="${5:-}"; _lpa_ka="${6:-}"
+    _lpa_psk_file=""
+    set -- "$_lpa_if" peer "$_lpa_pk" allowed-ips "$_lpa_aip"
+    [ -n "$_lpa_ep" ] && set -- "$@" endpoint "$_lpa_ep"
+    [ -n "$_lpa_ka" ] && set -- "$@" persistent-keepalive "$_lpa_ka"
+    if [ -n "$_lpa_psk" ]; then
+        _lpa_psk_file="$(mktemp)"; chmod 600 "$_lpa_psk_file"
+        printf '%s\n' "$_lpa_psk" > "$_lpa_psk_file"
+        set -- "$@" preshared-key "$_lpa_psk_file"
+    fi
+    awg set "$@" 2>/dev/null
+    _lpa_rc=$?
+    [ -n "$_lpa_psk_file" ] && rm -f "$_lpa_psk_file"
+    return "$_lpa_rc"
+}
+
+# live_peer_remove IFACE PUBKEY
+live_peer_remove() { have_cmd awg && awg set "$1" peer "$2" remove 2>/dev/null; }
+
+# live_peer_set_aip IFACE PUBKEY ALLOWED_IPS   (comma-separated, replaces full list)
+live_peer_set_aip() { have_cmd awg && awg set "$1" peer "$2" allowed-ips "$3" 2>/dev/null; }
+
+# live_peer_set_keepalive IFACE PUBKEY SECONDS (0 = off)
+live_peer_set_keepalive() { have_cmd awg && awg set "$1" peer "$2" persistent-keepalive "$3" 2>/dev/null; }
+
+# live_peer_set_endpoint IFACE PUBKEY HOST:PORT
+live_peer_set_endpoint() { have_cmd awg && awg set "$1" peer "$2" endpoint "$3" 2>/dev/null; }
+
+# live_iface_set_port IFACE PORT
+live_iface_set_port() { have_cmd awg && awg set "$1" listen-port "$2" 2>/dev/null; }
+
+# live_iface_set_fwmark IFACE MARK (0 or "off" to disable)
+live_iface_set_fwmark() {
+    have_cmd awg || return 1
+    _fm="${2:-0}"
+    [ "$_fm" = "off" ] && _fm=0
+    awg set "$1" fwmark "$_fm" 2>/dev/null
+}
+
+# live_iface_set_mtu IFACE MTU — tunnel MTU (ip link, not awg set)
+live_iface_set_mtu() { ip link set mtu "$2" dev "$1" 2>/dev/null; }
+
+# live_iface_set_obf IFACE — push current UCI obfuscation values to kernel.
+live_iface_set_obf() {
+    have_cmd awg || return 1
+    _if="$1"
+    # shellcheck disable=SC2046
+    set --
+    for _k in jc jmin jmax s1 s2 s3 s4 h1 h2 h3 h4 i1 i2 i3 i4 i5; do
+        _v="$(iface_get "$_if" "awg_${_k}")"
+        [ -n "$_v" ] && set -- "$@" "$_k" "$_v"
+    done
+    [ "$#" -eq 0 ] && return 0
+    awg set "$_if" "$@" 2>/dev/null
+}
+
+# live_iface_clear_obf IFACE — zero-out all obfuscation on kernel (plain WG mode).
+live_iface_clear_obf() {
+    have_cmd awg || return 1
+    awg set "$1" \
+        jc 0 jmin 0 jmax 0 s1 0 s2 0 s3 0 s4 0 \
+        h1 1 h2 2 h3 3 h4 4 2>/dev/null
+}
+
+# live_peer_sync_from_uci IFACE PT IDX — push the UCI-defined peer at index
+# back onto the kernel (used when re-enabling a peer that was removed).
+live_peer_sync_from_uci() {
+    _if="$1"; _pt="$2"; _idx="$3"
+    _pk="$(peer_get "$_pt" "$_idx" public_key)"
+    [ -z "$_pk" ] && return 1
+    _aip="$(peer_get "$_pt" "$_idx" allowed_ips)"
+    _psk="$(peer_get "$_pt" "$_idx" preshared_key)"
+    _ka="$(peer_get  "$_pt" "$_idx" persistent_keepalive)"
+    _ep="$(peer_get  "$_pt" "$_idx" endpoint_host)"
+    live_peer_add "$_if" "$_pk" "$_aip" "$_ep" "$_psk" "$_ka"
+}
+
+# live_peer_set_advsec IFACE PUBKEY on|off
+live_peer_set_advsec() {
+    have_cmd awg || return 1
+    awg set "$1" peer "$2" advanced-security "$3" 2>/dev/null
+}
+
+# apply_advsec_flags IFACE — re-push each peer's _liminal_advanced_security
+# flag to the kernel. Needed after ifup: the netifd handler doesn't persist
+# advanced-security through a restart.
+apply_advsec_flags() {
+    _if="$1"; _pt="amneziawg_${_if}"
+    _pi=0
+    while peer_exists "$_pt" "$_pi"; do
+        _pk="$(peer_get "$_pt" "$_pi" public_key)"
+        _as="$(peer_get "$_pt" "$_pi" _liminal_advanced_security)"
+        if [ -n "$_pk" ] && [ -n "$_as" ]; then
+            live_peer_set_advsec "$_if" "$_pk" "$_as" || true
+        fi
+        _pi=$((_pi + 1))
+    done
+    return 0
+}
+
+# awg_peer_field IFACE PUBKEY KEY — read a field from human `awg show` output.
+# Use awg_dump_peer for fields covered by the machine-readable dump format.
+awg_peer_field() {
+    have_cmd awg || return 0
+    awg show "$1" 2>/dev/null | awk -v pk="$2" -v key="$3" '
+        /peer:/ { cur=$NF }
+        cur==pk && index($0, key ":") {
+            sub(/^[[:space:]]*/, ""); sub("^" key ":[[:space:]]*", "")
+            print; exit
+        }
+    '
+}
+
+# awg_dump_peer IFACE PUBKEY — echo the peer's tab-separated line from
+# `awg show IFACE dump`. Empty if peer not found. Fields (1-based):
+#   1 public_key  2 preshared_key  3 endpoint  4 allowed_ips
+#   5 last_handshake_time (unix ts, 0 = never)
+#   6 rx_bytes   7 tx_bytes   8 persistent_keepalive (number or "off")
+awg_dump_peer() {
+    have_cmd awg || return 0
+    # NR>1 skips the device line (always first in per-iface dump).
+    awg show "$1" dump 2>/dev/null | awk -F'\t' -v pk="$2" 'NR>1 && $1==pk { print; exit }'
+}
+
+# awg_peer_handshake_age IFACE PUBKEY — print handshake age in seconds.
+# 9999 if never (ts=0) or peer not found.
+awg_peer_handshake_age() {
+    _line="$(awg_dump_peer "$1" "$2")"
+    [ -z "$_line" ] && { echo 9999; return 0; }
+    _ts="$(printf '%s\n' "$_line" | awk -F'\t' '{print $5}')"
+    if [ -z "$_ts" ] || [ "$_ts" = "0" ]; then echo 9999; return 0; fi
+    echo $(( $(date +%s) - _ts ))
+}
+
+# fmt_bytes NUM — format a raw byte count into human-readable (matches the
+# "1.24 MiB" style of WireGuard's human show output).
+fmt_bytes() {
+    awk -v b="${1:-0}" 'BEGIN {
+        if      (b >= 1099511627776) printf "%.2f TiB\n", b/1099511627776
+        else if (b >= 1073741824)    printf "%.2f GiB\n", b/1073741824
+        else if (b >= 1048576)       printf "%.2f MiB\n", b/1048576
+        else if (b >= 1024)          printf "%.2f KiB\n", b/1024
+        else                         printf "%d B\n",     b
+    }'
+}
+
+# ─── Firewall helpers ────────────────────────────────────────────────
+
+# fw_new_zone / fw_new_rule / fw_new_forwarding — add a new section, echo its
+# numeric index so caller can uci set "firewall.@TYPE[IDX].prop=val".
+fw_new_zone()       { uci add firewall zone >/dev/null;       uci show firewall | sed -n 's/^firewall\.@zone\[\([0-9]\+\)\]=zone$/\1/p'             | tail -n1; }
+fw_new_rule()       { uci add firewall rule >/dev/null;       uci show firewall | sed -n 's/^firewall\.@rule\[\([0-9]\+\)\]=rule$/\1/p'             | tail -n1; }
+fw_new_forwarding() { uci add firewall forwarding >/dev/null; uci show firewall | sed -n 's/^firewall\.@forwarding\[\([0-9]\+\)\]=forwarding$/\1/p' | tail -n1; }
+
+# fw_find_by TYPE PROP VALUE — echo index of first matching section (empty + rc=1 if none).
+fw_find_by() {
+    _i=0
+    while uci -q get "firewall.@$1[$_i]" >/dev/null 2>&1; do
+        _v="$(uci -q get "firewall.@$1[$_i].$2" 2>/dev/null || true)"
+        [ "$_v" = "$3" ] && { echo "$_i"; return 0; }
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+# fw_count TYPE — echo the number of sections of the given type.
+fw_count() {
+    _i=0
+    while uci -q get "firewall.@$1[$_i]" >/dev/null 2>&1; do
+        _i=$((_i + 1))
+    done
+    echo "$_i"
+}
+
+# ─── Service helpers (colors resolved at call time) ──────────────────
+
+svc_restart() { echo -e "  ${B}Restarting${NC} $1..."; /etc/init.d/"$1" restart >/dev/null 2>&1 || true; }
+svc_reload()  { echo -e "  ${B}Reloading${NC}  $1..."; /etc/init.d/"$1" reload  >/dev/null 2>&1 || true; }
+
+# apply_all [podkop] — commit network+firewall, reload network, restart firewall.
+# Pass "podkop" to also restart podkop if its init script is present.
+apply_all() {
+    uci commit network
+    uci commit firewall
+    svc_reload network
+    svc_restart firewall
+    if [ "${1:-}" = "podkop" ] && [ -x /etc/init.d/podkop ]; then
+        svc_restart podkop
+    fi
+}
+
+# cancelled — print "Cancelled" in dim. Use in `|| { cancelled; PAUSE; return; }`.
+cancelled() { echo -e "  ${DIM2}Cancelled${NC}"; }
+
+
 # ─── Colors (soft white-blue-violet palette) ─────────────────────────
 
 W="\033[38;5;255m"            # clean bright white
 B="\033[38;5;111m"            # soft blue
 V="\033[38;5;141m"            # soft violet
 A="\033[38;5;146m"            # soft steel blue (labels)
-DIM="\033[2m\033[38;5;240m"   # dim gray (faded)
-DIM2="\033[38;5;245m"         # slightly brighter dim
+DIM="\033[2m\033[38;5;240m"   # very faded — box frames only (borders/sep)
+DIM2="\033[38;5;245m"         # readable dim gray — inline content hints
 OK="\033[38;5;114m"           # soft green
 WARN_C="\033[38;5;180m"       # soft wheat/amber
 ERR="\033[38;5;174m"          # soft rose/red
@@ -178,7 +534,7 @@ NC="\033[0m"
 
 ICO_ON="${OK}●${NC}"
 ICO_OFF="${ERR}●${NC}"
-ICO_DIS="${DIM}○${NC}"
+ICO_DIS="${DIM2}○${NC}"
 ICO_OK="${OK}✓${NC}"
 ICO_ERR="${ERR}✗${NC}"
 ICO_WARN="${WARN_C}!${NC}"
@@ -214,6 +570,73 @@ box_line() {
     echo -e "${DIM}${BOX_V}${NC} $1"
 }
 
+# ─── Auto-sizing box buffer ─────────────────────────────────────────
+# Pattern: collect content via box_buf_line / box_buf_sep, then flush via
+# box_buf_flush. Flush measures the widest buffered line (ANSI stripped)
+# and sizes the frame accordingly, so long hostnames / resolved-IP hints
+# never overflow.
+
+_BOX_BUF=""
+_BOX_BUF_SEP="$(printf '\037')"   # ASCII unit-separator (0x1F)
+
+box_buf_reset() { _BOX_BUF=""; }
+box_buf_line()  { _BOX_BUF="${_BOX_BUF}${1}${_BOX_BUF_SEP}"; }
+box_buf_sep()   { _BOX_BUF="${_BOX_BUF}__BOXSEP__${_BOX_BUF_SEP}"; }
+
+# _visible_bytes TEXT — length after stripping ANSI CSI.
+# printf %b expands the literal "\033[…m" the rest of the codebase stores,
+# then sed removes the real escape bytes. Multibyte runes (●, ↳, ✓) count
+# as 3 bytes each — box ends up a few chars wider than strictly needed.
+_visible_bytes() {
+    _vb="$(printf '%b' "$1" 2>/dev/null | sed 's/\x1b\[[0-9;]*[mGKHJ]//g')"
+    echo "${#_vb}"
+}
+
+# box_buf_flush [min] [max] — render top + buffered lines + bot, sized to
+# the widest line. Defaults: min=44, max=100.
+box_buf_flush() {
+    _bf_min="${1:-44}"; _bf_max="${2:-100}"
+    _bf_w="$_bf_min"
+    _bf_rest="$_BOX_BUF"
+    while [ -n "$_bf_rest" ]; do
+        _bf_line="${_bf_rest%%${_BOX_BUF_SEP}*}"
+        case "$_bf_rest" in
+            *"${_BOX_BUF_SEP}"*) _bf_rest="${_bf_rest#*${_BOX_BUF_SEP}}" ;;
+            *) _bf_rest="" ;;
+        esac
+        [ -z "$_bf_line" ] && continue
+        [ "$_bf_line" = "__BOXSEP__" ] && continue
+        _bf_len="$(_visible_bytes "$_bf_line")"
+        _bf_len=$((_bf_len + 2))   # account for "│ " prefix
+        [ "$_bf_len" -gt "$_bf_w" ] && _bf_w="$_bf_len"
+    done
+    [ "$_bf_w" -gt "$_bf_max" ] && _bf_w="$_bf_max"
+
+    box_top "$_bf_w"
+    _bf_rest="$_BOX_BUF"
+    while [ -n "$_bf_rest" ]; do
+        _bf_line="${_bf_rest%%${_BOX_BUF_SEP}*}"
+        case "$_bf_rest" in
+            *"${_BOX_BUF_SEP}"*) _bf_rest="${_bf_rest#*${_BOX_BUF_SEP}}" ;;
+            *) _bf_rest="" ;;
+        esac
+        if [ "$_bf_line" = "__BOXSEP__" ]; then
+            box_sep "$_bf_w"
+        else
+            box_line "$_bf_line"
+        fi
+    done
+    box_bot "$_bf_w"
+    box_buf_reset
+    return 0
+}
+
+# box_section LABEL [width] — label arg is ignored (kept for grouping at
+# call sites); emits a plain separator.
+box_section() {
+    box_sep "${2:-54}"
+}
+
 # ─── Breadcrumbs ─────────────────────────────────────────────────────
 
 _CRUMBS=""
@@ -222,7 +645,7 @@ crumb_push() { [ -n "$_CRUMBS" ] && _CRUMBS="${_CRUMBS} > $1" || _CRUMBS="$1"; }
 crumb_pop()  { _CRUMBS="$(echo "$_CRUMBS" | sed 's/ > [^>]*$//')"; }
 crumb_show() {
     [ -z "$_CRUMBS" ] && return
-    echo -e "${DIM}${_CRUMBS}${NC}"
+    echo -e "${DIM2}${_CRUMBS}${NC}"
     echo ""
 }
 
@@ -291,7 +714,7 @@ section() {
     _stitle="$1"; _slen=${#_stitle}; _spad=$((34 - _slen))
     [ "$_spad" -lt 1 ] && _spad=1
     _sline=""; _si=0; while [ "$_si" -lt "$_spad" ]; do _sline="${_sline}─"; _si=$((_si+1)); done
-    echo -e "\n  ${DIM}──${NC} ${V}${_stitle}${NC} ${DIM}${_sline}${NC}\n"
+    echo -e "\n  ${DIM2}──${NC} ${V}${_stitle}${NC} ${DIM2}${_sline}${NC}\n"
 }
 
 # read_choice VAR — read a single menu choice, strip invisible/control chars
@@ -352,7 +775,6 @@ _nslookup_ips() {
     else
         _ni_out="$(nslookup "$1" 2>/dev/null || true)"
     fi
-    # Extract IPs: skip the server line (before first empty line), then grab all IPs
     echo "$_ni_out" | awk '
         /^$/ { body=1; next }
         body && /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {
@@ -373,7 +795,6 @@ check_dns_poisoning() {
     _cdp_ips="$(_nslookup_ips "$1" "${2:-}")"
     # No response at all
     [ -z "$_cdp_ips" ] && return 2
-    # Check for 127.x.x.x in response (common poisoning/blocking pattern)
     echo "$_cdp_ips" | grep -qE '^127\.' && return 1
     return 0
 }
@@ -463,16 +884,10 @@ restore_backups() {
     [ -f "$BACKUP_DIR/dhcp.bak" ]     && cp "$BACKUP_DIR/dhcp.bak"     /etc/config/dhcp || true
     [ -f "$BACKUP_DIR/podkop.bak" ]   && cp "$BACKUP_DIR/podkop.bak"   /etc/config/podkop || true
     [ -f "$BACKUP_DIR/liminal.bak" ]  && cp "$BACKUP_DIR/liminal.bak"  /etc/config/liminal && liminal_config_load || true
-    echo -e "  ${B}Reloading${NC} network..."
-    /etc/init.d/network reload   >/dev/null 2>&1 || true
-    echo -e "  ${B}Restarting${NC} firewall..."
-    /etc/init.d/firewall restart >/dev/null 2>&1 || true
-    echo -e "  ${B}Restarting${NC} dnsmasq..."
-    /etc/init.d/dnsmasq restart  >/dev/null 2>&1 || true
-    if [ -x /etc/init.d/podkop ]; then
-        echo -e "  ${B}Restarting${NC} Podkop..."
-        /etc/init.d/podkop restart >/dev/null 2>&1 || true
-    fi
+    svc_reload network
+    svc_restart firewall
+    svc_restart dnsmasq
+    [ -x /etc/init.d/podkop ] && svc_restart podkop
     podkop_refresh
 }
 
@@ -516,7 +931,6 @@ prompt() {
         printf "  %s: " "$_q"
     fi
     read -r _ans || true
-    # Check if Ctrl+C was pressed during read
     is_cancelled && { eval "$_var="; return 1; }
     # Strip control characters
     _ans="$(printf '%s' "${_ans:-}" | tr -d '\001-\037\177')"
@@ -751,7 +1165,6 @@ select_dns() {
     fi
 
     # ── Group: Public DNS (skip current & recommended, sorted by latency) ──
-    # Build sortable list: "latency_padded|Name|IP" then sort
     _sd_sortbuf=""
     _sd_ifs="$IFS"; IFS='
 '
@@ -846,7 +1259,6 @@ select_dns() {
             return 0
         fi
 
-        # Validate numeric choice
         case "$_sd_choice" in *[!0-9]*) warn "Invalid selection"; continue ;; esac
         if [ "$_sd_choice" -lt 1 ] 2>/dev/null; then warn "Invalid selection"; continue; fi
         if [ "$_sd_choice" -gt "$_sd_max" ] 2>/dev/null; then warn "Invalid selection"; continue; fi
@@ -879,7 +1291,7 @@ do_dns_network_test() {
     _dt_fqdn="${3:-}"       # peer hostname (empty = skip hostname check)
     _dt_online="${4:-0}"    # 1 if peer is online
 
-    _dt_dns="$(uci -q get "network.${_dt_iface}.dns" || true)"
+    _dt_dns="$(iface_get "$_dt_iface" dns)"
     _dt_lan="$(detect_router_lan_ip 2>/dev/null || true)"
     _dt_is_local=0
     [ -n "$_dt_lan" ] && [ -n "$_dt_dns" ] && [ "$_dt_dns" = "$_dt_lan" ] && _dt_is_local=1
@@ -1214,6 +1626,77 @@ build_peer_fqdn() {
     printf '%s.%s.%s\n' "$_bp_h" "$_bp_i" "$_bp_d"
 }
 
+# prompt_custom_hostname IFACE_DOMAIN LAN_DOMAIN
+# Interactive 3-option submenu for composing a hostname:
+#   1 → iface-scoped  (hostname.IFACE_DOMAIN, e.g. mybox.awg1.lan)
+#   2 → lan-scoped    (hostname.LAN_DOMAIN,   e.g. mybox.lan)
+#   3 → literal FQDN  (hostname used as typed, with chars sanitized)
+# Output: sets the global CUSTOM_HOSTNAME_RESULT. Empty = cancelled/invalid.
+prompt_custom_hostname() {
+    _ch_ifd="$1"; _ch_lan="$2"
+    CUSTOM_HOSTNAME_RESULT=""
+    echo ""
+    echo -e "    ${B}1${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(hostname.${_ch_ifd})${NC}"
+    echo -e "    ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(hostname.${_ch_lan})${NC}"
+    echo -e "    ${B}3${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(hostname — literal FQDN)${NC}"
+    echo -e "    ${DIM2}Enter › Cancel${NC}"
+    echo ""
+    echo -ne "  ${A}>${NC} "; read -r _ch_sub || true
+    sigint_caught && return 1
+    _ch_suffix=""; _ch_literal=0
+    case "${_ch_sub:-}" in
+        1) _ch_suffix=".${_ch_ifd}" ;;
+        2) _ch_suffix=".${_ch_lan}" ;;
+        3) _ch_literal=1 ;;
+        *) return 1 ;;
+    esac
+    while true; do
+        prompt _ch_name "Hostname" "" || return 1
+        sigint_caught && return 1
+        [ -z "$_ch_name" ] && return 1
+        if [ "$_ch_literal" -eq 1 ]; then
+            _ch_clean="$(printf '%s' "$_ch_name" | sed 's/[^a-zA-Z0-9.-]//g')"
+            _ch_clean="${_ch_clean#.}"; _ch_clean="${_ch_clean%.}"
+            [ -z "$_ch_clean" ] && { warn "Invalid hostname"; continue; }
+            CUSTOM_HOSTNAME_RESULT="$_ch_clean"
+        else
+            _ch_san="$(sanitize_hostname "$_ch_name")"
+            [ -z "$_ch_san" ] && { warn "Invalid hostname"; continue; }
+            CUSTOM_HOSTNAME_RESULT="${_ch_san}${_ch_suffix}"
+        fi
+        return 0
+    done
+}
+
+# resolve_custom_hostname INPUT IFACE_DOMAIN LAN_DOMAIN — turn user input into
+# a full FQDN using precedence rules that work for any LAN domain:
+#   - empty input → empty output (signals "cancel")
+#   - input ends in LAN_DOMAIN (or equals it)  → used as-is
+#   - input contains a dot                     → LAN_DOMAIN appended
+#                                                ("web.foo" → "web.foo.<lan>")
+#   - bare label (no dot)                      → IFACE_DOMAIN appended
+#                                                ("foo" → "foo.<iface>.<lan>")
+# Characters outside [A-Za-z0-9.-] are stripped silently.
+resolve_custom_hostname() {
+    _rh_in="$1"; _rh_ifd="$2"; _rh_lan="$3"
+    _rh_clean="$(printf '%s' "$_rh_in" | sed 's/[^a-zA-Z0-9.-]//g')"
+    [ -z "$_rh_clean" ] && { printf ''; return 1; }
+    # Collapse leading/trailing dots if user pasted awkward input.
+    _rh_clean="${_rh_clean#.}"; _rh_clean="${_rh_clean%.}"
+    [ -z "$_rh_clean" ] && { printf ''; return 1; }
+
+    # Already in the LAN zone — use literal.
+    case "$_rh_clean" in
+        "$_rh_lan"|*".$_rh_lan") printf '%s\n' "$_rh_clean"; return 0 ;;
+    esac
+    # Dotted short form outside LAN zone — append LAN domain.
+    case "$_rh_clean" in
+        *.*) printf '%s.%s\n' "$_rh_clean" "$_rh_lan"; return 0 ;;
+    esac
+    # Bare label — full iface-scoped path.
+    printf '%s.%s\n' "$_rh_clean" "$_rh_ifd"
+}
+
 # Find hostrecord index by _liminal_iface + _liminal_peer
 find_hostrecord() {
     _fh_iface="$1"; _fh_peer="$2"; _fh_i=0
@@ -1257,7 +1740,7 @@ add_peer_hostrecord() {
     uci set "dhcp.@hostrecord[$_ah_idx]._liminal_iface=${_ah_iface}"
     uci set "dhcp.@hostrecord[$_ah_idx]._liminal_peer=${_ah_desc}"
     uci commit dhcp
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    svc_restart dnsmasq
     echo -e "  ${ICO_OK} ${OK}DNS:${NC} ${_ah_fqdn} → ${_ah_ip}"
 }
 
@@ -1267,8 +1750,9 @@ remove_peer_hostrecord() {
     _rh_fqdn="$(uci -q get "dhcp.@hostrecord[$_rh_idx].name" || true)"
     uci delete "dhcp.@hostrecord[$_rh_idx]"
     uci commit dhcp
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    svc_restart dnsmasq
     [ -n "$_rh_fqdn" ] && echo -e "  ${B}Removed${NC} DNS: ${_rh_fqdn}"
+    return 0
 }
 
 # Remove all hostrecords for an interface
@@ -1289,7 +1773,7 @@ remove_iface_hostrecords() {
     done
     if [ "$_ri_changed" -eq 1 ]; then
         uci commit dhcp
-        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+        svc_restart dnsmasq
         echo -e "  ${B}Removed${NC} DNS records for ${W}${_ri_iface}${NC}"
     fi
 }
@@ -1312,7 +1796,7 @@ rename_iface_hostrecords() {
     done
     if [ "$_uih_changed" -eq 1 ]; then
         uci commit dhcp
-        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+        svc_restart dnsmasq
         echo -e "  ${B}Updated${NC} DNS records: *.${_uih_old}.${_uih_domain} → *.$(sanitize_hostname "$_uih_new").${_uih_domain}"
     fi
 }
@@ -1333,7 +1817,7 @@ check_hostrecord_warnings() {
     fi
 
     # 2. Peer DNS points to router
-    _chw_dns="$(uci -q get "network.${_chw_iface}.dns" || true)"
+    _chw_dns="$(iface_get "$_chw_iface" dns)"
     _chw_lan="$(detect_router_lan_ip 2>/dev/null || true)"
     if [ -n "$_chw_dns" ] && [ -n "$_chw_lan" ] && [ "$_chw_dns" != "$_chw_lan" ]; then
         warn "Interface DNS is ${_chw_dns}, not router (${_chw_lan})"
@@ -1456,6 +1940,36 @@ validate_port() {
     [ "$1" -le 65535 ] 2>/dev/null || { warn "Port must be <= 65535"; return 1; }
 }
 
+# validate_wg_key KEY — a WireGuard/AmneziaWG key is 32 bytes of base64,
+# which is always exactly 44 characters long and ends with '='. Matches the
+# regex LuCI uses (luci-proto-amneziawg/amneziawg.js).
+validate_wg_key() {
+    case "$1" in
+        '') warn "Key is empty"; return 1 ;;
+    esac
+    if ! printf '%s' "$1" | grep -Eq '^[A-Za-z0-9+/]{43}=$'; then
+        warn "Invalid key — must be 44-char base64 ending with '='"
+        return 1
+    fi
+    return 0
+}
+
+# validate_fwmark INPUT — decimal (1..2^32-1) or 0xHEX.
+validate_fwmark() {
+    case "$1" in
+        ''|off|OFF) return 0 ;;
+        0x*)
+            _h="${1#0x}"
+            case "$_h" in ''|*[!0-9A-Fa-f]*) warn "Invalid hex fwmark: $1"; return 1 ;; esac
+            return 0
+            ;;
+        *)
+            case "$1" in *[!0-9]*) warn "fwmark must be decimal or 0xHEX"; return 1 ;; esac
+            return 0
+            ;;
+    esac
+}
+
 validate_cidr_ipv4() {
     printf '%s' "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' \
         || { warn "Invalid IPv4 CIDR: $1"; return 1; }
@@ -1560,6 +2074,124 @@ find_zone_for_interface() {
     return 1
 }
 
+# detect_lan_zone — auto-find the FW zone that acts as LAN.
+# Heuristic: zone literally named "lan" → else first zone whose `network`
+# list contains a UCI network interface with private RFC1918 `ipaddr` → else
+# hardcoded "lan" (matches fallback callers expect).
+detect_lan_zone() {
+    if zone_exists "lan"; then echo "lan"; return 0; fi
+    _dz_i=0
+    while uci -q get "firewall.@zone[$_dz_i]" >/dev/null 2>&1; do
+        _dz_name="$(uci -q get "firewall.@zone[$_dz_i].name" || true)"
+        _dz_nets="$(uci -q get "firewall.@zone[$_dz_i].network" || true)"
+        for _dz_n in $_dz_nets; do
+            _dz_ip="$(uci -q get "network.${_dz_n}.ipaddr" 2>/dev/null || true)"
+            case "$_dz_ip" in
+                10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)
+                    echo "$_dz_name"; return 0 ;;
+            esac
+        done
+        _dz_i=$((_dz_i + 1))
+    done
+    echo "lan"
+}
+
+# detect_wan_zone — auto-find the FW zone that acts as WAN.
+# Heuristic: zone named "wan" → else zone with masq=1 → else "wan".
+detect_wan_zone() {
+    if zone_exists "wan"; then echo "wan"; return 0; fi
+    _dz_i=0
+    while uci -q get "firewall.@zone[$_dz_i]" >/dev/null 2>&1; do
+        _dz_masq="$(uci -q get "firewall.@zone[$_dz_i].masq" 2>/dev/null || true)"
+        if [ "$_dz_masq" = "1" ]; then
+            uci -q get "firewall.@zone[$_dz_i].name" || true
+            return 0
+        fi
+        _dz_i=$((_dz_i + 1))
+    done
+    echo "wan"
+}
+
+# _forwarding_dest_for VPN_ZONE PREDICATE — echo the first zone this VPN
+# zone forwards into that PREDICATE (called with the candidate) accepts.
+_forwarding_dest_for() {
+    _fdz_vpn="$1"; _fdz_pred="$2"
+    [ -z "$_fdz_vpn" ] && return 1
+    _fdz_i=0
+    while uci -q get "firewall.@forwarding[$_fdz_i]" >/dev/null 2>&1; do
+        _fdz_src="$(uci -q get "firewall.@forwarding[$_fdz_i].src"  2>/dev/null || true)"
+        _fdz_dst="$(uci -q get "firewall.@forwarding[$_fdz_i].dest" 2>/dev/null || true)"
+        if [ "$_fdz_src" = "$_fdz_vpn" ] && [ -n "$_fdz_dst" ] && "$_fdz_pred" "$_fdz_dst"; then
+            printf '%s\n' "$_fdz_dst"
+            return 0
+        fi
+        _fdz_i=$((_fdz_i + 1))
+    done
+    return 1
+}
+
+# _zone_is_wan ZONE — returns 0 if zone looks like a WAN (masq=1 OR name
+# contains "wan"). Predicate for _forwarding_dest_for.
+_zone_is_wan() {
+    _z="$1"
+    _zi="$(find_zone_index "$_z" 2>/dev/null)" || return 1
+    _m="$(uci -q get "firewall.@zone[$_zi].masq" 2>/dev/null || true)"
+    [ "$_m" = "1" ] && return 0
+    case "$_z" in *wan*|*Wan*|*WAN*) return 0 ;; esac
+    return 1
+}
+
+# _zone_is_lan ZONE — returns 0 if zone looks like a LAN (name "lan" or
+# network list contains an RFC1918 interface).
+_zone_is_lan() {
+    _z="$1"
+    [ "$_z" = "lan" ] && return 0
+    _zi="$(find_zone_index "$_z" 2>/dev/null)" || return 1
+    _nets="$(uci -q get "firewall.@zone[$_zi].network" 2>/dev/null || true)"
+    for _n in $_nets; do
+        _ip="$(uci -q get "network.${_n}.ipaddr" 2>/dev/null || true)"
+        case "$_ip" in
+            10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# iface_lan_zone IFACE — LAN zone this VPN is wired to.
+#   1. existing forwarding vpn_zone → <lan-ish zone>  (self-consistent)
+#   2. global heuristic (detect_lan_zone)
+iface_lan_zone() {
+    _vz="$(find_zone_for_interface "$1" 2>/dev/null || true)"
+    _r="$(_forwarding_dest_for "$_vz" _zone_is_lan 2>/dev/null || true)"
+    [ -n "$_r" ] && { printf '%s' "$_r"; return 0; }
+    detect_lan_zone
+}
+
+# iface_wan_zone IFACE — WAN zone this VPN is wired to.
+# Same precedence as iface_lan_zone so multi-WAN setups (wan, wan6,
+# wan_wwan, wan2, …) stay on whatever zone the user actually picked.
+iface_wan_zone() {
+    _vz="$(find_zone_for_interface "$1" 2>/dev/null || true)"
+    _r="$(_forwarding_dest_for "$_vz" _zone_is_wan 2>/dev/null || true)"
+    [ -n "$_r" ] && { printf '%s' "$_r"; return 0; }
+    detect_wan_zone
+}
+
+# detect_lan_netiface — UCI network interface name that carries LAN IPs.
+# "lan" if it exists, else the first iface with RFC1918 ipaddr.
+detect_lan_netiface() {
+    if uci -q get network.lan >/dev/null 2>&1; then echo "lan"; return 0; fi
+    for _dn in $(uci -q show network 2>/dev/null \
+            | sed -n "s/^network\.\([^.=]*\)=interface$/\1/p"); do
+        _dn_ip="$(uci -q get "network.${_dn}.ipaddr" 2>/dev/null || true)"
+        case "$_dn_ip" in
+            10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)
+                echo "$_dn"; return 0 ;;
+        esac
+    done
+    echo "lan"
+}
+
 forwarding_exists() {
     src="$1"; dst="$2"; i=0
     while uci -q get "firewall.@forwarding[$i]" >/dev/null 2>&1; do
@@ -1636,7 +2268,7 @@ find_free_subnet() {
             | sed -n "s/^network\.\([^.]*\)\.addresses=.*/\1/p" \
             | sort -u)"
         for _eif in $_all_ifs; do
-            for _ev in $(uci -q get "network.${_eif}.addresses" 2>/dev/null); do
+            for _ev in $(iface_get "$_eif" addresses); do
                 case "$_ev" in */*) ;; *) continue ;; esac
                 _esubnet="$(network_base_from_cidr "$_ev")"
                 if [ "$_esubnet" = "$_cand_subnet" ] || cidr_contains_ip "$_ev" "$_cand_ip"; then
@@ -1694,6 +2326,125 @@ generate_awg_keys() {
     printf '%s\n%s\n' "$priv" "$pub"
 }
 
+# ─── AWG obfuscation parameter generation ────────────────────────────
+
+# awg_rand_u32 — print a random unsigned 32-bit integer
+awg_rand_u32() {
+    if [ -r /dev/urandom ]; then
+        _v="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n')"
+        if [ -n "$_v" ]; then
+            printf '%s' "$_v"
+            return
+        fi
+    fi
+    awk 'BEGIN { srand(); printf "%u", int(rand() * 4294967295) }'
+}
+
+# awg_rand_range MIN MAX — random int in [MIN, MAX] inclusive
+awg_rand_range() {
+    _min="$1"; _max="$2"
+    _span=$((_max - _min + 1))
+    if [ -r /dev/urandom ]; then
+        _v="$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' \n')"
+        [ -n "$_v" ] && { echo $((_min + _v % _span)); return; }
+    fi
+    awk -v mn="$_min" -v sp="$_span" 'BEGIN { srand(); printf "%d", mn + int(rand() * sp) }'
+}
+
+# generate_awg_obfuscation — emit 12 newline-separated values (AWG 2.0):
+#   Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1
+# Per AmneziaWG recommendations: Jc 4-8, Jmin 40-80, Jmax 900-1200,
+# S1/S2/S3/S4 in 15-100 with S1+56 != S2 handshake-overlap avoidance;
+# H1-H4 distinct u32 avoiding reserved WG values {1,2,3,4,5}.
+# I1 left "0" — this is a tagged-junk string (AWG 2.0); default keeps
+# backward compatibility with older AmneziaWG kernel modules.
+generate_awg_obfuscation() {
+    _Jc="$(awg_rand_range 4 8)"
+    _Jmin="$(awg_rand_range 40 80)"
+    _Jmax="$(awg_rand_range 900 1200)"
+    _S1="$(awg_rand_range 15 100)"
+    _S2="$(awg_rand_range 15 100)"
+    while [ $((_S1 + 56)) -eq "$_S2" ]; do
+        _S2="$(awg_rand_range 15 100)"
+    done
+    _S3="$(awg_rand_range 15 100)"
+    _S4="$(awg_rand_range 15 100)"
+
+    _reserved="1 2 3 4 5"
+    _picked=""
+    _i=0
+    while [ "$_i" -lt 4 ]; do
+        _h="$(awg_rand_u32)"
+        [ "$_h" -eq 0 ] 2>/dev/null && continue
+        _collide=0
+        for _r in $_reserved $_picked; do
+            [ "$_h" = "$_r" ] && { _collide=1; break; }
+        done
+        [ "$_collide" -eq 1 ] && continue
+        _picked="$_picked $_h"
+        _i=$((_i + 1))
+    done
+
+    # shellcheck disable=SC2086
+    set -- $_picked
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$_Jc" "$_Jmin" "$_Jmax" "$_S1" "$_S2" "$_S3" "$_S4" \
+        "$1" "$2" "$3" "$4" "0"
+}
+
+# awg_iface_get_param IFACE KEY — read UCI `network.IFACE.awg_KEY`,
+# fallback to runtime `awg show` value keyed by the same short name.
+awg_iface_get_param() {
+    _if="$1"; _key="$2"
+    _v="$(uci -q get "network.${_if}.awg_${_key}" 2>/dev/null || true)"
+    if [ -n "$_v" ]; then
+        printf '%s' "$_v"
+        return 0
+    fi
+    awg_iface_show_val "$_if" "$_key"
+}
+
+# render_awg_obfuscation_block IFACE — print AWG [Interface]-section lines
+# (Jc/Jmin/Jmax/S1/S2/H1-H4/I1) so AmneziaWG-aware clients parse them.
+# Emits nothing if the interface has no obfuscation configured.
+render_awg_obfuscation_block() {
+    _if="$1"
+    _jc="$(iface_get "$_if" awg_jc)"
+    [ -z "$_jc" ] && return 0
+    _jmin="$(iface_get "$_if" awg_jmin)"
+    _jmax="$(iface_get "$_if" awg_jmax)"
+    _s1="$(iface_get "$_if" awg_s1)"
+    _s2="$(iface_get "$_if" awg_s2)"
+    _s3="$(iface_get "$_if" awg_s3)"
+    _s4="$(iface_get "$_if" awg_s4)"
+    _h1="$(awg_iface_get_param "$_if" h1)"
+    _h2="$(awg_iface_get_param "$_if" h2)"
+    _h3="$(awg_iface_get_param "$_if" h3)"
+    _h4="$(awg_iface_get_param "$_if" h4)"
+    _i1="$(awg_iface_get_param "$_if" i1)"
+    _i2="$(iface_get "$_if" awg_i2)"
+    _i3="$(iface_get "$_if" awg_i3)"
+    _i4="$(iface_get "$_if" awg_i4)"
+    _i5="$(iface_get "$_if" awg_i5)"
+    [ -n "$_jc"   ] && printf 'Jc = %s\n'   "$_jc"
+    [ -n "$_jmin" ] && printf 'Jmin = %s\n' "$_jmin"
+    [ -n "$_jmax" ] && printf 'Jmax = %s\n' "$_jmax"
+    [ -n "$_s1"   ] && printf 'S1 = %s\n'   "$_s1"
+    [ -n "$_s2"   ] && printf 'S2 = %s\n'   "$_s2"
+    [ -n "$_s3"   ] && printf 'S3 = %s\n'   "$_s3"
+    [ -n "$_s4"   ] && printf 'S4 = %s\n'   "$_s4"
+    [ -n "$_h1"   ] && printf 'H1 = %s\n'   "$_h1"
+    [ -n "$_h2"   ] && printf 'H2 = %s\n'   "$_h2"
+    [ -n "$_h3"   ] && printf 'H3 = %s\n'   "$_h3"
+    [ -n "$_h4"   ] && printf 'H4 = %s\n'   "$_h4"
+    [ -n "$_i1"   ] && printf 'I1 = %s\n'   "$_i1"
+    [ -n "$_i2"   ] && printf 'I2 = %s\n'   "$_i2"
+    [ -n "$_i3"   ] && printf 'I3 = %s\n'   "$_i3"
+    [ -n "$_i4"   ] && printf 'I4 = %s\n'   "$_i4"
+    [ -n "$_i5"   ] && printf 'I5 = %s\n'   "$_i5"
+    return 0
+}
+
 # ─── Precondition checks ─────────────────────────────────────────────
 
 ensure_required_tools() {
@@ -1713,12 +2464,15 @@ ensure_base_firewall() {
 }
 
 ensure_wan_masq() {
-    wan_idx="$(find_zone_index "$WAN_ZONE" || true)"
-    [ -n "$wan_idx" ] || die "Firewall zone '$WAN_ZONE' not found"
+    # Accept an explicit zone argument (preferred) or fall back to the
+    # wizard-level $WAN_ZONE global for legacy callers.
+    _wz="${1:-${WAN_ZONE:-wan}}"
+    wan_idx="$(find_zone_index "$_wz" || true)"
+    [ -n "$wan_idx" ] || die "Firewall zone '$_wz' not found"
     masq="$(uci -q get "firewall.@zone[$wan_idx].masq" || true)"
     if [ "$masq" != "1" ]; then
-        warn "Masquerading disabled on '$WAN_ZONE'. VPN clients may lack internet."
-        if confirm "Enable masquerading on '$WAN_ZONE'?" "y"; then
+        warn "Masquerading disabled on '$_wz'. VPN clients may lack internet."
+        if confirm "Enable masquerading on '$_wz'?" "y"; then
             uci set "firewall.@zone[$wan_idx].masq=1"
         fi
     fi
@@ -1847,7 +2601,7 @@ detect_podkop_state() {
     fi
 
     if [ -n "$_dpk_iface" ]; then
-        _dpk_dns="$(uci -q get "network.${_dpk_iface}.dns" || true)"
+        _dpk_dns="$(iface_get "$_dpk_iface" dns)"
         _dpk_lan="$(detect_router_lan_ip 2>/dev/null || true)"
         if [ -n "$_dpk_dns" ] && [ -n "$_dpk_lan" ] && [ "$_dpk_dns" = "$_dpk_lan" ]; then
             PK_DNS_VIA_ROUTER=1
@@ -1893,6 +2647,73 @@ get_all_awg_interfaces() {
         | sed "s/network\.//"
 }
 
+# resolve_hostname HOSTNAME — echo the first A-record IP for HOSTNAME, or
+# empty if input is already an IP / is an IPv6 literal / fails to resolve.
+# Tries getent first (NSS path), falls back to nslookup (busybox).
+resolve_hostname() {
+    _rh_in="$1"
+    [ -z "$_rh_in" ] && return 1
+    # Skip anything already numeric / IPv6 literal — only hostnames need resolving.
+    case "$_rh_in" in
+        *:*) return 1 ;;                       # IPv6 literal
+        *[!0-9.]*) ;;                          # has non-digit non-dot → hostname
+        *) return 1 ;;                         # pure IPv4 literal
+    esac
+    _rh_ip="$(getent hosts "$_rh_in" 2>/dev/null | awk '{print $1; exit}')"
+    [ -z "$_rh_ip" ] && _rh_ip="$(nslookup "$_rh_in" 2>/dev/null \
+        | awk '/^Address: /{print $2; exit}')"
+    [ -z "$_rh_ip" ] && return 1
+    printf '%s\n' "$_rh_ip"
+}
+
+# resolve_hostname_via HOSTNAME DNS_SERVER — resolve via a specific server,
+# bypassing local split-horizon records. Used to see what external clients
+# would get. Empty if it fails.
+resolve_hostname_via() {
+    _rh_in="$1"; _rh_srv="$2"
+    [ -z "$_rh_in" ] || [ -z "$_rh_srv" ] && return 1
+    case "$_rh_in" in
+        *:*|*[!0-9.]*) ;;
+        *) return 1 ;;
+    esac
+    # nslookup output on BusyBox: the answer's "Address" line comes after
+    # the server's own address line. Take the last non-server Address.
+    _rh_ip="$(nslookup "$_rh_in" "$_rh_srv" 2>/dev/null \
+        | awk -v srv="$_rh_srv" '
+            /^Address/ {
+                sub(/.*:[[:space:]]*/, "")
+                if ($0 != srv && $0 != "") last=$0
+            }
+            END { if (last) print last }')"
+    [ -z "$_rh_ip" ] && return 1
+    printf '%s\n' "$_rh_ip"
+}
+
+# classify_endpoint_ip IP — echo a short context label for an endpoint IP:
+#   "wan"      → matches this router's WAN IP
+#   "hairpin"  → matches this router's LAN IP (split-horizon DNS)
+#   "private"  → RFC1918 / link-local but NOT this router
+#   "external" → public IP, but NOT this router's WAN
+#   (empty)    → could not classify
+classify_endpoint_ip() {
+    _cip="$1"
+    [ -z "$_cip" ] && return 1
+    # Router's own LAN IP → intentional split-horizon / hairpin DNS setup.
+    _lan_ip="$(detect_router_lan_ip 2>/dev/null || true)"
+    if [ -n "$_lan_ip" ] && [ "$_cip" = "$_lan_ip" ]; then
+        echo "hairpin"; return 0
+    fi
+    case "$_cip" in
+        10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|169.254.*|127.*)
+            echo "private"; return 0 ;;
+    esac
+    _wan_ip="$(detect_wan_ip 2>/dev/null || true)"
+    if [ -n "$_wan_ip" ] && [ "$_cip" = "$_wan_ip" ]; then
+        echo "wan"; return 0
+    fi
+    echo "external"
+}
+
 # ─── WAN IP detection (Endpoint) ─────────────────────────────────────
 
 detect_wan_ip() {
@@ -1929,135 +2750,82 @@ count_peers() {
 }
 
 count_active_peers() {
-    _iface="$1"
     have_cmd awg || { echo "0"; return; }
-    awg show 2>/dev/null | awk -v iface="$_iface" -v th=120 '
-        /^interface:/ { cur=$2 }
-        cur==iface && /latest handshake:/ {
-            sub(/.*latest handshake: /,"")
-            if (/never/) next
-            t=0; for(i=1;i<=NF;i++){
-                if($i~/^[0-9]+$/){n=$i;u=$(i+1)
-                    if(u~/^second/)t+=n
-                    else if(u~/^minute/)t+=n*60
-                    else if(u~/^hour/)t+=n*3600
-                    else if(u~/^day/)t+=n*86400}
-            }
-            if(t<=th) a++
-        }
-        END { print a+0 }
-    '
+    awg show "$1" dump 2>/dev/null | awk -F'\t' -v now="$(date +%s)" -v th=120 '
+        NR>1 && $5 != "0" && (now - $5) <= th { a++ }
+        END { print a+0 }'
 }
 
 active_peer_names() {
-    # Returns comma-separated list of active peer names
+    # Returns comma-separated list of peer descriptions whose handshake is
+    # within the last 120s. Pair each dump row with its UCI description.
     _iface="$1"; _pt="amneziawg_${_iface}"
     have_cmd awg || return
+    # Collect active public keys from dump, one per line.
+    _active_pks="$(awg show "$_iface" dump 2>/dev/null | awk -F'\t' -v now="$(date +%s)" -v th=120 '
+        NR>1 && $5 != "0" && (now - $5) <= th { print $1 }')"
+    [ -z "$_active_pks" ] && { echo ""; return; }
+
     _names=""
-    _awg_out="$(awg show "$_iface" 2>/dev/null)"
     _pi=0
-    while uci -q get "network.@${_pt}[$_pi]" >/dev/null 2>&1; do
-        _pk="$(uci -q get "network.@${_pt}[$_pi].public_key" || true)"
-        _desc="$(uci -q get "network.@${_pt}[$_pi].description" || true)"
-        [ -z "$_pk" ] && { _pi=$((_pi+1)); continue; }
+    while peer_exists "$_pt" "$_pi"; do
+        _pk="$(peer_get "$_pt" "$_pi" public_key)"
+        _desc="$(peer_get "$_pt" "$_pi" description)"
         [ -z "$_desc" ] && _desc="peer$((_pi+1))"
-        _sec="$(echo "$_awg_out" | awk -v pk="$_pk" '
-            /peer:/{cur=$NF} cur==pk&&/latest handshake:/{
-                sub(/.*latest handshake: /,"");
-                if(/never/){print 9999999;exit}
-                t=0;for(i=1;i<=NF;i++){if($i~/^[0-9]+$/){n=$i;u=$(i+1);
-                    if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
-                    else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
-                print t;exit}')"
-        [ "${_sec:-9999999}" -le "120" ] 2>/dev/null && \
+        if [ -n "$_pk" ] && printf '%s\n' "$_active_pks" | grep -Fxq -- "$_pk"; then
             _names="${_names:+${_names}, }${_desc}"
-        _pi=$((_pi+1))
+        fi
+        _pi=$((_pi + 1))
     done
     echo "$_names"
 }
 
+# get_peer_handshake IFACE PUBKEY — human-readable age ("5m", "1h 23m", ...),
+# "never" if no handshake yet, "-" if peer not found.
 get_peer_handshake() {
-    # Returns human-readable handshake for a peer by public key
-    # $1=iface, $2=public_key
-    _iface="$1"; _pk="$2"
-    have_cmd awg || { echo "-"; return; }
-    awg show "$_iface" 2>/dev/null | awk -v pk="$_pk" '
-        /peer:/ { cur=$NF }
-        cur==pk && /latest handshake:/ {
-            sub(/.*latest handshake: /,"")
-            if (/never/) { print "never"; found=1; exit }
-            t=0; for(i=1;i<=NF;i++){
-                if($i~/^[0-9]+$/){n=$i;u=$(i+1)
-                    if(u~/^second/)t+=n
-                    else if(u~/^minute/)t+=n*60
-                    else if(u~/^hour/)t+=n*3600
-                    else if(u~/^day/)t+=n*86400}
-            }
-            if(t<60) printf "%ds\n",t
-            else if(t<3600) printf "%dm\n",int(t/60)
-            else if(t<86400) printf "%dh %dm\n",int(t/3600),int((t%3600)/60)
-            else printf "%dd %dh\n",int(t/86400),int((t%86400)/3600)
-            found=1; exit
-        }
-        END { if(!found) print "-" }
-    '
+    _line="$(awg_dump_peer "$1" "$2")"
+    [ -z "$_line" ] && { echo "-"; return; }
+    _ts="$(printf '%s\n' "$_line" | awk -F'\t' '{print $5}')"
+    if [ -z "$_ts" ] || [ "$_ts" = "0" ]; then echo "never"; return; fi
+    _age=$(( $(date +%s) - _ts ))
+    [ "$_age" -lt 0 ] && _age=0
+    if   [ "$_age" -lt 60 ];    then printf '%ds\n'     "$_age"
+    elif [ "$_age" -lt 3600 ];  then printf '%dm\n'     "$((_age/60))"
+    elif [ "$_age" -lt 86400 ]; then printf '%dh %dm\n' "$((_age/3600))" "$(((_age%3600)/60))"
+    else                             printf '%dd %dh\n' "$((_age/86400))" "$(((_age%86400)/3600))"
+    fi
 }
 
 get_peer_rx() {
-    _iface="$1"; _pk="$2"
-    have_cmd awg || return
-    awg show "$_iface" 2>/dev/null | awk -v pk="$_pk" '
-        /peer:/ { cur=$NF }
-        cur==pk && /transfer:/ {
-            sub(/.*transfer: /,"")
-            # "1.24 MiB received, 3.47 MiB sent"
-            match($0, /(.+) received/, a)
-            if (RSTART) print a[1]
-            else { split($0, p, ","); sub(/^ */, "", p[1]); sub(/ received.*/, "", p[1]); print p[1] }
-            exit
-        }
-    '
+    _line="$(awg_dump_peer "$1" "$2")"
+    [ -z "$_line" ] && { echo "0 B"; return; }
+    _b="$(printf '%s\n' "$_line" | awk -F'\t' '{print $6}')"
+    fmt_bytes "${_b:-0}"
 }
 
 get_peer_tx() {
-    _iface="$1"; _pk="$2"
-    have_cmd awg || return
-    awg show "$_iface" 2>/dev/null | awk -v pk="$_pk" '
-        /peer:/ { cur=$NF }
-        cur==pk && /transfer:/ {
-            sub(/.*transfer: /,"")
-            match($0, /, (.+) sent/, a)
-            if (RSTART) print a[1]
-            else { split($0, p, ","); sub(/^ */, "", p[2]); sub(/ sent.*/, "", p[2]); print p[2] }
-            exit
-        }
-    '
+    _line="$(awg_dump_peer "$1" "$2")"
+    [ -z "$_line" ] && { echo "0 B"; return; }
+    _b="$(printf '%s\n' "$_line" | awk -F'\t' '{print $7}')"
+    fmt_bytes "${_b:-0}"
 }
 
+# get_peer_endpoint_live IFACE PUBKEY — "host:port", empty if "(none)"/missing.
 get_peer_endpoint_live() {
-    _iface="$1"; _pk="$2"
-    have_cmd awg || return
-    awg show "$_iface" 2>/dev/null | awk -v pk="$_pk" '
-        /peer:/ { cur=$NF }
-        cur==pk && /endpoint:/ {
-            sub(/.*endpoint: /,"")
-            print
-            exit
-        }
-    '
+    _line="$(awg_dump_peer "$1" "$2")"
+    [ -z "$_line" ] && return
+    _ep="$(printf '%s\n' "$_line" | awk -F'\t' '{print $3}')"
+    [ -z "$_ep" ] || [ "$_ep" = "(none)" ] && return
+    printf '%s\n' "$_ep"
 }
 
+# get_peer_keepalive_live IFACE PUBKEY — "every Ns" or empty if off.
 get_peer_keepalive_live() {
-    _iface="$1"; _pk="$2"
-    have_cmd awg || return
-    awg show "$_iface" 2>/dev/null | awk -v pk="$_pk" '
-        /peer:/ { cur=$NF }
-        cur==pk && /persistent keepalive:/ {
-            sub(/.*persistent keepalive: /,"")
-            print
-            exit
-        }
-    '
+    _line="$(awg_dump_peer "$1" "$2")"
+    [ -z "$_line" ] && return
+    _ka="$(printf '%s\n' "$_line" | awk -F'\t' '{print $8}')"
+    [ -z "$_ka" ] || [ "$_ka" = "off" ] || [ "$_ka" = "0" ] && return
+    printf 'every %ss\n' "$_ka"
 }
 
 list_used_hosts() {
@@ -2067,7 +2835,7 @@ list_used_hosts() {
         | grep "=${_pt}$" \
         | sed "s/^network\.//; s/=${_pt}$//" \
         | while read -r _sec; do
-            uci -q get "network.${_sec}.allowed_ips" 2>/dev/null || true
+            iface_get "$_sec" allowed_ips
         done \
         | sed -n "s/.*${_prefix}\.\([0-9]\{1,3\}\)\/32.*/\1/p" \
         | sort -n -u
@@ -2097,70 +2865,160 @@ awg_iface_show_val() {
 
 # ─── Amnezia config output ───────────────────────────────────────────
 
-emit_peer_config() {
-    _iface="$1"; _client_priv="$2"; _client_v4="$3"; _client_v6="$4"
-    _server_pub="$5"; _conf="$6"; _host="$7"; _port="$8"
+# ─── Peer config rendering (single source of truth) ──────────────────
 
-    _H1="$(awg_iface_show_val "$_iface" "h1")"; [ -n "$_H1" ] || _H1="1"
-    _H2="$(awg_iface_show_val "$_iface" "h2")"; [ -n "$_H2" ] || _H2="2"
-    _H3="$(awg_iface_show_val "$_iface" "h3")"; [ -n "$_H3" ] || _H3="3"
-    _H4="$(awg_iface_show_val "$_iface" "h4")"; [ -n "$_H4" ] || _H4="4"
-    _I1="$(awg_iface_show_val "$_iface" "i1")"; [ -n "$_I1" ] || _I1="0"
+# _resolve_endpoint_host IFACE [PT IDX] — resolve the endpoint to put in a
+# client .conf. Precedence: per-peer override (if PT/IDX given) → interface
+# override → WAN auto-detect → placeholder.
+_resolve_endpoint_host() {
+    _eh=""
+    if [ "$#" -ge 3 ]; then
+        _eh="$(uci -q get "network.@$2[$3].endpoint_host" 2>/dev/null || true)"
+    fi
+    [ -z "$_eh" ] && _eh="$(uci -q get "network.$1.endpoint_host" 2>/dev/null || true)"
+    [ -z "$_eh" ] && _eh="$(detect_wan_ip 2>/dev/null || true)"
+    [ -z "$_eh" ] && _eh="YOUR_SERVER_IP"
+    printf '%s' "$_eh"
+}
 
-    _MTU="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
+# _base64_1line STRING — emit single-line base64 (with fallback)
+_base64_1line() {
+    printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
+}
 
-    _conf_crlf="$(printf "%s" "$_conf" | sed 's/$/\r/')"
+# reconstruct_peer_config IFACE PEER_IDX — emit the peer's WireGuard .conf on stdout
+reconstruct_peer_config() {
+    _iface="$1"; _idx="$2"; _pt="amneziawg_${_iface}"
 
-    _AWG_JSON="$(jq -n \
-      --arg pr "$_client_priv" \
-      --arg i1 "$_I1" \
-      --arg v4 "$_client_v4" \
-      --arg v6 "${_client_v6:-}" \
-      --arg pp "$_server_pub" \
-      --arg cf "$_conf_crlf" \
-      --arg h1 "$_H1" --arg h2 "$_H2" --arg h3 "$_H3" --arg h4 "$_H4" \
-      --arg host "$_host" \
-      --arg port "$_port" \
-      --arg mtu "$_MTU" \
-      --argjson allowed_ips "$(printf '%s' "$_conf" | sed -n 's/^AllowedIPs = //p' | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -s .)" \
+    _client_priv="$(peer_get "$_pt" "$_idx" "private_key")"
+    [ -z "$_client_priv" ] && { echo ""; return 1; }
+
+    _peer_ip="$(peer_get "$_pt" "$_idx" "allowed_ips" "?")"
+    _keepalive="$(peer_get "$_pt" "$_idx" "persistent_keepalive" "$CFG_DEFAULT_KEEPALIVE")"
+    _psk="$(peer_get "$_pt" "$_idx" "preshared_key")"
+    _client_allowed_ips="$(peer_get "$_pt" "$_idx" "client_allowed_ips" "0.0.0.0/0, ::/0")"
+    _peer_obf="$(peer_get "$_pt" "$_idx" "_liminal_obfuscation")"
+
+    _server_priv="$(iface_get "$_iface" "private_key")"
+    _server_pub="$(printf '%s' "$_server_priv" | awg pubkey 2>/dev/null || true)"
+
+    _port="$(iface_get "$_iface" "listen_port" "$CFG_DEFAULT_PORT")"
+    _dns="$(iface_get "$_iface" "dns")"
+    [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "$CFG_DEFAULT_DNS")"
+    _mtu="$(iface_get "$_iface" "mtu" "$CFG_DEFAULT_MTU")"
+    _endpoint_host="$(_resolve_endpoint_host "$_iface" "$_pt" "$_idx")"
+
+    # If a LAN domain is explicitly configured in dnsmasq, append it as a
+    # search domain so the client resolves short hostnames (e.g. "router"
+    # → "router.${lan_domain}"). Fallback "lan" is not auto-included.
+    _dom_explicit="$(uci -q get "dhcp.@dnsmasq[0].domain" 2>/dev/null || true)"
+    if [ -n "$_dom_explicit" ]; then
+        _dns_line="${_dns}, ${_dom_explicit}"
+    else
+        _dns_line="$_dns"
+    fi
+
+    printf "[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %s\n" \
+        "$_client_priv" "$_peer_ip" "$_dns_line" "$_mtu"
+    if [ "$_peer_obf" = "1" ]; then
+        _obf_block="$(render_awg_obfuscation_block "$_iface")"
+        [ -n "$_obf_block" ] && printf '%s\n' "$_obf_block"
+    fi
+    printf "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\nEndpoint = %s:%s\nPersistentKeepAlive = %s\n" \
+        "$_server_pub" "$_client_allowed_ips" "$_endpoint_host" "$_port" "$_keepalive"
+    [ -n "$_psk" ] && printf "PresharedKey = %s\n" "$_psk"
+    return 0
+}
+
+# _build_amnezia_json IFACE CLIENT_PRIV CLIENT_V4 CLIENT_V6 SERVER_PUB CONF HOST PORT
+# Produce the Amnezia container JSON (input to vpn:// base64). Internal helper.
+_build_amnezia_json() {
+    _iface="$1" _pr="$2" _v4="$3" _v6="$4" _pp="$5" _conf="$6" _host="$7" _port="$8"
+
+    _h1="$(awg_iface_get_param "$_iface" "h1")"; : "${_h1:=1}"
+    _h2="$(awg_iface_get_param "$_iface" "h2")"; : "${_h2:=2}"
+    _h3="$(awg_iface_get_param "$_iface" "h3")"; : "${_h3:=3}"
+    _h4="$(awg_iface_get_param "$_iface" "h4")"; : "${_h4:=4}"
+    _i1="$(awg_iface_get_param "$_iface" "i1")"; : "${_i1:=0}"
+    _jc="$(iface_get   "$_iface" "awg_jc"   "120")"
+    _jmin="$(iface_get "$_iface" "awg_jmin" "23")"
+    _jmax="$(iface_get "$_iface" "awg_jmax" "911")"
+    _s1="$(iface_get   "$_iface" "awg_s1"   "0")"
+    _s2="$(iface_get   "$_iface" "awg_s2"   "0")"
+    _mtu="$(iface_get  "$_iface" "mtu" "$CFG_DEFAULT_MTU")"
+
+    _conf_crlf="$(printf '%s' "$_conf" | sed 's/$/\r/')"
+    _aip_json="$(printf '%s' "$_conf" | sed -n 's/^AllowedIPs = //p' | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -s .)"
+
+    _inner="$(jq -n \
+      --arg pr "$_pr" --arg i1 "$_i1" \
+      --arg v4 "$_v4" --arg v6 "${_v6:-}" \
+      --arg pp "$_pp" --arg cf "$_conf_crlf" \
+      --arg h1 "$_h1" --arg h2 "$_h2" --arg h3 "$_h3" --arg h4 "$_h4" \
+      --arg jc "$_jc" --arg jmin "$_jmin" --arg jmax "$_jmax" \
+      --arg s1 "$_s1" --arg s2 "$_s2" \
+      --arg host "$_host" --arg port "$_port" --arg mtu "$_mtu" \
+      --argjson allowed_ips "$_aip_json" \
       '{
           H1: $h1, H2: $h2, H3: $h3, H4: $h4,
-          I1: $i1, Jc: "120", Jmax: "911", Jmin: "23", S1: "0", S2: "0",
+          I1: $i1, Jc: $jc, Jmax: $jmax, Jmin: $jmin, S1: $s1, S2: $s2,
           allowed_ips: $allowed_ips,
           client_ip: (if $v6 != "" then ($v4 + ", " + $v6) else $v4 end),
-          client_priv_key: $pr,
-          config: $cf,
-          hostName: $host,
-          mtu: ($mtu|tonumber),
-          port: ($port|tonumber),
+          client_priv_key: $pr, config: $cf,
+          hostName: $host, mtu: ($mtu|tonumber), port: ($port|tonumber),
           server_pub_key: $pp
       }'
     )"
 
-    _AMNEZIA_JSON="$(jq -n \
-      --arg last "$_AWG_JSON" \
-      --arg name "AWG $_iface" \
-      --arg host "$_host" \
-      --arg port "$_port" \
+    jq -n --arg last "$_inner" --arg name "AWG $_iface" \
+          --arg host "$_host" --arg port "$_port" \
       '{
-          containers: [{
-              container: "amnezia-awg",
-              awg: {
-                  isThirdPartyConfig: true,
-                  last_config: $last,
-                  port: $port,
-                  transport_proto: "udp"
-              }
-          }],
-          defaultContainer: "amnezia-awg",
-          description: $name,
-          hostName: $host
+          containers: [{ container: "amnezia-awg", awg: {
+              isThirdPartyConfig: true, last_config: $last,
+              port: $port, transport_proto: "udp"
+          }}],
+          defaultContainer: "amnezia-awg", description: $name, hostName: $host
       }'
-    )"
+}
 
-    _VPN_KEY="vpn://$(printf "%s" "$_AMNEZIA_JSON" \
-        | base64 -w 0 2>/dev/null \
-        || printf "%s" "$_AMNEZIA_JSON" | base64)"
+# build_vpn_key IFACE PEER_IDX — emit a vpn:// URL for the peer.
+build_vpn_key() {
+    _iface="$1"; _idx="$2"; _pt="amneziawg_${_iface}"
+
+    _client_priv="$(peer_get "$_pt" "$_idx" "private_key")"
+    _client_v4="$(peer_get "$_pt" "$_idx" "allowed_ips")"
+
+    _server_priv="$(iface_get "$_iface" "private_key")"
+    _server_pub="$(printf '%s' "$_server_priv" | awg pubkey 2>/dev/null || true)"
+
+    _port="$(iface_get "$_iface" "listen_port" "$CFG_DEFAULT_PORT")"
+    _host="$(_resolve_endpoint_host "$_iface" "$_pt" "$_idx")"
+    _conf="$(reconstruct_peer_config "$_iface" "$_idx")"
+
+    _amnezia_json="$(_build_amnezia_json "$_iface" "$_client_priv" "$_client_v4" "" \
+                                         "$_server_pub" "$_conf" "$_host" "$_port")"
+    printf 'vpn://%s' "$(_base64_1line "$_amnezia_json")"
+}
+
+# emit_peer_config IFACE PEER_IDX [HOST] — print .conf + vpn:// + download + QR.
+# HOST is optional override; when omitted, uses the same resolver as build_vpn_key.
+emit_peer_config() {
+    _iface="$1"; _idx="$2"; _host="${3:-}"
+    _pt="amneziawg_${_iface}"
+
+    _conf="$(reconstruct_peer_config "$_iface" "$_idx")"
+    [ -z "$_conf" ] && { warn "Failed to read peer private key"; return 1; }
+
+    _client_priv="$(peer_get "$_pt" "$_idx" "private_key")"
+    _client_v4="$(peer_get "$_pt" "$_idx" "allowed_ips")"
+    _server_priv="$(iface_get "$_iface" "private_key")"
+    _server_pub="$(printf '%s' "$_server_priv" | awg pubkey 2>/dev/null || true)"
+    _port="$(iface_get "$_iface" "listen_port" "$CFG_DEFAULT_PORT")"
+    [ -z "$_host" ] && _host="$(_resolve_endpoint_host "$_iface" "$_pt" "$_idx")"
+
+    _amnezia_json="$(_build_amnezia_json "$_iface" "$_client_priv" "$_client_v4" "" \
+                                         "$_server_pub" "$_conf" "$_host" "$_port")"
+    _vpn_key="vpn://$(_base64_1line "$_amnezia_json")"
 
     echo ""
     echo -e "  ${V}── Peer Config ──${NC}"
@@ -2168,12 +3026,9 @@ emit_peer_config() {
     echo -e "${W}${_conf}${NC}"
     echo ""
     echo -e "  ${A}AmneziaVPN key:${NC}"
-    echo "$_VPN_KEY"
+    echo "$_vpn_key"
     echo ""
-
-    _conf_b64="$(printf "%s" "$_conf" \
-        | base64 -w 0 2>/dev/null \
-        || printf "%s" "$_conf" | base64)"
+    _conf_b64="$(_base64_1line "$_conf")"
     echo -e "  ${A}Download:${NC} https://immalware.vercel.app/download?filename=awg_${_iface}.conf&content=${_conf_b64}"
     echo ""
 
@@ -2182,103 +3037,7 @@ emit_peer_config() {
         qrencode -t ANSIUTF8 "$_conf" 2>/dev/null || true
         echo ""
     fi
-}
-
-# ─── Reconstruct peer config from UCI ─────────────────────────────
-
-reconstruct_peer_config() {
-    _iface="$1"; _idx="$2"
-    _pt="amneziawg_${_iface}"
-
-    _client_priv="$(uci -q get "network.@${_pt}[$_idx].private_key" || true)"
-    [ -z "$_client_priv" ] && { echo ""; return 1; }
-
-    _peer_ip="$(uci -q get "network.@${_pt}[$_idx].allowed_ips" || echo "?")"
-    _keepalive="$(uci -q get "network.@${_pt}[$_idx].persistent_keepalive" || echo "$CFG_DEFAULT_KEEPALIVE")"
-    _psk="$(uci -q get "network.@${_pt}[$_idx].preshared_key" || true)"
-    _client_allowed_ips="$(uci -q get "network.@${_pt}[$_idx].client_allowed_ips" || echo "0.0.0.0/0, ::/0")"
-
-    _server_priv="$(uci -q get "network.${_iface}.private_key" || true)"
-    _server_pub="$(printf '%s' "$_server_priv" | awg pubkey 2>/dev/null || true)"
-
-    _port="$(uci -q get "network.${_iface}.listen_port" || echo "$CFG_DEFAULT_PORT")"
-    _dns="$(uci -q get "network.${_iface}.dns" || true)"
-    [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "$CFG_DEFAULT_DNS")"
-    _mtu="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
-
-    _endpoint_host="$(uci -q get "network.${_iface}.endpoint_host" || true)"
-    if [ -z "$_endpoint_host" ]; then
-        _endpoint_host="$(detect_wan_ip || true)"
-    fi
-    [ -z "$_endpoint_host" ] && _endpoint_host="YOUR_SERVER_IP"
-
-    printf "[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\nEndpoint = %s:%s\nPersistentKeepAlive = %s\n" \
-        "$_client_priv" "$_peer_ip" "$_dns" "$_mtu" "$_server_pub" "$_client_allowed_ips" "$_endpoint_host" "$_port" "$_keepalive"
-    [ -n "$_psk" ] && printf "PresharedKey = %s\n" "$_psk"
-}
-
-build_vpn_key() {
-    _iface="$1"; _idx="$2"
-    _pt="amneziawg_${_iface}"
-
-    _client_priv="$(uci -q get "network.@${_pt}[$_idx].private_key" || true)"
-    _client_v4="$(uci -q get "network.@${_pt}[$_idx].allowed_ips" || true)"
-
-    _server_priv="$(uci -q get "network.${_iface}.private_key" || true)"
-    _server_pub="$(printf '%s' "$_server_priv" | awg pubkey 2>/dev/null || true)"
-
-    _port="$(uci -q get "network.${_iface}.listen_port" || echo "$CFG_DEFAULT_PORT")"
-    _dns="$(uci -q get "network.${_iface}.dns" || true)"
-    [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "$CFG_DEFAULT_DNS")"
-    _endpoint_host="$(uci -q get "network.${_iface}.endpoint_host" || true)"
-    if [ -z "$_endpoint_host" ]; then
-        _endpoint_host="$(detect_wan_ip || true)"
-    fi
-    [ -z "$_endpoint_host" ] && _endpoint_host="YOUR_SERVER_IP"
-
-    _conf="$(reconstruct_peer_config "$_iface" "$_idx")"
-
-    _H1="$(awg_iface_show_val "$_iface" "h1")"; [ -n "$_H1" ] || _H1="1"
-    _H2="$(awg_iface_show_val "$_iface" "h2")"; [ -n "$_H2" ] || _H2="2"
-    _H3="$(awg_iface_show_val "$_iface" "h3")"; [ -n "$_H3" ] || _H3="3"
-    _H4="$(awg_iface_show_val "$_iface" "h4")"; [ -n "$_H4" ] || _H4="4"
-    _I1="$(awg_iface_show_val "$_iface" "i1")"; [ -n "$_I1" ] || _I1="0"
-    _MTU="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
-
-    _conf_crlf="$(printf "%s" "$_conf" | sed 's/$/\r/')"
-
-    _AWG_JSON="$(jq -n \
-      --arg pr "$_client_priv" --arg i1 "$_I1" \
-      --arg v4 "$_client_v4" --arg v6 "" \
-      --arg pp "$_server_pub" --arg cf "$_conf_crlf" \
-      --arg h1 "$_H1" --arg h2 "$_H2" --arg h3 "$_H3" --arg h4 "$_H4" \
-      --arg host "$_endpoint_host" --arg port "$_port" --arg mtu "$_MTU" \
-      --argjson allowed_ips "$(printf '%s' "$_conf" | sed -n 's/^AllowedIPs = //p' | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -s .)" \
-      '{
-          H1: $h1, H2: $h2, H3: $h3, H4: $h4,
-          I1: $i1, Jc: "120", Jmax: "911", Jmin: "23", S1: "0", S2: "0",
-          allowed_ips: $allowed_ips,
-          client_ip: $v4, client_priv_key: $pr, config: $cf,
-          hostName: $host, mtu: ($mtu|tonumber), port: ($port|tonumber),
-          server_pub_key: $pp
-      }'
-    )"
-
-    _AMNEZIA_JSON="$(jq -n \
-      --arg last "$_AWG_JSON" --arg name "AWG $_iface" \
-      --arg host "$_endpoint_host" --arg port "$_port" \
-      '{
-          containers: [{ container: "amnezia-awg", awg: {
-              isThirdPartyConfig: true, last_config: $last,
-              port: $port, transport_proto: "udp"
-          }}],
-          defaultContainer: "amnezia-awg", description: $name, hostName: $host
-      }'
-    )"
-
-    printf "vpn://%s" "$(printf "%s" "$_AMNEZIA_JSON" \
-        | base64 -w 0 2>/dev/null \
-        || printf "%s" "$_AMNEZIA_JSON" | base64)"
+    return 0
 }
 
 # ─── Individual peer display functions ────────────────────────────
@@ -2327,36 +3086,7 @@ show_peer_vpn_key() {
 }
 
 show_peer_all() {
-    _iface="$1"; _idx="$2"; _pname="${3:-peer}"
-    _conf="$(reconstruct_peer_config "$_iface" "$_idx")"
-    [ -z "$_conf" ] && { warn "Failed to read peer private key"; PAUSE; return; }
-
-    echo ""
-    echo -e "  ${V}── Config ──${NC}"
-    echo ""
-    echo -e "${W}${_conf}${NC}"
-    echo ""
-
-    if have_cmd jq && have_cmd base64; then
-        _key="$(build_vpn_key "$_iface" "$_idx")"
-        echo -e "  ${A}AmneziaVPN key:${NC}"
-        echo "$_key"
-        echo ""
-    fi
-
-    if have_cmd base64; then
-        _b64="$(printf "%s" "$_conf" | base64 -w 0 2>/dev/null || printf "%s" "$_conf" | base64)"
-        _fname="$(printf '%s_%s' "$_pname" "$_iface" | tr 'A-Z ' 'a-z-' | sed 's/[^a-z0-9_-]//g')"
-        echo -e "  ${A}Download:${NC}"
-        echo "https://immalware.vercel.app/download?filename=${_fname}.conf&content=${_b64}"
-        echo ""
-    fi
-
-    if have_cmd qrencode; then
-        echo -e "  ${A}QR Code:${NC}"
-        qrencode -t ANSIUTF8 "$_conf" 2>/dev/null || true
-        echo ""
-    fi
+    emit_peer_config "$1" "$2" || { PAUSE; return; }
     PAUSE
 }
 
@@ -2379,71 +3109,184 @@ do_rename_peer() {
     uci set "network.@${_pt}[$_idx].description=$_new_name"
     uci commit network
 
-    # Update hostrecord if exists
     _rp_hr_idx="$(find_hostrecord "$_iface" "$_old_desc" 2>/dev/null)" && {
         _rp_ip="$(uci -q get "dhcp.@hostrecord[$_rp_hr_idx].ip" || true)"
         _rp_fqdn="$(build_peer_fqdn "$_iface" "$_new_name")"
         uci set "dhcp.@hostrecord[$_rp_hr_idx].name=${_rp_fqdn}"
         uci set "dhcp.@hostrecord[$_rp_hr_idx]._liminal_peer=${_new_name}"
         uci commit dhcp
-        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+        svc_restart dnsmasq
         echo -e "  ${B}Updated${NC} DNS: ${W}${_rp_fqdn}${NC}"
     }
 
     echo -e "  ${OK}Renamed:${NC} ${_old_desc} -> ${W}${_new_name}${NC}"
     PAUSE
-    # Return new name via global
     PEER_NEW_NAME="$_new_name"
     return 0
 }
 
-do_regen_peer() {
-    _iface="$1"; _idx="$2"; _desc="$3"
-    _pt="amneziawg_${_iface}"
-
+# _pm_toggle_obfuscation IFACE PT IDX — flip _liminal_obfuscation. Affects
+# only what gets written into newly-emitted .conf; kernel state is untouched.
+_pm_toggle_obfuscation() {
+    _iface="$1"; _pt="$2"; _idx="$3"
+    _cur="$(peer_get "$_pt" "$_idx" _liminal_obfuscation)"
+    section "Obfuscation (in config)"
+    echo -e "  ${A}Current:${NC} ${W}${_cur:-unset}${NC}"
     echo ""
-    echo -e "  ${A}This will generate new keys for '${W}${_desc}${A}'.${NC}"
-    echo -e "  ${A}The old config/QR/vpn:// will stop working.${NC}"
+    echo -e "  ${DIM2}Controls AWG obfuscation lines in the emitted .conf.${NC}"
+    echo -e "  ${DIM2}'on'  — include Jc/Jmin/Jmax/S1-S4/H1-H4/I1-I5${NC}"
+    echo -e "  ${DIM2}'off' — plain WireGuard .conf${NC}"
+    echo -e "  ${DIM2}Existing clients keep the config they already downloaded;${NC}"
+    echo -e "  ${DIM2}re-download via 'Generate Config' to get the new shape.${NC}"
     echo ""
-    confirm "Regenerate keys?" "n" || return
+    echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}on${NC}"
+    echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}off${NC}"
+    echo -e "  ${DIM2}Enter › Cancel${NC}"
+    echo ""
+    prompt _po_choice "Select" "" || return 0
+    sigint_caught && return 0
+    case "${_po_choice:-}" in
+        1) _new="1" ;;
+        2) _new="0" ;;
+        *) return 0 ;;
+    esac
+    if [ "$_new" = "$_cur" ]; then
+        echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0
+    fi
+    peer_set "$_pt" "$_idx" _liminal_obfuscation "$_new"
+    uci commit network
+    echo -e "  ${ICO_OK} ${OK}Obfuscation set to $([ "$_new" = "1" ] && echo on || echo off)${NC}"
+    echo -e "  ${WARN_C}Re-download client config to apply${NC}"
+    PAUSE
+    return 0
+}
 
-    _client_priv="$(awg genkey)" || { warn "Key generation failed"; PAUSE; return; }
-    _client_pub="$(printf '%s' "$_client_priv" | awg pubkey)" \
-        || { warn "Public key derivation failed"; PAUSE; return; }
+# _pm_edit_endpoint IFACE PT IDX — per-peer endpoint_host override. Empty
+# value clears the override so the peer inherits the interface setting.
+_pm_edit_endpoint() {
+    _iface="$1"; _pt="$2"; _idx="$3"
+    _cur="$(peer_get "$_pt" "$_idx" endpoint_host)"
+    _iface_ep="$(iface_get "$_iface" endpoint_host)"
+    _wan_ep="$(detect_wan_ip 2>/dev/null || true)"
+    section "Edit Endpoint"
+    echo -e "  ${A}Current:${NC} ${W}${_cur:-inherit from interface}${NC}"
+    if [ -n "$_iface_ep" ]; then
+        echo -e "  ${DIM2}Interface endpoint: ${_iface_ep}${NC}"
+    elif [ -n "$_wan_ep" ]; then
+        echo -e "  ${DIM2}Auto-detected WAN: ${_wan_ep}${NC}"
+    fi
+    echo ""
+    echo -e "  ${DIM2}Override the endpoint this peer's .conf gets. Useful when${NC}"
+    echo -e "  ${DIM2}multiple domains/IPs point to the router and you want this${NC}"
+    echo -e "  ${DIM2}specific peer to connect via a specific one.${NC}"
+    echo -e "  ${DIM2}Leave empty to inherit the interface default.${NC}"
+    echo ""
+    prompt _new_ep "Endpoint (empty = inherit, 'clear' to remove)" "$_cur" || return 0
+    sigint_caught && return 0
+    case "${_new_ep:-}" in ""|clear|CLEAR) _new_ep="" ;; esac
+    if [ "$_new_ep" = "$_cur" ]; then
+        echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0
+    fi
+    peer_set "$_pt" "$_idx" endpoint_host "$_new_ep"
+    uci commit network
+    if [ -n "$_new_ep" ]; then
+        echo -e "  ${ICO_OK} ${OK}Endpoint set to ${_new_ep}${NC}"
+    else
+        echo -e "  ${ICO_OK} ${OK}Endpoint cleared (will inherit)${NC}"
+    fi
+    echo -e "  ${WARN_C}Re-download client config to apply${NC}"
+    PAUSE
+    return 0
+}
 
-    uci set "network.@${_pt}[$_idx].private_key=$_client_priv"
-    uci set "network.@${_pt}[$_idx].public_key=$_client_pub"
+# _pm_rotate_secrets IFACE PT IDX DESC PUBKEY — rotate keypair / PSK / both.
+# Live-swaps the peer on the kernel (remove + re-add) and invalidates any
+# previously-emitted configs for this peer.
+_pm_rotate_secrets() {
+    _iface="$1"; _pt="$2"; _idx="$3"; _desc="$4"; _old_pub="$5"
+    section "Rotate Secrets"
+    echo -e "  ${A}This invalidates the current client .conf/QR/vpn://${NC}"
+    echo -e "  ${A}for '${W}${_desc}${A}'. Re-download after rotation.${NC}"
+    echo ""
+    echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Client keypair${NC}  ${DIM2}(client will need new private key)${NC}"
+    echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}PreSharedKey${NC}    ${DIM2}(extra layer, rotated independently)${NC}"
+    echo -e "  ${B}3${NC} ${DIM2}›${NC} ${W}Both${NC}             ${DIM2}(full rotation)${NC}"
+    echo -e "  ${DIM2}Enter › Cancel${NC}"
+    echo ""
+    prompt _rs_choice "Select" "" || return 0
+    sigint_caught && return 0
+    _regen_keys=0; _regen_psk=0
+    case "${_rs_choice:-}" in
+        1) _regen_keys=1 ;;
+        2) _regen_psk=1 ;;
+        3) _regen_keys=1; _regen_psk=1 ;;
+        *) return 0 ;;
+    esac
+    confirm "Proceed with rotation?" "n" || { cancelled; PAUSE; return 0; }
+
+    _new_priv=""; _new_pub=""
+    if [ "$_regen_keys" -eq 1 ]; then
+        _new_priv="$(awg genkey)" || { warn "Key generation failed"; PAUSE; return 0; }
+        _new_pub="$(printf '%s' "$_new_priv" | awg pubkey)" || { warn "pubkey derivation failed"; PAUSE; return 0; }
+        peer_set "$_pt" "$_idx" private_key "$_new_priv"
+        peer_set "$_pt" "$_idx" public_key  "$_new_pub"
+    fi
+    if [ "$_regen_psk" -eq 1 ]; then
+        _new_psk="$(awg genpsk)" || { warn "PSK generation failed"; PAUSE; return 0; }
+        peer_set "$_pt" "$_idx" preshared_key "$_new_psk"
+    fi
     uci commit network
 
-    echo -e "  ${B}Restarting${NC} AWG..."
-    ifdown "$_iface" >/dev/null 2>&1 || true
-    ifup "$_iface" >/dev/null 2>&1 || true
-
-    echo -e "\n  ${OK}Keys regenerated for '${_desc}'${NC}"
-    echo ""
-
-    # Show new config
-    _conf="$(reconstruct_peer_config "$_iface" "$_idx")"
-    if [ -n "$_conf" ]; then
-        echo -e "  ${V}── New Config ──${NC}"
-        echo ""
-        echo -e "${W}${_conf}${NC}"
-        echo ""
-
-        if have_cmd jq && have_cmd base64; then
-            _key="$(build_vpn_key "$_iface" "$_idx")"
-            echo -e "  ${A}AmneziaVPN key:${NC}"
-            echo "$_key"
-            echo ""
-        fi
-
-        if have_cmd qrencode; then
-            echo -e "  ${A}QR Code:${NC}"
-            qrencode -t ANSIUTF8 "$_conf" 2>/dev/null || true
-            echo ""
-        fi
+    # Live swap on kernel. If we changed the pubkey, we must remove the old
+    # peer (by old pubkey) and re-add; otherwise just re-add with new PSK.
+    _live_ok=0
+    _eff_pub="${_new_pub:-$_old_pub}"
+    if [ -n "$_old_pub" ]; then
+        live_peer_remove "$_iface" "$_old_pub" >/dev/null 2>&1 || true
+        live_peer_sync_from_uci "$_iface" "$_pt" "$_idx" && _live_ok=1
     fi
+    [ "$_live_ok" -eq 0 ] && restart_iface "$_iface" "Restarting AWG..."
+
+    _msg=""
+    [ "$_regen_keys" -eq 1 ] && _msg="keys"
+    [ "$_regen_psk"  -eq 1 ] && _msg="${_msg:+$_msg + }PSK"
+    echo -e "  ${ICO_OK} ${OK}Rotated ${_msg}${NC}"
+    echo -e "  ${WARN_C}Old client config is now invalid — re-download${NC}"
     PAUSE
+    PEER_NEW_PUB="${_new_pub:-$_old_pub}"
+    return 0
+}
+
+_pm_generate_config() {
+    _iface="$1"; _idx="$2"; _desc="$3"
+    crumb_push "Generate Config"
+    while true; do
+        clear
+        crumb_show
+        echo -e "${W}Generate Config${NC}  ${DIM2}·${NC}  ${W}${_desc}${NC}"
+        echo ""
+        echo -e "${DIM2}──────────────────────────────────────${NC}"
+        echo ""
+        echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}QR Code${NC}"
+        echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Download Link${NC}"
+        echo -e "  ${B}3${NC} ${DIM2}›${NC} ${W}vpn:// Key${NC}     ${DIM2}(AmneziaVPN)${NC}"
+        echo -e "  ${B}4${NC} ${DIM2}›${NC} ${W}Setup Config${NC}   ${DIM2}(plain .conf)${NC}"
+        echo -e "  ${B}5${NC} ${DIM2}›${NC} ${W}Show All${NC}       ${DIM2}(QR + link + vpn:// + conf)${NC}"
+        echo ""
+        echo -e "  ${DIM2}Enter › Back${NC}"
+        echo ""
+        echo -ne "  ${A}>${NC} " && read_choice _gc_choice
+        sigint_caught && { crumb_pop; return; }
+        case "${_gc_choice:-}" in
+            "") crumb_pop; return ;;
+            1)  show_peer_qr       "$_iface" "$_idx" ;;
+            2)  show_peer_download "$_iface" "$_idx" "$_desc" ;;
+            3)  show_peer_vpn_key  "$_iface" "$_idx" ;;
+            4)  show_peer_conf     "$_iface" "$_idx" ;;
+            5)  show_peer_all      "$_iface" "$_idx" "$_desc" ;;
+            *)  warn "Unknown option"; PAUSE ;;
+        esac
+    done
 }
 
 # ─── Peer sub-menu ────────────────────────────────────────────────
@@ -2456,15 +3299,15 @@ do_peer_menu() {
     while true; do
         clear
         crumb_show
-        _aip="$(uci -q get "network.@${_pt}[$_idx].allowed_ips" || echo "?")"
-        _pub="$(uci -q get "network.@${_pt}[$_idx].public_key" || true)"
-        _peer_disabled="$(uci -q get "network.@${_pt}[$_idx].disabled" || echo "0")"
+        _aip="$(peer_get "$_pt" "$_idx" allowed_ips "?")"
+        _pub="$(peer_get "$_pt" "$_idx" public_key)"
+        _peer_disabled="$(peer_get "$_pt" "$_idx" disabled "0")"
         [ "$_peer_disabled" != "1" ] && _peer_disabled=0
         _shortpub=""
         [ -n "$_pub" ] && _shortpub="$(printf '%s' "$_pub" | cut -c1-10)..."
 
         _hs=""; _rx=""; _tx=""; _ep=""
-        _ka="$(uci -q get "network.@${_pt}[$_idx].persistent_keepalive" || echo "0")"
+        _ka="$(peer_get "$_pt" "$_idx" persistent_keepalive "0")"
         _is_online=0; _hs_sec=9999
 
         if [ "$_peer_disabled" -eq 0 ]; then
@@ -2479,13 +3322,7 @@ do_peer_menu() {
         else
             _st_ico="${ICO_OFF}"; _online="${ERR}Offline${NC}"
             if [ -n "$_hs" ] && [ "$_hs" != "-" ] && [ "$_hs" != "never" ]; then
-                _hs_sec="$(awg show "$_iface" 2>/dev/null | awk -v pk="$_pub" '
-                    /peer:/{cur=$NF} cur==pk&&/latest handshake:/{
-                        sub(/.*latest handshake: /,"");
-                        t=0;for(i=1;i<=NF;i++){if($i~/^[0-9]+$/){n=$i;u=$(i+1);
-                            if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
-                            else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
-                        print t;exit}')"
+                _hs_sec="$(awg_peer_handshake_age "$_iface" "$_pub")"
                 if [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null; then
                     _st_ico="${ICO_ON}"; _online="${OK}Online${NC}"
                     _is_online=1
@@ -2497,36 +3334,53 @@ do_peer_menu() {
 
         detect_podkop_state "$_iface"
 
-        box_top 44
-        box_line "  ${_st_ico} ${W}${_desc}${NC}  ${_online}"
-        box_sep 44
-        box_line "  ${A}Address${NC}      ${W}${_aip}${NC}"
-        if [ "$_is_online" -eq 1 ] && [ -n "$_ep" ]; then
-            box_line "  ${A}Endpoint${NC}     ${W}${_ep}${NC}"
-        fi
-        box_line "  ${A}Handshake${NC}    ${_hs_col}"
-        if [ -n "$_rx" ] || [ -n "$_tx" ]; then
-            if [ -n "$_rx" ]; then box_line "  ${A}Rx${NC}           ${W}${_rx}${NC}"; fi
-            if [ -n "$_tx" ]; then box_line "  ${A}Tx${NC}           ${W}${_tx}${NC}"; fi
-        fi
-        box_sep 44
-        _peer_dns="$(uci -q get "network.${_iface}.dns" || echo "n/a")"
+        _hr_fqdn="$(get_peer_hostrecord_fqdn "$_iface" "$_desc" 2>/dev/null || true)"
+        _peer_dns="$(iface_get "$_iface" dns "n/a")"
         _pdns_chain="$(dns_chain_label "$_iface")"
         [ -n "$_pdns_chain" ] && _pdns_chain="  ${_pdns_chain}"
-        box_line "  ${A}DNS${NC}          ${W}${_peer_dns}${NC}${_pdns_chain}"
-        if [ -n "$_ka" ] && [ "$_ka" != "0" ]; then
-            box_line "  ${A}Keepalive${NC}    ${DIM2}every ${_ka}s${NC}"
+        # Match interface box: append LAN domain as search suffix so what
+        # the user sees here equals what goes into the client's .conf.
+        _pdns_search="$(uci -q get "dhcp.@dnsmasq[0].domain" 2>/dev/null || true)"
+        if [ -n "$_pdns_search" ] && [ "$_peer_dns" != "n/a" ]; then
+            _peer_dns_shown="${_peer_dns}, ${_pdns_search}"
         else
-            box_line "  ${A}Keepalive${NC}    ${DIM2}off${NC}"
+            _peer_dns_shown="$_peer_dns"
         fi
-        box_line "  ${A}Public Key${NC}   ${DIM2}${_shortpub}${NC}"
-        _hr_fqdn="$(get_peer_hostrecord_fqdn "$_iface" "$_desc" 2>/dev/null || true)"
+
+        box_buf_reset
+        box_buf_line "  ${_st_ico} ${W}${_desc}${NC}  ${_online}"
+
+        # Identity
+        box_buf_sep
+        box_buf_line "  ${A}Address${NC}      ${W}${_aip}${NC}"
+        box_buf_line "  ${A}Public${NC}       ${DIM2}${_shortpub}${NC}"
         if [ -n "$_hr_fqdn" ]; then
-            box_line "  ${A}Hostname${NC}     ${W}${_hr_fqdn}${NC}"
+            box_buf_line "  ${A}Hostname${NC}     ${W}${_hr_fqdn}${NC}"
         else
-            box_line "  ${A}Hostname${NC}     ${DIM2}none${NC}"
+            box_buf_line "  ${A}Hostname${NC}     ${DIM2}none${NC}"
         fi
-        box_bot 44
+
+        # Connection — only when enabled
+        if [ "$_peer_disabled" -eq 0 ]; then
+            box_buf_sep
+            box_buf_line "  ${A}Handshake${NC}    ${_hs_col}"
+            if [ "$_is_online" -eq 1 ] && [ -n "$_ep" ]; then
+                box_buf_line "  ${A}Endpoint${NC}     ${W}${_ep}${NC}"
+            fi
+            _rx_show="${_rx:-0 B}"
+            _tx_show="${_tx:-0 B}"
+            box_buf_line "  ${A}Traffic${NC}      ${DIM2}↓${NC} ${W}${_rx_show}${NC}  ${DIM2}↑${NC} ${W}${_tx_show}${NC}"
+        fi
+
+        # Client Config — inherited from the interface
+        box_buf_sep
+        box_buf_line "  ${A}DNS${NC}          ${W}${_peer_dns_shown}${NC}${_pdns_chain}"
+        if [ -n "$_ka" ] && [ "$_ka" != "0" ]; then
+            box_buf_line "  ${A}Keepalive${NC}    ${DIM2}every ${_ka}s${NC}"
+        else
+            box_buf_line "  ${A}Keepalive${NC}    ${DIM2}off${NC}"
+        fi
+        box_buf_flush 44
 
         # ── Inline DNS diagnostics (PK_* already set above) ──
         if [ -n "$_hr_fqdn" ]; then
@@ -2606,30 +3460,38 @@ do_peer_menu() {
             _peer_toggle="${ERR}Disable${NC} Peer"
         fi
 
-        echo -e "  ${DIM2}Config${NC}"
-        echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Show${NC} Setup Config"
-        echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Show${NC} Download Link"
-        echo -e "  ${B}3${NC} ${DIM2}›${NC} ${W}Show${NC} vpn:// Key"
-        echo -e "  ${B}4${NC} ${DIM2}›${NC} ${W}Show${NC} QR Code"
-        echo -e "  ${B}5${NC} ${DIM2}›${NC} ${W}Show${NC} All"
-        echo ""
+        # Column-aligned Settings — same technique as the peer list uses
+        # (ANSI cursor positioning). Value column starts at ~24.
+        _SV="\\033[26G"
+
         echo -e "  ${DIM2}Settings${NC}"
-        _cur_caip="$(uci -q get "network.@${_pt}[$_idx].client_allowed_ips" || echo "0.0.0.0/0, ::/0")"
-        echo -e "  ${B}a${NC} ${DIM2}›${NC} ${W}AllowedIPs${NC}  ${DIM2}${_cur_caip}${NC}"
-        echo -e "  ${B}k${NC} ${DIM2}›${NC} ${W}Keepalive${NC}   ${DIM2}${_ka}s${NC}"
-        if [ -n "$_hr_fqdn" ]; then
-            echo -e "  ${B}h${NC} ${DIM2}›${NC} ${W}Hostname${NC}    ${DIM2}${_hr_fqdn}${NC}"
-        else
-            echo -e "  ${B}h${NC} ${DIM2}›${NC} ${W}Hostname${NC}    ${DIM2}none${NC}"
-        fi
-        echo -e "  ${B}g${NC} ${DIM2}›${NC} ${W}Test${NC} DNS & Network"
-        if [ "$_is_online" -eq 1 ]; then
-            echo -e "  ${B}p${NC} ${DIM2}›${NC} ${W}Test${NC} Connection"
-        fi
+        _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0, ::/0")"
+        _cur_advsec="$(peer_get "$_pt" "$_idx" _liminal_advanced_security)"
+        case "${_cur_advsec:-}" in
+            on|off) _as_label="${_cur_advsec}" ;;
+            *)      _as_label="inherit" ;;
+        esac
+        _hr_disp="${_hr_fqdn:-none}"
+        _cur_pobf="$(peer_get "$_pt" "$_idx" _liminal_obfuscation)"
+        case "${_cur_pobf:-}" in
+            1) _pobf_label="on"  ;;
+            0) _pobf_label="off" ;;
+            *) _pobf_label="—"   ;;
+        esac
+        _cur_pep="$(peer_get "$_pt" "$_idx" endpoint_host)"
+        _pep_label="${_cur_pep:-inherit}"
+        echo -e "  ${B}a${NC} ${DIM2}›${NC} ${W}AllowedIPs${NC}${_SV}${DIM2}${_cur_caip}${NC}"
+        echo -e "  ${B}k${NC} ${DIM2}›${NC} ${W}Keepalive${NC}${_SV}${DIM2}${_ka}s${NC}"
+        echo -e "  ${B}s${NC} ${DIM2}›${NC} ${W}Adv. Security${NC}${_SV}${DIM2}${_as_label}${NC}"
+        echo -e "  ${B}o${NC} ${DIM2}›${NC} ${W}Obfuscation${NC}${_SV}${DIM2}${_pobf_label}  ${DIM2}(in .conf)${NC}"
+        echo -e "  ${B}e${NC} ${DIM2}›${NC} ${W}Endpoint${NC}${_SV}${DIM2}${_pep_label}${NC}"
+        echo -e "  ${B}h${NC} ${DIM2}›${NC} ${W}Hostname${NC}${_SV}${DIM2}${_hr_disp}${NC}"
+        echo -e "  ${B}g${NC} ${DIM2}›${NC} ${W}Test DNS & Network${NC}"
         echo ""
         echo -e "  ${DIM2}Actions${NC}"
+        echo -e "  ${B}c${NC} ${DIM2}›${NC} ${W}Generate Config${NC}"
         echo -e "  ${B}6${NC} ${DIM2}›${NC} ${W}Rename${NC} Peer"
-        echo -e "  ${B}7${NC} ${DIM2}›${NC} ${ERR}Regenerate${NC} Keys"
+        echo -e "  ${B}7${NC} ${DIM2}›${NC} ${WARN_C}Rotate${NC} Secrets"
         echo -e "  ${B}8${NC} ${DIM2}›${NC} ${_peer_toggle}"
         echo -e "  ${B}9${NC} ${DIM2}›${NC} ${ERR}Delete${NC} Peer"
         echo ""
@@ -2640,32 +3502,28 @@ do_peer_menu() {
         sigint_caught && { crumb_pop; return; }
 
         case "${_peer_choice:-}" in
-            1) show_peer_conf "$_iface" "$_idx" ;;
-            2) show_peer_download "$_iface" "$_idx" "$_desc" ;;
-            3) show_peer_vpn_key "$_iface" "$_idx" ;;
-            4) show_peer_qr "$_iface" "$_idx" ;;
-            5) show_peer_all "$_iface" "$_idx" "$_desc" ;;
+            c|C) _pm_generate_config "$_iface" "$_idx" "$_desc" ;;
+            o|O) _pm_toggle_obfuscation "$_iface" "$_pt" "$_idx" ;;
+            e|E) _pm_edit_endpoint      "$_iface" "$_pt" "$_idx" ;;
             6)  PEER_NEW_NAME=""
                 if do_rename_peer "$_iface" "$_idx" "$_desc"; then
                     _desc="$PEER_NEW_NAME"
                     crumb_pop; crumb_push "$_desc"
                 fi ;;
-            7) do_regen_peer "$_iface" "$_idx" "$_desc" ;;
+            7)  PEER_NEW_PUB=""
+                _pm_rotate_secrets "$_iface" "$_pt" "$_idx" "$_desc" "$_pub"
+                [ -n "$PEER_NEW_PUB" ] && _pub="$PEER_NEW_PUB" ;;
             8)  if [ "$_peer_disabled" -eq 1 ]; then
                     uci delete "network.@${_pt}[$_idx].disabled" 2>/dev/null || true
                     uci commit network
-                    spinner_start "Enabling peer..."
-                    ifdown "$_iface" >/dev/null 2>&1 || true
-                    ifup "$_iface" >/dev/null 2>&1 || true
-                    spinner_stop
+                    live_peer_sync_from_uci "$_iface" "$_pt" "$_idx" \
+                        || restart_iface "$_iface" "Enabling peer..."
                     echo -e "  ${ICO_OK} ${OK}Peer '${_desc}' enabled${NC}"
                 else
                     uci set "network.@${_pt}[$_idx].disabled=1"
                     uci commit network
-                    spinner_start "Disabling peer..."
-                    ifdown "$_iface" >/dev/null 2>&1 || true
-                    ifup "$_iface" >/dev/null 2>&1 || true
-                    spinner_stop
+                    [ -n "$_pub" ] && live_peer_remove "$_iface" "$_pub" \
+                        || restart_iface "$_iface" "Disabling peer..."
                     echo -e "  ${ICO_OK} ${OK}Peer '${_desc}' disabled${NC}"
                 fi
                 PAUSE ;;
@@ -2674,16 +3532,18 @@ do_peer_menu() {
                 remove_peer_hostrecord "$_iface" "$_desc"
                 uci delete "network.@${_pt}[$_idx]"
                 uci commit network
-                spinner_start "Restarting AWG..."
-                ifdown "$_iface" >/dev/null 2>&1 || true
-                ifup "$_iface" >/dev/null 2>&1 || true
-                spinner_stop
+                # Live-remove from kernel so active tunnels stay up
+                # (avoids ifdown/ifup which would drop this very SSH session).
+                if [ -n "$_pub" ]; then
+                    live_peer_remove "$_iface" "$_pub" \
+                        || restart_iface "$_iface" "Restarting AWG..."
+                fi
                 echo -e "  ${ICO_OK} ${OK}Peer '${_desc}' deleted${NC}"
                 PAUSE
                 crumb_pop; return ;;
             a) # Edit AllowedIPs
                 section "Edit AllowedIPs"
-                _cur_caip="$(uci -q get "network.@${_pt}[$_idx].client_allowed_ips" || echo "0.0.0.0/0, ::/0")"
+                _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0, ::/0")"
                 echo -e "  ${A}Current:${NC} ${W}${_cur_caip}${NC}"
                 echo ""
                 echo -e "  ${DIM2}Presets:${NC}"
@@ -2693,12 +3553,12 @@ do_peer_menu() {
                 echo ""
                 prompt _aip_choice "Select" "" || continue
                 sigint_caught && continue
-                [ -z "$_aip_choice" ] && { echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; continue; }
+                [ -z "$_aip_choice" ] && { cancelled; PAUSE; continue; }
                 case "$_aip_choice" in
                     1) _new_caip="0.0.0.0/0, ::/0" ;;
                     2) prompt _new_caip "AllowedIPs" "$_cur_caip" || continue
                        sigint_caught && continue
-                       [ -z "$_new_caip" ] && { echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; continue; } ;;
+                       [ -z "$_new_caip" ] && { cancelled; PAUSE; continue; } ;;
                     *) continue ;;
                 esac
                 if [ "$_new_caip" != "$_cur_caip" ]; then
@@ -2726,26 +3586,40 @@ do_peer_menu() {
                     echo -ne "  ${A}>${NC} "; read -r _h_choice || true
                     sigint_caught && continue
                     case "${_h_choice:-}" in
-                        1)  _h_domain="$(sanitize_hostname "$_iface").$(get_lan_domain)"
-                            while true; do
-                                prompt _h_new "Hostname (without .${_h_domain})" "" || break
-                                sigint_caught && break
-                                [ -z "$_h_new" ] && break
-                                _h_san="$(sanitize_hostname "$_h_new")"
-                                [ -z "$_h_san" ] && { warn "Invalid hostname"; continue; }
-                                _h_fqdn="${_h_san}.${_h_domain}"
-                                [ "$_h_fqdn" = "$_cur_hr" ] && { echo -e "  ${DIM2}No change${NC}"; break; }
-                                if hostrecord_fqdn_exists "$_h_fqdn"; then
+                        1)  _h_lan_domain="$(get_lan_domain)"
+                            _h_domain="$(sanitize_hostname "$_iface").${_h_lan_domain}"
+                            _h_auto="$(build_peer_fqdn "$_iface" "$_desc" 2>/dev/null || true)"
+                            _h_short="$(sanitize_hostname "$_desc").${_h_lan_domain}"
+                            echo ""
+                            echo -e "    ${B}1${NC} ${DIM2}›${NC} ${W}${_h_auto}${NC}"
+                            echo -e "    ${B}2${NC} ${DIM2}›${NC} ${W}${_h_short}${NC}  ${DIM2}(short, no iface suffix)${NC}"
+                            echo -e "    ${B}3${NC} ${DIM2}›${NC} ${W}Custom${NC}"
+                            echo -e "    ${DIM2}Enter › Cancel${NC}"
+                            echo ""
+                            echo -ne "  ${A}>${NC} "; read -r _h_sub || true
+                            sigint_caught && continue
+                            _h_fqdn=""
+                            case "${_h_sub:-}" in
+                                1) _h_fqdn="$_h_auto"  ;;
+                                2) _h_fqdn="$_h_short" ;;
+                                3)  prompt_custom_hostname "$_h_domain" "$_h_lan_domain" \
+                                        && _h_fqdn="$CUSTOM_HOSTNAME_RESULT" \
+                                        || _h_fqdn="" ;;
+                                *)  _h_fqdn="" ;;
+                            esac
+                            if [ -n "$_h_fqdn" ]; then
+                                if [ "$_h_fqdn" = "$_cur_hr" ]; then
+                                    echo -e "  ${DIM2}No change${NC}"
+                                elif hostrecord_fqdn_exists "$_h_fqdn"; then
                                     warn "Hostname '${_h_fqdn}' already exists"
-                                    continue
+                                else
+                                    _h_idx="$(find_hostrecord "$_iface" "$_desc")"
+                                    uci set "dhcp.@hostrecord[$_h_idx].name=${_h_fqdn}"
+                                    uci commit dhcp
+                                    svc_restart dnsmasq
+                                    echo -e "  ${ICO_OK} ${OK}Hostname changed:${NC} ${_h_fqdn}"
                                 fi
-                                _h_idx="$(find_hostrecord "$_iface" "$_desc")"
-                                uci set "dhcp.@hostrecord[$_h_idx].name=${_h_fqdn}"
-                                uci commit dhcp
-                                /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
-                                echo -e "  ${ICO_OK} ${OK}Hostname changed:${NC} ${_h_fqdn}"
-                                break
-                            done ;;
+                            fi ;;
                         2)  remove_peer_hostrecord "$_iface" "$_desc" ;;
                         *)  continue ;;
                     esac
@@ -2753,9 +3627,12 @@ do_peer_menu() {
                     echo -e "  ${A}No DNS record for this peer${NC}"
                     echo ""
                     _h_auto="$(build_peer_fqdn "$_iface" "$_desc" 2>/dev/null || true)"
-                    _h_domain="$(sanitize_hostname "$_iface").$(get_lan_domain)"
+                    _h_lan_domain="$(get_lan_domain)"
+                    _h_domain="$(sanitize_hostname "$_iface").$_h_lan_domain"
+                    _h_short="$(sanitize_hostname "$_desc").$_h_lan_domain"
                     echo -e "    ${B}1${NC} ${DIM2}›${NC} ${W}${_h_auto}${NC}"
-                    echo -e "    ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter hostname.${_h_domain})${NC}"
+                    echo -e "    ${B}2${NC} ${DIM2}›${NC} ${W}${_h_short}${NC}  ${DIM2}(short, no iface suffix)${NC}"
+                    echo -e "    ${B}3${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter hostname.${_h_domain})${NC}"
                     echo -e "    ${DIM2}Enter › Skip${NC}"
                     echo ""
                     echo -ne "  ${A}>${NC} "; read -r _h_choice || true
@@ -2763,13 +3640,11 @@ do_peer_menu() {
                     _h_fqdn=""
                     case "${_h_choice:-}" in
                         1)  _h_fqdn="$_h_auto" ;;
-                        2)  while true; do
-                                prompt _h_custom "Hostname (without .${_h_domain})" "" || break
-                                sigint_caught && break
-                                [ -z "$_h_custom" ] && break
-                                _h_san="$(sanitize_hostname "$_h_custom")"
-                                [ -z "$_h_san" ] && { warn "Invalid hostname"; continue; }
-                                _h_fqdn="${_h_san}.${_h_domain}"
+                        2)  _h_fqdn="$_h_short" ;;
+                        3)  while true; do
+                                prompt_custom_hostname "$_h_domain" "$_h_lan_domain" || { _h_fqdn=""; break; }
+                                _h_fqdn="$CUSTOM_HOSTNAME_RESULT"
+                                [ -z "$_h_fqdn" ] && break
                                 if hostrecord_fqdn_exists "$_h_fqdn"; then
                                     warn "Hostname '${_h_fqdn}' already exists"
                                     _h_fqdn=""
@@ -2792,7 +3667,7 @@ do_peer_menu() {
 
             k) # Edit Keepalive
                 section "Edit Keepalive"
-                _cur_ka="$(uci -q get "network.@${_pt}[$_idx].persistent_keepalive" || echo "$CFG_DEFAULT_KEEPALIVE")"
+                _cur_ka="$(peer_get "$_pt" "$_idx" persistent_keepalive "$CFG_DEFAULT_KEEPALIVE")"
                 echo -e "  ${A}Current:${NC} ${W}${_cur_ka}s${NC}"
                 echo -e "  ${DIM2}0 = off, 25 = recommended for NAT${NC}"
                 prompt _new_ka "Keepalive" "$_cur_ka" || continue
@@ -2802,9 +3677,8 @@ do_peer_menu() {
                     confirm "Change keepalive ${_cur_ka}s → ${_new_ka}s?" "y" || continue
                     uci set "network.@${_pt}[$_idx].persistent_keepalive=$_new_ka"
                     uci commit network
-                    echo -e "  ${B}Restarting${NC} ${_iface}..."
-                    ifdown "$_iface" >/dev/null 2>&1 || true
-                    ifup "$_iface" >/dev/null 2>&1 || true
+                    [ -n "$_pub" ] && live_peer_set_keepalive "$_iface" "$_pub" "$_new_ka" \
+                        || restart_iface "$_iface"
                     echo -e "  ${ICO_OK} ${OK}Keepalive updated to ${_new_ka}s${NC}"
                     echo -e "  ${WARN_C}Re-download client config to apply${NC}"
                 else
@@ -2812,58 +3686,48 @@ do_peer_menu() {
                 fi
                 PAUSE ;;
 
-            g|G) # Test DNS & Network Diagnostics
-                do_dns_network_test "$_iface" "${_aip%%/*}" "$_hr_fqdn" "$_is_online"
+            s|S) # Advanced Security (per-peer obfuscation toggle)
+                section "Advanced Security"
+                _cur_advsec="$(peer_get "$_pt" "$_idx" _liminal_advanced_security)"
+                echo -e "  ${A}Current:${NC} ${W}${_cur_advsec:-inherit from interface}${NC}"
+                echo ""
+                echo -e "  ${DIM2}Controls packet obfuscation for THIS peer only.${NC}"
+                echo -e "  ${DIM2}'on'  — AmneziaWG obfuscated handshake (default)${NC}"
+                echo -e "  ${DIM2}'off' — plain WireGuard (for vanilla WG clients)${NC}"
+                echo -e "  ${DIM2}'inherit' — use interface-wide setting${NC}"
+                echo ""
+                echo -e "  ${WARN_C}Note: setting is lost on ifup (reboot or iface restart).${NC}"
+                echo -e "  ${WARN_C}Liminal re-applies via 'apply_advsec_flags' after restart.${NC}"
+                echo ""
+                echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}on${NC}"
+                echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}off${NC}"
+                echo -e "  ${B}3${NC} ${DIM2}›${NC} ${W}inherit${NC} (clear override)"
+                echo -e "  ${DIM2}Enter › Cancel${NC}"
+                echo ""
+                prompt _as_choice "Select" "" || continue
+                sigint_caught && continue
+                case "${_as_choice:-}" in
+                    1) _new_advsec="on" ;;
+                    2) _new_advsec="off" ;;
+                    3) _new_advsec="" ;;
+                    *) continue ;;
+                esac
+                if [ "$_new_advsec" = "$_cur_advsec" ]; then
+                    echo -e "  ${DIM2}No change${NC}"; PAUSE; continue
+                fi
+                peer_set "$_pt" "$_idx" _liminal_advanced_security "$_new_advsec"
+                uci commit network
+                # Apply live. If clearing the override, restore to interface default ("on").
+                _apply_val="${_new_advsec:-on}"
+                if [ -n "$_pub" ]; then
+                    live_peer_set_advsec "$_iface" "$_pub" "$_apply_val" \
+                        || warn "Live apply failed; will take effect on next interface restart"
+                fi
+                echo -e "  ${ICO_OK} ${OK}Advanced Security set to ${_apply_val}${NC}"
                 PAUSE ;;
 
-            p|P) # Test Connection
-                if [ "$_is_online" -eq 0 ]; then
-                    warn "Peer is offline — no connection to test"
-                    PAUSE; continue
-                fi
-                echo ""
-                echo -e "  ${V}── Connection Test ──${NC}"
-                echo ""
-                _test_pip="${_aip%%/*}"
-                _TC="\033[36G"
-
-                # VPN tunnel ping
-                echo -ne "  ${DIM2}VPN Ping ${_test_pip}${NC}${_TC}"
-                _tp_out="$(ping -c3 -W2 "$_test_pip" 2>/dev/null)" && _tp_ok=1 || _tp_ok=0
-                if [ "$_tp_ok" -eq 1 ]; then
-                    _tp_stats="$(echo "$_tp_out" | sed -n 's|.*/\([0-9.]*\)/.*|\1|p')"
-                    if [ -n "$_tp_stats" ]; then
-                        echo -e "${ICO_OK} ${OK}Reachable${NC}  ${DIM2}avg ${_tp_stats}ms${NC}"
-                    else
-                        echo -e "${ICO_OK} ${OK}Reachable${NC}"
-                    fi
-                else
-                    echo -e "${ICO_WARN} ${WARN_C}No reply${NC}"
-                fi
-
-                # Peer endpoint UDP reachability (live endpoint from awg show)
-                if [ -n "$_ep" ] && [ "$_ep" != "(none)" ]; then
-                    _tp_ep_host="${_ep%%:*}"
-                    _tp_ep_port="${_ep##*:}"
-                    echo -ne "  ${DIM2}UDP ${_ep}${NC}${_TC}"
-                    if ( echo -n "" > /dev/udp/"$_tp_ep_host"/"$_tp_ep_port" ) 2>/dev/null; then
-                        echo -e "${ICO_OK} ${OK}Open${NC}"
-                    elif have_cmd nc && nc -uzw2 "$_tp_ep_host" "$_tp_ep_port" </dev/null >/dev/null 2>&1; then
-                        echo -e "${ICO_OK} ${OK}Open${NC}"
-                    else
-                        echo -e "${ICO_WARN} ${WARN_C}Open or filtered${NC}"
-                    fi
-                fi
-
-                # Handshake freshness (best indicator of real connectivity)
-                echo -ne "  ${DIM2}Handshake${NC}${_TC}"
-                if [ "$_hs_sec" -le 120 ] 2>/dev/null; then
-                    echo -e "${ICO_OK} ${OK}${_hs_sec}s ago${NC}"
-                else
-                    echo -e "${ICO_WARN} ${WARN_C}${_hs:--}${NC}"
-                fi
-
-                echo ""
+            g|G) # Test DNS & Network Diagnostics
+                do_dns_network_test "$_iface" "${_aip%%/*}" "$_hr_fqdn" "$_is_online"
                 PAUSE ;;
 
             "") crumb_pop; return ;;
@@ -2885,26 +3749,20 @@ do_list_peers() {
     echo ""
 
     _pi=0; _found=0
-    while uci -q get "network.@${_pt}[$_pi]" >/dev/null 2>&1; do
+    while peer_exists "$_pt" "$_pi"; do
         _found=1; _n=$((_pi + 1))
-        _desc="$(uci -q get "network.@${_pt}[$_pi].description" || echo "(unnamed)")"
-        _aip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "?")"
-        _pub="$(uci -q get "network.@${_pt}[$_pi].public_key" || true)"
+        _desc="$(peer_get "$_pt" "$_pi" description "(unnamed)")"
+        _aip="$(peer_get "$_pt" "$_pi" allowed_ips "?")"
+        _pub="$(peer_get "$_pt" "$_pi" public_key)"
 
-        _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
+        _pdis="$(peer_get "$_pt" "$_pi" disabled "0")"
         if [ "$_pdis" = "1" ]; then
-            echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${ICO_DIS} ${DIM}${_desc}${NC}  ${DIM}${_aip}${NC}"
+            echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${ICO_DIS} ${DIM2}${_desc}${NC}  ${DIM2}${_aip}${NC}"
         else
             _hs="$(get_peer_handshake "$_iface" "$_pub")"
             _hs_sec=9999
             if [ -n "$_hs" ] && [ "$_hs" != "-" ] && [ "$_hs" != "never" ]; then
-                _hs_sec="$(awg show "$_iface" 2>/dev/null | awk -v pk="$_pub" '
-                    /peer:/{cur=$NF} cur==pk&&/latest handshake:/{
-                        sub(/.*latest handshake: /,"");t=0;
-                        for(i=1;i<=NF;i++){if($i~/^[0-9]+$/){n=$i;u=$(i+1);
-                            if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
-                            else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
-                        print t;exit}' 2>/dev/null)"
+                _hs_sec="$(awg_peer_handshake_age "$_iface" "$_pub")"
                 if [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null; then
                     echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${ICO_ON} ${W}${_desc}${NC}  ${DIM2}${_aip}${NC}"
                 else
@@ -2931,7 +3789,7 @@ do_list_peers() {
     [ -z "${_peer_sel:-}" ] && return
 
     _sel_idx=$((_peer_sel - 1))
-    _sel_desc="$(uci -q get "network.@${_pt}[$_sel_idx].description" 2>/dev/null || true)"
+    _sel_desc="$(peer_get "$_pt" "$_sel_idx" description)"
     if [ -z "$_sel_desc" ]; then
         warn "Invalid selection"
         PAUSE
@@ -2967,15 +3825,13 @@ do_add_peer() {
     done
     trap_restore
 
-    # Get interface params
-    _addr="$(uci -q get "network.${_iface}.addresses" || true)"
+    _addr="$(iface_get "$_iface" addresses)"
     [ -z "$_addr" ] && { die "Cannot read interface address for $_iface"; }
     _prefix="$(get_ip_prefix "$_addr")"
     _iface_subnet="$(network_base_from_cidr "$_addr")"
 
     _peer_ip="$(pick_free_ip "$_iface" "$_prefix")"
 
-    # Validate peer IP belongs to interface subnet
     _peer_ip_bare="${_peer_ip%/*}"
     if ! cidr_contains_ip "$_iface_subnet" "$_peer_ip_bare"; then
         die "Generated peer IP $_peer_ip is outside interface subnet $_iface_subnet"
@@ -2985,7 +3841,7 @@ do_add_peer() {
     # ── Connection ───────────────────────────────────────────────────
     section "Connection"
 
-    _ep_iface="$(uci -q get "network.${_iface}.endpoint_host" || true)"
+    _ep_iface="$(iface_get "$_iface" endpoint_host)"
     _ep_wan="$(detect_wan_ip || true)"
 
     echo -e "  ${A}Endpoint for client config:${NC}"
@@ -3009,6 +3865,10 @@ do_add_peer() {
     echo ""
     _ep_max="$_ep_n"
 
+    # _peer_endpoint_override: only non-empty if user picked Custom — that's
+    # the one case where we want the choice to persist per-peer (options 1/2
+    # are just "inherit from iface" which is the default anyway).
+    _peer_endpoint_override=""
     while true; do
         echo -ne "  ${A}>${NC} "; read -r _ep_choice || true
         sigint_caught && return
@@ -3023,6 +3883,7 @@ do_add_peer() {
             prompt _endpoint_host "Endpoint address" "" || return
             sigint_caught && return
             [ -z "$_endpoint_host" ] && { warn "Required field"; continue; }
+            _peer_endpoint_override="$_endpoint_host"
             break
         fi
         # Pick from list
@@ -3035,11 +3896,11 @@ do_add_peer() {
     done
     echo -e "  ${ICO_OK} ${OK}Endpoint:${NC} ${W}$_endpoint_host${NC}"
 
-    _port="$(uci -q get "network.${_iface}.listen_port" || echo "$CFG_DEFAULT_PORT")"
-    _dns="$(uci -q get "network.${_iface}.dns" || true)"
+    _port="$(iface_get "$_iface" listen_port "$CFG_DEFAULT_PORT")"
+    _dns="$(iface_get "$_iface" dns)"
     [ -z "$_dns" ] && _dns="$(detect_router_lan_ip || echo "$CFG_DEFAULT_DNS")"
     _keepalive="$CFG_DEFAULT_KEEPALIVE"
-    _mtu="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
+    _mtu="$(iface_get "$_iface" mtu "$CFG_DEFAULT_MTU")"
 
     echo -e "  ${ICO_OK} ${OK}DNS:${NC} ${W}$_dns${NC}"
     echo -e "  ${ICO_OK} ${OK}MTU:${NC} ${W}$_mtu${NC}"
@@ -3048,15 +3909,19 @@ do_add_peer() {
     section "Routing"
 
     _vpn_zone="$(find_zone_for_interface "$_iface" 2>/dev/null || true)"
+    _ap_lan_zone="$(iface_lan_zone "$_iface")"
+    _ap_wan_zone="$(iface_wan_zone "$_iface")"
     _has_wan_fwd=0; _has_lan_fwd=0
     if [ -n "$_vpn_zone" ]; then
-        forwarding_exists "$_vpn_zone" "wan" && _has_wan_fwd=1
-        forwarding_exists "$_vpn_zone" "lan" && _has_lan_fwd=1
+        forwarding_exists "$_vpn_zone" "$_ap_wan_zone" && _has_wan_fwd=1
+        forwarding_exists "$_vpn_zone" "$_ap_lan_zone" && _has_lan_fwd=1
     fi
 
-    _wan_proto="$(uci -q get "network.wan.proto" || true)"
-    _lan_proto="$(uci -q get "network.lan.proto" || true)"
-    [ -z "$_wan_proto" ] && _has_wan_fwd=0
+    # Check the underlying network interface(s) attached to each zone still exist.
+    _ap_lan_iface="$(detect_lan_netiface)"
+    _lan_proto="$(uci -q get "network.${_ap_lan_iface}.proto" 2>/dev/null || true)"
+    # WAN interface name varies (wan / wan6 / wan_wwan) — just check the zone.
+    zone_exists "$_ap_wan_zone" || _has_wan_fwd=0
     [ -z "$_lan_proto" ] && _has_lan_fwd=0
 
     if [ "$_has_wan_fwd" = "0" ] && [ "$_has_lan_fwd" = "0" ]; then
@@ -3104,10 +3969,33 @@ do_add_peer() {
     _client_pub="$(printf '%s' "$_client_priv" | awg pubkey)" \
         || die "Public key derivation failed"
 
-    _server_priv="$(uci -q get "network.${_iface}.private_key" || true)"
+    _server_priv="$(iface_get "$_iface" private_key)"
     [ -z "$_server_priv" ] && die "Missing interface private key"
     _server_pub="$(printf '%s' "$_server_priv" | awg pubkey)"
     echo -e "  ${ICO_OK} ${OK}Keys:${NC} generated"
+
+    # ── Obfuscation ──────────────────────────────────────────────────
+    _iface_has_obf=0
+    [ -n "$(iface_get "$_iface" awg_jc)" ] && _iface_has_obf=1
+
+    section "Obfuscation"
+
+    if [ "$_iface_has_obf" -eq 1 ]; then
+        echo -e "  ${DIM2}Server has AmneziaWG obfuscation enabled.${NC}"
+        echo -e "  ${DIM2}Include obfuscation params (Jc/Jmin/Jmax/S1/S2/H1-H4/I1)${NC}"
+        echo -e "  ${DIM2}in the peer .conf for AmneziaWG-aware clients.${NC}"
+        _obf_default="y"
+    else
+        echo -e "  ${DIM2}Server has no obfuscation configured.${NC}"
+        echo -e "  ${DIM2}Plain WireGuard clients will connect normally.${NC}"
+        _obf_default="n"
+    fi
+    echo ""
+    if confirm "Enable obfuscation in peer config?" "$_obf_default"; then
+        _peer_obf=1
+    else
+        _peer_obf=0
+    fi
 
     # ── Summary ──────────────────────────────────────────────────────
     section "Summary"
@@ -3119,9 +4007,10 @@ do_add_peer() {
     echo -e "  ${A}MTU${NC}          ${W}$_mtu${NC}"
     echo -e "  ${A}AllowedIPs${NC}   ${W}$_client_allowed_ips${NC}"
     echo -e "  ${A}PSK${NC}          ${W}yes${NC}"
+    echo -e "  ${A}Obfuscation${NC}  $( [ "$_peer_obf" = "1" ] && echo -e "${OK}enabled${NC}" || echo -e "${DIM2}disabled${NC}" )"
     echo ""
 
-    confirm "Create peer?" "y" || { echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; return 0; }
+    confirm "Create peer?" "y" || { cancelled; PAUSE; return 0; }
 
     echo -e "  ${B}Adding${NC} peer ${W}$PEER_NAME${NC}..."
     _sec="$(uci add network "$_pt")"
@@ -3133,51 +4022,40 @@ do_add_peer() {
     uci set "network.${_sec}.description=$PEER_NAME"
     [ -n "$_psk" ] && uci set "network.${_sec}.preshared_key=$_psk"
     uci set "network.${_sec}.client_allowed_ips=$_client_allowed_ips"
+    uci set "network.${_sec}._liminal_obfuscation=$_peer_obf"
+    # Only persist endpoint override if the user explicitly chose Custom;
+    # Interface/WAN selections inherit via _resolve_endpoint_host at render.
+    [ -n "$_peer_endpoint_override" ] && \
+        uci set "network.${_sec}.endpoint_host=$_peer_endpoint_override"
 
     uci commit network
 
-    # Build client config
-    _conf="[Interface]
-PrivateKey = $_client_priv
-Address = $_peer_ip
-DNS = $_dns
-MTU = $_mtu
-
-[Peer]
-PublicKey = $_server_pub
-AllowedIPs = $_client_allowed_ips
-Endpoint = ${_endpoint_host}:${_port}
-PersistentKeepAlive = $_keepalive"
-    [ -n "$_psk" ] && _conf="${_conf}
-PresharedKey = $_psk"
-
     echo ""
     echo -e "  ${ICO_OK} ${OK}Peer '${PEER_NAME}' created${NC}"
-    echo -e "  ${B}Restarting${NC} ${_iface}..."
-    ifdown "$_iface" >/dev/null 2>&1 || true
-    ifup "$_iface" >/dev/null 2>&1 || true
-    echo -e "  ${ICO_OK} ${OK}Done${NC}"
 
-    # Offer DNS hostrecord
+    # Offer DNS hostrecord BEFORE restart_iface — if the user is SSH'd over
+    # this same VPN, the iface restart drops the connection, killing any
+    # interactive prompt that follows.
     _hr_auto="$(build_peer_fqdn "$_iface" "$PEER_NAME" 2>/dev/null || true)"
     if [ -n "$_hr_auto" ]; then
-        _hr_domain="$(sanitize_hostname "$_iface").$(get_lan_domain)"
+        _hr_lan_domain="$(get_lan_domain)"
+        _hr_domain="$(sanitize_hostname "$_iface").$_hr_lan_domain"
+        _hr_short="$(sanitize_hostname "$PEER_NAME").$_hr_lan_domain"
         section "Local DNS"
         echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}${_hr_auto}${NC}"
-        echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter hostname.${_hr_domain})${NC}"
+        echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}${_hr_short}${NC}  ${DIM2}(short, no iface suffix)${NC}"
+        echo -e "  ${B}3${NC} ${DIM2}›${NC} ${W}Custom${NC}  ${DIM2}(enter hostname.${_hr_domain})${NC}"
         echo -e "  ${DIM2}Enter › Skip${NC}"
         echo ""
         echo -ne "  ${A}>${NC} "; read -r _hr_choice || true
         sigint_caught && _hr_choice=""
         case "${_hr_choice:-}" in
             1)  _hr_fqdn="$_hr_auto" ;;
-            2)  while true; do
-                    prompt _hr_custom "Hostname (without .${_hr_domain})" "" || { _hr_fqdn=""; break; }
-                    sigint_caught && { _hr_fqdn=""; break; }
-                    [ -z "$_hr_custom" ] && { _hr_fqdn=""; break; }
-                    _hr_san="$(sanitize_hostname "$_hr_custom")"
-                    [ -z "$_hr_san" ] && { warn "Invalid hostname"; continue; }
-                    _hr_fqdn="${_hr_san}.${_hr_domain}"
+            2)  _hr_fqdn="$_hr_short" ;;
+            3)  while true; do
+                    prompt_custom_hostname "$_hr_domain" "$_hr_lan_domain" || { _hr_fqdn=""; break; }
+                    _hr_fqdn="$CUSTOM_HOSTNAME_RESULT"
+                    [ -z "$_hr_fqdn" ] && break
                     if hostrecord_fqdn_exists "$_hr_fqdn"; then
                         warn "Hostname '${_hr_fqdn}' already exists"
                         continue
@@ -3196,12 +4074,23 @@ PresharedKey = $_psk"
         fi
     fi
 
+    # Apply the peer to the running kernel live — no ifdown/ifup means the VPN
+    # session this script is running over stays up. UCI is already committed
+    # so netifd will rebuild the same state on next reboot.
+    if live_peer_add "$_iface" "$_client_pub" "$_peer_ip" "" "$_psk" "$_keepalive"; then
+        echo -e "  ${ICO_OK} ${OK}Peer active${NC}"
+    else
+        warn "Live peer add failed — restarting interface as fallback"
+        restart_iface "$_iface"
+    fi
+    echo -e "  ${ICO_OK} ${OK}Done${NC}"
+
     PAUSE
 
     # Find index of newly created peer for navigation
     _new_idx=0
-    while uci -q get "network.@${_pt}[$_new_idx]" >/dev/null 2>&1; do
-        _nd="$(uci -q get "network.@${_pt}[$_new_idx].description" || true)"
+    while peer_exists "$_pt" "$_new_idx"; do
+        _nd="$(peer_get "$_pt" "$_new_idx" description)"
         if [ "$_nd" = "$PEER_NAME" ]; then
             CREATED_PEER_IDX="$_new_idx"
             CREATED_PEER_NAME="$PEER_NAME"
@@ -3209,6 +4098,654 @@ PresharedKey = $_psk"
         fi
         _new_idx=$((_new_idx + 1))
     done
+}
+
+# _apply_obfuscation IFACE — generate random AmneziaWG params and write to UCI.
+_apply_obfuscation() {
+    _if="$1"
+    _obf="$(generate_awg_obfuscation)"
+    iface_set "$_if" "awg_jc"   "$(printf '%s\n' "$_obf" | sed -n '1p')"
+    iface_set "$_if" "awg_jmin" "$(printf '%s\n' "$_obf" | sed -n '2p')"
+    iface_set "$_if" "awg_jmax" "$(printf '%s\n' "$_obf" | sed -n '3p')"
+    iface_set "$_if" "awg_s1"   "$(printf '%s\n' "$_obf" | sed -n '4p')"
+    iface_set "$_if" "awg_s2"   "$(printf '%s\n' "$_obf" | sed -n '5p')"
+    iface_set "$_if" "awg_s3"   "$(printf '%s\n' "$_obf" | sed -n '6p')"
+    iface_set "$_if" "awg_s4"   "$(printf '%s\n' "$_obf" | sed -n '7p')"
+    iface_set "$_if" "awg_h1"   "$(printf '%s\n' "$_obf" | sed -n '8p')"
+    iface_set "$_if" "awg_h2"   "$(printf '%s\n' "$_obf" | sed -n '9p')"
+    iface_set "$_if" "awg_h3"   "$(printf '%s\n' "$_obf" | sed -n '10p')"
+    iface_set "$_if" "awg_h4"   "$(printf '%s\n' "$_obf" | sed -n '11p')"
+    return 0
+}
+
+# _remove_obfuscation IFACE — delete all AmneziaWG obfuscation UCI keys.
+_remove_obfuscation() {
+    for _k in awg_jc awg_jmin awg_jmax awg_s1 awg_s2 awg_s3 awg_s4 \
+              awg_h1 awg_h2 awg_h3 awg_h4 \
+              awg_i1 awg_i2 awg_i3 awg_i4 awg_i5; do
+        uci -q delete "network.$1.$_k" 2>/dev/null || true
+    done
+    return 0
+}
+
+# _show_obfuscation_summary IFACE — print current obf params (expects params set)
+_show_obfuscation_summary() {
+    _if="$1"
+    _s3="$(iface_get "$_if" "awg_s3")"
+    _s4="$(iface_get "$_if" "awg_s4")"
+    echo -e "  ${A}Jc${NC}   ${W}$(iface_get "$_if" "awg_jc"   "?")${NC}   ${A}Jmin${NC} ${W}$(iface_get "$_if" "awg_jmin" "?")${NC}   ${A}Jmax${NC} ${W}$(iface_get "$_if" "awg_jmax" "?")${NC}"
+    echo -e "  ${A}S1${NC}   ${W}$(iface_get "$_if" "awg_s1"   "?")${NC}   ${A}S2${NC}   ${W}$(iface_get "$_if" "awg_s2"   "?")${NC}"
+    if [ -n "$_s3" ] || [ -n "$_s4" ]; then
+        echo -e "  ${A}S3${NC}   ${W}${_s3:-?}${NC}   ${A}S4${NC}   ${W}${_s4:-?}${NC}  ${DIM2}(AWG 2.0)${NC}"
+    fi
+    echo -e "  ${A}H1${NC}   ${DIM2}$(iface_get "$_if" "awg_h1" "?")${NC}"
+    echo -e "  ${A}H2${NC}   ${DIM2}$(iface_get "$_if" "awg_h2" "?")${NC}"
+    echo -e "  ${A}H3${NC}   ${DIM2}$(iface_get "$_if" "awg_h3" "?")${NC}"
+    echo -e "  ${A}H4${NC}   ${DIM2}$(iface_get "$_if" "awg_h4" "?")${NC}"
+}
+
+# _mi_obfuscation IFACE — Settings → Obfuscation menu branch handler.
+_mi_obfuscation() {
+    _iface="$1"
+    _cur_jc="$(iface_get "$_iface" "awg_jc")"
+    section "Obfuscation"
+    if [ -n "$_cur_jc" ]; then
+        _show_obfuscation_summary "$_iface"
+        echo ""
+        echo -e "  ${B}r${NC} ${DIM2}›${NC} ${WARN_C}Regenerate${NC} (rotate all params)"
+        echo -e "  ${B}d${NC} ${DIM2}›${NC} ${ERR}Remove${NC} Obfuscation"
+        echo ""
+        echo -e "  ${DIM2}Enter › Back${NC}"
+        echo ""
+        echo -ne "  ${A}>${NC} "; read -r _obf_choice || true
+        sigint_caught && return 0
+        case "${_obf_choice:-}" in
+            r|R)
+                echo ""
+                echo -e "  ${WARN_C}All peer .conf files with obfuscation enabled${NC}"
+                echo -e "  ${WARN_C}will stop working until clients re-download configs.${NC}"
+                echo ""
+                confirm "Regenerate obfuscation params?" "n" || { cancelled; PAUSE; return 0; }
+                _apply_obfuscation "$_iface"
+                uci commit network
+                live_iface_set_obf "$_iface" || restart_iface "$_iface"
+                echo -e "  ${ICO_OK} ${OK}Obfuscation rotated${NC}"
+                echo -e "  ${WARN_C}Re-download all peer configs${NC}"
+                PAUSE
+                ;;
+            d|D)
+                echo ""
+                echo -e "  ${WARN_C}Peers with obfuscation flag will stop connecting${NC}"
+                echo -e "  ${WARN_C}until clients re-download plain configs.${NC}"
+                echo ""
+                confirm "Remove obfuscation from interface?" "n" || { cancelled; PAUSE; return 0; }
+                _remove_obfuscation "$_iface"
+                uci commit network
+                live_iface_clear_obf "$_iface" || restart_iface "$_iface"
+                echo -e "  ${ICO_OK} ${OK}Obfuscation removed${NC}"
+                echo -e "  ${WARN_C}Re-download peer configs (plain WG mode)${NC}"
+                PAUSE
+                ;;
+            *) ;;
+        esac
+    else
+        echo -e "  ${DIM2}Not configured — plain WireGuard on the wire.${NC}"
+        echo -e "  ${DIM2}Setup will generate random AmneziaWG params:${NC}"
+        echo -e "  ${DIM2}  Jc/Jmin/Jmax, S1/S2, H1-H4 (I1 left default).${NC}"
+        echo ""
+        confirm "Setup obfuscation now?" "y" || { cancelled; PAUSE; return 0; }
+        _apply_obfuscation "$_iface"
+        echo ""
+        _show_obfuscation_summary "$_iface"
+        echo ""
+        confirm "Apply?" "y" || { uci revert network 2>/dev/null; cancelled; PAUSE; return 0; }
+        uci commit network
+        live_iface_set_obf "$_iface" || restart_iface "$_iface"
+        echo -e "  ${ICO_OK} ${OK}Obfuscation enabled${NC}"
+        echo -e "  ${WARN_C}Existing peers need obfuscation flag set${NC}"
+        echo -e "  ${WARN_C}to receive matching client configs.${NC}"
+        PAUSE
+    fi
+    return 0
+}
+
+# _mi_show_pubkey IFACE — print the interface's derived public key.
+_mi_show_pubkey() {
+    _iface="$1"
+    _srv_priv="$(iface_get "$_iface" private_key)"
+    _srv_pub=""
+    [ -n "$_srv_priv" ] && have_cmd awg && \
+        _srv_pub="$(printf '%s' "$_srv_priv" | awg pubkey 2>/dev/null || true)"
+    echo ""
+    if [ -n "$_srv_pub" ]; then
+        echo -e "  ${A}Public Key:${NC}"
+        echo "  $_srv_pub"
+    else
+        echo -e "  ${DIM2}Could not derive public key${NC}"
+    fi
+    PAUSE
+}
+
+# _mi_show_live_conf IFACE — dump running kernel state via `awg showconf`.
+_mi_show_live_conf() {
+    _iface="$1"
+    echo ""
+    echo -e "  ${V}── Live kernel config ──${NC}"
+    echo ""
+    if ! interface_device_exists "$_iface"; then
+        echo -e "  ${DIM2}Interface is down — nothing to show.${NC}"
+    else
+        _live_conf="$(awg showconf "$_iface" 2>&1)"
+        if [ -n "$_live_conf" ]; then
+            echo -e "${W}${_live_conf}${NC}"
+        else
+            echo -e "  ${DIM2}(empty — no peers / kernel state not available)${NC}"
+        fi
+    fi
+    echo ""
+    echo -e "  ${DIM2}This is what the kernel sees right now; UCI is what survives reboot.${NC}"
+    PAUSE
+}
+
+# _mi_toggle_podkop IFACE — link/unlink the interface in podkop sources.
+_mi_toggle_podkop() {
+    _iface="$1"
+    podkop_present || { warn "Podkop is not installed"; PAUSE; return 0; }
+    if podkop_has_interface "$_iface" 2>/dev/null; then
+        remove_podkop_interface "$_iface"
+        svc_restart podkop
+        echo -e "  ${ICO_OK} ${OK}Podkop unlinked${NC}"
+    else
+        add_podkop_interface "$_iface"
+        svc_restart podkop
+        echo -e "  ${ICO_OK} ${OK}Podkop linked${NC}"
+    fi
+    podkop_refresh
+    PAUSE
+    return 0
+}
+
+# _mi_toggle_forwarding IFACE ZONE DEST ENABLED — flip forwarding ZONE→DEST.
+# When enabling a WAN-like destination, also turns on masquerading there.
+_mi_toggle_forwarding() {
+    _iface="$1"; _zone="$2"; _dest="$3"; _enabled="$4"
+    if [ "$_enabled" -eq 1 ]; then
+        _fi=0
+        while uci -q get "firewall.@forwarding[$_fi]" >/dev/null 2>&1; do
+            _fsrc="$(uci -q get "firewall.@forwarding[$_fi].src"  2>/dev/null || true)"
+            _fdst="$(uci -q get "firewall.@forwarding[$_fi].dest" 2>/dev/null || true)"
+            _fl="$(uci   -q get "firewall.@forwarding[$_fi]._liminal_iface" 2>/dev/null || true)"
+            if [ "$_fl" = "$_iface" ] && [ "$_fsrc" = "$_zone" ] && [ "$_fdst" = "$_dest" ]; then
+                uci delete "firewall.@forwarding[$_fi]"
+                break
+            fi
+            _fi=$((_fi + 1))
+        done
+        uci commit firewall
+        svc_restart firewall
+        echo -e "  ${ICO_OK} ${OK}Forwarding to '${_dest}' disabled${NC}"
+    else
+        _fwd_idx="$(fw_new_forwarding)"
+        uci set "firewall.@forwarding[$_fwd_idx].src=${_zone}"
+        uci set "firewall.@forwarding[$_fwd_idx].dest=${_dest}"
+        uci set "firewall.@forwarding[$_fwd_idx]._liminal_iface=${_iface}"
+        uci commit firewall
+        [ "$_dest" = "$(iface_wan_zone "$_iface")" ] && ensure_wan_masq "$_dest"
+        svc_restart firewall
+        echo -e "  ${ICO_OK} ${OK}Forwarding to '${_dest}' enabled${NC}"
+    fi
+    PAUSE
+    return 0
+}
+
+# _mi_change_port IFACE — Settings → Change Port menu branch.
+_mi_change_port() {
+    _iface="$1"
+    section "Change Port"
+    _cur_port="$(iface_get "$_iface" listen_port)"
+    echo -e "  ${WARN_C}All existing peer configs will need to be updated${NC}"
+    echo -e "  ${WARN_C}with the new port after this change.${NC}"
+    echo ""
+    prompt _new_port "New port" "$_cur_port" || return 0
+    sigint_caught && return 0
+    [ "$_new_port" = "$_cur_port" ] && { echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0; }
+    validate_port "$_new_port" || { PAUSE; return 0; }
+    port_in_use "$_new_port" && { warn "Port $_new_port is already in use"; PAUSE; return 0; }
+    confirm "Change port ${_cur_port} → ${_new_port}?" "n" || return 0
+
+    autobackup_enabled && init_backup "Port Change"
+    iface_set "$_iface" listen_port "$_new_port"
+
+    _ri=0
+    while uci -q get "firewall.@rule[$_ri]" >/dev/null 2>&1; do
+        _rl="$(uci -q get "firewall.@rule[$_ri]._liminal_iface" || true)"
+        if [ "$_rl" = "$_iface" ]; then
+            uci set "firewall.@rule[$_ri].dest_port=$_new_port"
+            echo -e "  ${B}Updated${NC} FW rule port"
+        fi
+        _ri=$((_ri + 1))
+    done
+
+    uci commit network
+    uci commit firewall
+    # Live kernel update (no ifdown) + firewall reload for the rule change.
+    live_iface_set_port "$_iface" "$_new_port" || restart_iface "$_iface"
+    svc_restart firewall
+    echo -e "  ${ICO_OK} ${OK}Port changed to ${_new_port}${NC}"
+    echo -e "  ${WARN_C}Update all peer configs with new port${NC}"
+    PAUSE
+    return 0
+}
+
+# _mi_edit_endpoint IFACE — Settings → Endpoint menu branch.
+# _mi_edit_fwmark IFACE — Settings → Edit fwmark (policy-based routing mark).
+_mi_edit_fwmark() {
+    _iface="$1"
+    section "Edit fwmark"
+    _cur_fwmark="$(iface_get "$_iface" fwmark)"
+    echo -e "  ${A}Current:${NC} ${W}${_cur_fwmark:-off}${NC}"
+    echo ""
+    echo -e "  ${DIM2}Tags outbound packets with a firewall mark for PBR / kill-switch.${NC}"
+    echo -e "  ${DIM2}Accepts decimal (123) or hex (0x7b). Empty or 'off' disables.${NC}"
+    echo ""
+    prompt _new_fwmark "fwmark" "${_cur_fwmark:-off}" || return 0
+    sigint_caught && return 0
+    # Normalize: "off"/empty means unset
+    case "${_new_fwmark:-}" in ""|off|OFF) _new_fwmark="" ;; esac
+    if [ "$_new_fwmark" = "$_cur_fwmark" ]; then
+        echo -e "  ${DIM2}No change${NC}"
+        PAUSE; return 0
+    fi
+    validate_fwmark "$_new_fwmark" || { PAUSE; return 0; }
+    iface_set "$_iface" fwmark "$_new_fwmark"
+    uci commit network
+    live_iface_set_fwmark "$_iface" "${_new_fwmark:-0}" || restart_iface "$_iface"
+    echo -e "  ${ICO_OK} ${OK}fwmark ${_new_fwmark:-off}${NC}"
+    PAUSE
+    return 0
+}
+
+# detect_upstream_mtu [TARGET_IP] — echo the MTU of the route to TARGET_IP
+# (default 1.1.1.1). Falls back to 1500 if `ip route get` gives nothing.
+detect_upstream_mtu() {
+    _target="${1:-1.1.1.1}"
+    _mtu="$(ip -o route get "$_target" 2>/dev/null | sed -n 's/.*mtu \([0-9]\+\).*/\1/p' | head -n1)"
+    [ -z "$_mtu" ] && _mtu=1500
+    echo "$_mtu"
+}
+
+# recommend_mtu [TARGET_IP] — upstream_mtu minus 80 (AWG/WG tunnel overhead).
+recommend_mtu() {
+    _up="$(detect_upstream_mtu "${1:-}")"
+    _rec=$((_up - 80))
+    [ "$_rec" -lt 576 ] && _rec=1280  # sanity floor
+    echo "$_rec"
+}
+
+# _mi_edit_tunlink IFACE — Settings → tunlink. Pins tunnel to upstream iface.
+_mi_edit_tunlink() {
+    _iface="$1"
+    section "tunlink"
+    _cur="$(iface_get "$_iface" tunlink)"
+    echo -e "  ${A}Current:${NC} ${W}${_cur:-auto}${NC}"
+    echo ""
+    echo -e "  ${DIM2}Binds the tunnel to a specific upstream interface${NC}"
+    echo -e "  ${DIM2}(e.g. 'wan' or 'wan6'). Useful for multi-WAN where you${NC}"
+    echo -e "  ${DIM2}want the VPN to exit via a specific provider.${NC}"
+    echo -e "  ${DIM2}Leave empty to auto-pick via the routing table.${NC}"
+    echo ""
+    prompt _new_tl "tunlink (empty = auto)" "$_cur" || return 0
+    sigint_caught && return 0
+    [ "$_new_tl" = "$_cur" ] && { echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0; }
+    iface_set "$_iface" tunlink "$_new_tl"
+    uci commit network
+    echo -e "  ${ICO_OK} ${OK}tunlink set to ${_new_tl:-auto}${NC}"
+    echo -e "  ${WARN_C}Run 'Restart Interface' to apply${NC}"
+    PAUSE
+    return 0
+}
+
+# _mi_edit_nohostroute IFACE — toggle nohostroute. On is needed only when
+# the endpoint is reached through another tunnel (cascaded VPNs).
+_mi_edit_nohostroute() {
+    _iface="$1"
+    _cur="$(iface_get "$_iface" nohostroute)"
+    section "nohostroute"
+    case "$_cur" in
+        1|on|true) _label="on" ;;
+        *)         _label="off" ;;
+    esac
+    echo -e "  ${A}Current:${NC} ${W}${_label}${NC}"
+    echo ""
+    echo -e "  ${DIM2}Off (default) — netifd pins a host route to the endpoint IP,${NC}"
+    echo -e "  ${DIM2}               preventing a routing loop through the tunnel.${NC}"
+    echo -e "  ${DIM2}On            — skip the host route. Required when the endpoint${NC}"
+    echo -e "  ${DIM2}               is itself reached via another VPN/tunnel.${NC}"
+    echo ""
+    if [ "$_label" = "on" ]; then
+        confirm "Turn nohostroute OFF (restore default)?" "y" || return 0
+        iface_set "$_iface" nohostroute ""
+    else
+        confirm "Turn nohostroute ON?" "n" || return 0
+        iface_set "$_iface" nohostroute "1"
+    fi
+    uci commit network
+    echo -e "  ${ICO_OK} ${OK}nohostroute toggled${NC}"
+    echo -e "  ${WARN_C}Run 'Restart Interface' to apply${NC}"
+    PAUSE
+    return 0
+}
+
+# _mi_edit_ip6prefix IFACE — set ip6prefix for IPv6 prefix delegation.
+_mi_edit_ip6prefix() {
+    _iface="$1"
+    section "IPv6 Prefix"
+    _cur="$(iface_get "$_iface" ip6prefix)"
+    echo -e "  ${A}Current:${NC} ${W}${_cur:-none}${NC}"
+    echo ""
+    echo -e "  ${DIM2}IPv6 prefix advertised via this tunnel (ip6prefix in UCI).${NC}"
+    echo -e "  ${DIM2}Format: 'fd12:3456:789a::/48' — niche; leave empty if unsure.${NC}"
+    echo ""
+    prompt _new_p6 "ip6prefix (empty = none)" "$_cur" || return 0
+    sigint_caught && return 0
+    [ "$_new_p6" = "$_cur" ] && { echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0; }
+    iface_set "$_iface" ip6prefix "$_new_p6"
+    uci commit network
+    echo -e "  ${ICO_OK} ${OK}ip6prefix set to ${_new_p6:-none}${NC}"
+    echo -e "  ${WARN_C}Run 'Restart Interface' to apply${NC}"
+    PAUSE
+    return 0
+}
+
+# _mi_edit_route_table IFACE — set ip4table for policy-based routing.
+_mi_edit_route_table() {
+    _iface="$1"
+    section "Routing Table"
+    _cur="$(iface_get "$_iface" ip4table)"
+    echo -e "  ${A}Current ip4table:${NC} ${W}${_cur:-main}${NC}"
+    echo ""
+    echo -e "  ${DIM2}Installs IPv4 routes into a custom table instead of 'main'.${NC}"
+    echo -e "  ${DIM2}Enter a table number (1-252), a name from /etc/iproute2/rt_tables,${NC}"
+    echo -e "  ${DIM2}or leave empty / 'main' to reset to default.${NC}"
+    echo -e "  ${DIM2}Applied on next ifup — use 'Restart Interface' after.${NC}"
+    echo ""
+    prompt _new_tab "ip4table" "${_cur:-main}" || return 0
+    sigint_caught && return 0
+    case "${_new_tab:-}" in ""|main) _new_tab="" ;; esac
+    if [ "$_new_tab" = "$_cur" ]; then
+        echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0
+    fi
+    iface_set "$_iface" ip4table "$_new_tab"
+    uci commit network
+    echo -e "  ${ICO_OK} ${OK}ip4table set to ${_new_tab:-main}${NC}"
+    echo -e "  ${WARN_C}Run 'Restart Interface' to apply${NC}"
+    PAUSE
+    return 0
+}
+
+_mi_edit_endpoint() {
+    _iface="$1"
+    section "Edit Endpoint"
+    _cur_ep="$(iface_get "$_iface" endpoint_host)"
+    if [ -n "$_cur_ep" ]; then
+        echo -e "  ${A}Current endpoint:${NC} ${W}${_cur_ep}${NC}"
+    else
+        _det_ep="$(detect_wan_ip 2>/dev/null || true)"
+        echo -e "  ${A}Auto-detected WAN IP:${NC} ${W}${_det_ep:-unknown}${NC}"
+    fi
+    echo ""
+    echo -e "  ${DIM2}Enter a static IP or DDNS hostname.${NC}"
+    echo -e "  ${DIM2}Leave empty to reset to auto-detect.${NC}"
+    echo ""
+    prompt _new_ep "Endpoint host (empty = cancel)" "" || return 0
+    sigint_caught && return 0
+    if [ -z "$_new_ep" ]; then
+        if [ -n "$_cur_ep" ]; then
+            confirm "Reset to auto-detect?" "n" || return 0
+            iface_set "$_iface" endpoint_host ""
+            uci commit network
+            echo -e "  ${ICO_OK} ${OK}Endpoint reset to auto-detect${NC}"
+            echo -e "  ${WARN_C}Re-download client configs to apply${NC}"
+        else
+            cancelled
+        fi
+    elif [ "$_new_ep" != "$_cur_ep" ]; then
+        # Resolve the hostname and classify the resulting IP so the user
+        # can verify at a glance that the endpoint points at the right place.
+        echo ""
+        _new_ep_ip="$(resolve_hostname "$_new_ep" 2>/dev/null || true)"
+        if [ -n "$_new_ep_ip" ]; then
+            _ep_class="$(classify_endpoint_ip "$_new_ep_ip" 2>/dev/null || echo "")"
+            case "$_ep_class" in
+                wan)
+                    echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_new_ep_ip}${NC}  ${DIM2}(matches router WAN)${NC}"
+                    ;;
+                hairpin)
+                    # Router LAN IP → local DNS has a split-horizon record.
+                    # Helpful, but external clients see a different answer
+                    # — probe 1.1.1.1 for the public view.
+                    echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_new_ep_ip}${NC}  ${DIM2}(router LAN IP — split-horizon DNS)${NC}"
+                    _ext_ip="$(resolve_hostname_via "$_new_ep" 1.1.1.1 2>/dev/null || true)"
+                    if [ -n "$_ext_ip" ]; then
+                        _wan_now="$(detect_wan_ip 2>/dev/null || true)"
+                        if [ -n "$_wan_now" ] && [ "$_ext_ip" = "$_wan_now" ]; then
+                            echo -e "  ${DIM2}External (1.1.1.1) → ${_ext_ip}  (matches router WAN)${NC}"
+                        else
+                            echo -e "  ${DIM2}External (1.1.1.1) → ${_ext_ip}${NC}"
+                        fi
+                    else
+                        echo -e "  ${DIM2}Couldn't verify public answer via 1.1.1.1.${NC}"
+                    fi
+                    ;;
+                private)
+                    echo -e "  ${ICO_WARN} ${WARN_C}Resolves to private IP${NC} ${W}${_new_ep_ip}${NC}"
+                    echo -e "  ${DIM2}External clients won't reach an RFC1918 address.${NC}"
+                    ;;
+                external)
+                    echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_new_ep_ip}${NC}  ${DIM2}(external — not this router's WAN)${NC}"
+                    echo -e "  ${DIM2}OK for CGNAT / upstream-forwarded setups.${NC}"
+                    ;;
+                *)
+                    echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_new_ep_ip}${NC}"
+                    ;;
+            esac
+        else
+            case "$_new_ep" in
+                *[!0-9.]*)
+                    echo -e "  ${ICO_WARN} ${WARN_C}Could not resolve ${_new_ep} from router${NC}"
+                    echo -e "  ${DIM2}Clients will resolve it themselves; OK if transient.${NC}"
+                    ;;
+            esac
+        fi
+        echo ""
+        confirm "Apply?" "y" || { cancelled; PAUSE; return 0; }
+        iface_set "$_iface" endpoint_host "$_new_ep"
+        uci commit network
+        echo -e "  ${ICO_OK} ${OK}Endpoint set to ${_new_ep}${NC}"
+        echo -e "  ${WARN_C}Re-download client configs to apply${NC}"
+    else
+        echo -e "  ${DIM2}No change${NC}"
+    fi
+    PAUSE
+    return 0
+}
+
+# _mi_configure IFACE ZONE — Settings submenu for an interface.
+_mi_configure() {
+    _iface="$1"; _zone="$2"
+    crumb_push "Configure"
+    while true; do
+        clear
+        crumb_show
+        uci_network_exists "$_iface" || { crumb_pop; return; }
+
+        _c_dns="$(iface_get "$_iface" dns "-")"
+        _c_mtu="$(iface_get "$_iface" mtu "-")"
+        _c_dns_search="$(uci -q get "dhcp.@dnsmasq[0].domain" 2>/dev/null || true)"
+        _c_port="$(iface_get "$_iface" listen_port "-")"
+        _c_ep="$(iface_get "$_iface" endpoint_host)"
+        _c_fwmark="$(iface_get "$_iface" fwmark)"
+        _c_tab="$(iface_get "$_iface" ip4table)"
+        _c_jc="$(iface_get "$_iface" awg_jc)"
+
+        _c_lan_zone="$(iface_lan_zone "$_iface")"
+        _c_wan_zone="$(iface_wan_zone "$_iface")"
+        _c_fwd_lan_on=0; _c_fwd_wan_on=0
+        forwarding_exists "$_zone" "$_c_lan_zone" && _c_fwd_lan_on=1
+        forwarding_exists "$_zone" "$_c_wan_zone" && _c_fwd_wan_on=1
+
+        echo -e "${W}Configure ${_iface}${NC}"
+        echo ""
+        echo -e "${DIM2}──────────────────────────────────────${NC}"
+        echo ""
+        echo -e "  ${DIM2}Network${NC}"
+        if [ -n "$_c_dns_search" ]; then
+            _c_dns_shown="${_c_dns}, ${_c_dns_search}"
+        else
+            _c_dns_shown="$_c_dns"
+        fi
+        echo -e "  ${B}d${NC} ${DIM2}›${NC} ${W}DNS${NC}              ${DIM2}${_c_dns_shown}${NC}"
+        echo -e "  ${B}m${NC} ${DIM2}›${NC} ${W}MTU${NC}              ${DIM2}${_c_mtu}${NC}"
+        echo -e "  ${B}p${NC} ${DIM2}›${NC} ${W}Listen Port${NC}      ${DIM2}${_c_port}${NC}"
+        echo -e "  ${B}n${NC} ${DIM2}›${NC} ${W}Endpoint${NC}         ${DIM2}${_c_ep:-auto-detect}${NC}"
+        echo ""
+        echo -e "  ${DIM2}Routing${NC}"
+        if [ "$_c_fwd_lan_on" -eq 1 ]; then
+            echo -e "  ${B}l${NC} ${DIM2}›${NC} ${ERR}Disable${NC} LAN Forwarding"
+        else
+            echo -e "  ${B}l${NC} ${DIM2}›${NC} ${OK}Enable${NC} LAN Forwarding"
+        fi
+        if [ "$_c_fwd_wan_on" -eq 1 ]; then
+            echo -e "  ${B}w${NC} ${DIM2}›${NC} ${ERR}Disable${NC} WAN Forwarding"
+        else
+            echo -e "  ${B}w${NC} ${DIM2}›${NC} ${OK}Enable${NC} WAN Forwarding"
+        fi
+        if podkop_present; then
+            if podkop_has_interface "$_iface" 2>/dev/null; then
+                echo -e "  ${B}k${NC} ${DIM2}›${NC} ${ERR}Unlink${NC} Podkop"
+            else
+                echo -e "  ${B}k${NC} ${DIM2}›${NC} ${OK}Link${NC} Podkop"
+            fi
+        fi
+        echo -e "  ${B}f${NC} ${DIM2}›${NC} ${W}fwmark${NC}           ${DIM2}${_c_fwmark:-off}${NC}"
+        echo -e "  ${B}t${NC} ${DIM2}›${NC} ${W}Route Table${NC}      ${DIM2}${_c_tab:-main}${NC}"
+        _c_tunlink="$(iface_get "$_iface" tunlink)"
+        _c_nohost="$(iface_get "$_iface" nohostroute)"
+        case "$_c_nohost" in 1|on|true) _c_nohost_label="on" ;; *) _c_nohost_label="off" ;; esac
+        _c_p6="$(iface_get "$_iface" ip6prefix)"
+        echo -e "  ${B}u${NC} ${DIM2}›${NC} ${W}tunlink${NC}          ${DIM2}${_c_tunlink:-auto}${NC}"
+        echo -e "  ${B}x${NC} ${DIM2}›${NC} ${W}nohostroute${NC}      ${DIM2}${_c_nohost_label}${NC}"
+        echo -e "  ${B}6${NC} ${DIM2}›${NC} ${W}ip6prefix${NC}        ${DIM2}${_c_p6:-none}${NC}"
+        echo ""
+        echo -e "  ${DIM2}AmneziaWG${NC}"
+        if [ -n "$_c_jc" ]; then
+            _c_jmin="$(iface_get "$_iface" awg_jmin "?")"
+            _c_jmax="$(iface_get "$_iface" awg_jmax "?")"
+            echo -e "  ${B}o${NC} ${DIM2}›${NC} ${W}Obfuscation${NC}      ${DIM2}Jc=${_c_jc} Jmin=${_c_jmin} Jmax=${_c_jmax}${NC}"
+        else
+            echo -e "  ${B}o${NC} ${DIM2}›${NC} ${OK}Setup${NC} Obfuscation"
+        fi
+        echo ""
+        echo -e "  ${DIM2}Info${NC}"
+        echo -e "  ${B}i${NC} ${DIM2}›${NC} ${W}Show${NC} Public Key"
+        echo -e "  ${B}v${NC} ${DIM2}›${NC} ${W}Show${NC} Live Config  ${DIM2}(kernel state)${NC}"
+        echo -e "  ${B}g${NC} ${DIM2}›${NC} ${W}Test${NC} DNS & Network"
+        echo ""
+        echo -e "  ${DIM2}Enter › Back${NC}"
+        echo ""
+        echo -ne "  ${A}>${NC} " && read_choice _c_choice
+        sigint_caught && { crumb_pop; return; }
+        case "${_c_choice:-}" in
+            "")  crumb_pop; return ;;
+            d|D) _mi_edit_dns          "$_iface" ;;
+            m|M) _mi_edit_mtu          "$_iface" ;;
+            p|P) _mi_change_port      "$_iface" ;;
+            n|N) _mi_edit_endpoint    "$_iface" ;;
+            f|F) _mi_edit_fwmark      "$_iface" ;;
+            t|T) _mi_edit_route_table "$_iface" ;;
+            o|O) _mi_obfuscation      "$_iface" ;;
+            l|L) _mi_toggle_forwarding "$_iface" "$_zone" "$_c_lan_zone" "$_c_fwd_lan_on" ;;
+            w|W) _mi_toggle_forwarding "$_iface" "$_zone" "$_c_wan_zone" "$_c_fwd_wan_on" ;;
+            k|K) _mi_toggle_podkop "$_iface" ;;
+            u|U) _mi_edit_tunlink     "$_iface" ;;
+            x|X) _mi_edit_nohostroute "$_iface" ;;
+            6)   _mi_edit_ip6prefix   "$_iface" ;;
+            i|I) _mi_show_pubkey "$_iface" ;;
+            v|V) _mi_show_live_conf "$_iface" ;;
+            g|G) do_dns_network_test "$_iface"; PAUSE ;;
+            *)   warn "Unknown option"; PAUSE ;;
+        esac
+    done
+}
+
+# _mi_edit_dns IFACE — change the DNS the client's .conf will carry. No
+# kernel side effects; clients must re-download their config to pick it up.
+_mi_edit_dns() {
+    _iface="$1"
+    section "Edit DNS"
+    _cur_dns="$(iface_get "$_iface" "dns")"
+    _new_dns=""
+    if ! select_dns _new_dns "$_cur_dns"; then
+        return 0
+    fi
+    if [ -z "$_new_dns" ] || [ "$_new_dns" = "$_cur_dns" ]; then
+        echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0
+    fi
+    _TC="\033[36G"
+    echo ""
+    _ed_test="$(_dns_test "$_new_dns")"
+    if [ "$_ed_test" = "fail" ]; then
+        echo -e "  ${ICO_ERR} ${ERR}${_new_dns} is not a DNS server or is not responding${NC}"
+        confirm "Use anyway?" "n" || { PAUSE; return 0; }
+    else
+        echo -e "  ${ICO_OK} ${OK}DNS responds${NC}  $(_dns_fmt_latency "$_ed_test")"
+    fi
+    check_dns_poisoning "facebook.com" "$_new_dns"
+    _ed_pr=$?
+    if [ "$_ed_pr" -eq 0 ]; then
+        echo -e "  ${ICO_OK} ${OK}DNS clean${NC}"
+    elif [ "$_ed_pr" -eq 1 ]; then
+        echo -e "  ${ICO_ERR} ${ERR}DNS poisoning detected (127.x.x.x)${NC}"
+    else
+        echo -e "  ${ICO_WARN} ${WARN_C}DNS poisoning check unavailable${NC}"
+    fi
+    echo ""
+    confirm "Apply?" "y" || { cancelled; PAUSE; return 0; }
+    iface_set "$_iface" "dns" "$_new_dns"
+    uci commit network
+    echo -e "  ${ICO_OK} ${OK}DNS set to ${_new_dns}${NC}"
+    echo -e "  ${WARN_C}Existing peer configs contain the old value — re-download to apply${NC}"
+    PAUSE
+    return 0
+}
+
+# _mi_edit_mtu IFACE — change tunnel MTU. Live-applied via `ip link set mtu`,
+# no ifdown needed. Client .conf also carries the MTU so clients must
+# re-download or adjust manually.
+_mi_edit_mtu() {
+    _iface="$1"
+    section "Edit MTU"
+    _cur_mtu="$(iface_get "$_iface" "mtu" "$CFG_DEFAULT_MTU")"
+    # Recommended MTU from `ip route get <endpoint>`.
+    _ep_for_mtu="$(iface_get "$_iface" endpoint_host)"
+    [ -z "$_ep_for_mtu" ] && _ep_for_mtu="1.1.1.1"
+    _rec_mtu="$(recommend_mtu "$_ep_for_mtu")"
+    echo -e "  ${A}Current:${NC}     ${W}${_cur_mtu}${NC}"
+    echo -e "  ${A}Recommended:${NC} ${W}${_rec_mtu}${NC}  ${DIM2}(upstream − 80)${NC}"
+    echo ""
+    prompt _new_mtu "MTU" "$_cur_mtu" || return 0
+    sigint_caught && return 0
+    [ "$_new_mtu" = "$_cur_mtu" ] && { echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0; }
+    case "$_new_mtu" in *[!0-9]*) warn "MTU must be numeric"; PAUSE; return 0 ;; esac
+    [ "$_new_mtu" -ge 1200 ] 2>/dev/null || warn "MTU below 1200 is unusual"
+    [ "$_new_mtu" -le 1500 ] 2>/dev/null || { warn "MTU above 1500 is invalid"; PAUSE; return 0; }
+    iface_set "$_iface" "mtu" "$_new_mtu"
+    uci commit network
+    live_iface_set_mtu "$_iface" "$_new_mtu" || true
+    echo -e "  ${ICO_OK} ${OK}MTU set to ${_new_mtu}${NC}"
+    echo -e "  ${WARN_C}Existing peer configs contain the old value — re-download to apply${NC}"
+    PAUSE
+    return 0
 }
 
 do_manage_interface() {
@@ -3219,20 +4756,22 @@ do_manage_interface() {
         crumb_show
         uci_network_exists "$_iface" || { crumb_pop; crumb_pop; return; }
 
-        _addr="$(uci -q get "network.${_iface}.addresses" || echo "n/a")"
-        _port="$(uci -q get "network.${_iface}.listen_port" || echo "n/a")"
+        _addr="$(iface_get "$_iface" addresses "n/a")"
+        _port="$(iface_get "$_iface" listen_port "n/a")"
         _dns="$(uci  -q get "network.${_iface}.dns" || echo "n/a")"
-        _mtu="$(uci -q get "network.${_iface}.mtu" || echo "n/a")"
+        _mtu="$(iface_get "$_iface" mtu "n/a")"
         _zone="$(find_zone_for_interface "$_iface" 2>/dev/null || echo "none")"
         _peer_count="$(count_peers "$_iface")"
-        _disabled="$(uci -q get "network.${_iface}.disabled" || echo "0")"
+        _disabled="$(iface_get "$_iface" disabled "0")"
 
+        _lan_zone="$(iface_lan_zone "$_iface")"
+        _wan_zone="$(iface_wan_zone "$_iface")"
         _fwd_lan_on=0; _fwd_wan_on=0
-        _fwd_lan="${ICO_ERR}"; forwarding_exists "$_zone" "lan" && { _fwd_lan="${ICO_OK}"; _fwd_lan_on=1; }
-        _fwd_wan="${ICO_ERR}"; forwarding_exists "$_zone" "wan" && { _fwd_wan="${ICO_OK}"; _fwd_wan_on=1; }
+        _fwd_lan="${ICO_ERR}"; forwarding_exists "$_zone" "$_lan_zone" && { _fwd_lan="${ICO_OK}"; _fwd_lan_on=1; }
+        _fwd_wan="${ICO_ERR}"; forwarding_exists "$_zone" "$_wan_zone" && { _fwd_wan="${ICO_OK}"; _fwd_wan_on=1; }
 
         # Public key (truncated)
-        _srv_priv="$(uci -q get "network.${_iface}.private_key" || true)"
+        _srv_priv="$(iface_get "$_iface" private_key)"
         _srv_pub=""
         if [ -n "$_srv_priv" ] && have_cmd awg; then
             _srv_pub="$(printf '%s' "$_srv_priv" | awg pubkey 2>/dev/null || true)"
@@ -3259,36 +4798,14 @@ do_manage_interface() {
             fi
         fi
 
-        # Total Rx/Tx across all peers
-        _total_rx=""; _total_tx=""
+        # Total Rx/Tx across all peers — sum raw bytes from `awg show dump`.
+        _rx_sum=""; _tx_sum=""
         if [ "$_disabled" != "1" ] && interface_device_exists "$_iface" && have_cmd awg; then
-            _awg_dump="$(awg show "$_iface" 2>/dev/null || true)"
-            if [ -n "$_awg_dump" ]; then
-                _total_rx="$(echo "$_awg_dump" | awk '/transfer:/{
-                    sub(/.*transfer: /,""); sub(/ received.*/,""); print; exit}')"
-                _total_tx="$(echo "$_awg_dump" | awk '/transfer:/{
-                    sub(/.*, /,""); sub(/ sent.*/,""); print; exit}')"
-                # Sum all peers if multiple
-                _rx_sum="$(echo "$_awg_dump" | awk 'BEGIN{t=0} /transfer:/{
-                    sub(/.*transfer: /,""); split($0,a,",");
-                    v=$1+0; u=$2;
-                    if(u~/GiB/)t+=v*1073741824; else if(u~/MiB/)t+=v*1048576;
-                    else if(u~/KiB/)t+=v*1024; else t+=v
-                } END{
-                    if(t>=1073741824) printf "%.1f GiB",t/1073741824;
-                    else if(t>=1048576) printf "%.1f MiB",t/1048576;
-                    else if(t>=1024) printf "%.1f KiB",t/1024;
-                    else printf "%d B",t}')"
-                _tx_sum="$(echo "$_awg_dump" | awk 'BEGIN{t=0} /transfer:/{
-                    sub(/.*transfer: /,""); sub(/.*,[ ]*/,""); sub(/ sent/,"");
-                    v=$1+0; u=$2;
-                    if(u~/GiB/)t+=v*1073741824; else if(u~/MiB/)t+=v*1048576;
-                    else if(u~/KiB/)t+=v*1024; else t+=v
-                } END{
-                    if(t>=1073741824) printf "%.1f GiB",t/1073741824;
-                    else if(t>=1048576) printf "%.1f MiB",t/1048576;
-                    else if(t>=1024) printf "%.1f KiB",t/1024;
-                    else printf "%d B",t}')"
+            _sums="$(awg show "$_iface" dump 2>/dev/null | awk -F'\t' '
+                NR>1 { rx+=$6; tx+=$7 } END { printf "%d %d\n", rx+0, tx+0 }')"
+            if [ -n "$_sums" ]; then
+                _rx_sum="$(fmt_bytes "${_sums%% *}")"
+                _tx_sum="$(fmt_bytes "${_sums##* }")"
             fi
         fi
 
@@ -3296,56 +4813,90 @@ do_manage_interface() {
         # Detect podkop state (sets PK_* globals)
         detect_podkop_state "$_iface"
 
-        _ep_override="$(uci -q get "network.${_iface}.endpoint_host" || true)"
+        _ep_override="$(iface_get "$_iface" endpoint_host)"
+        _ep_resolved=""
         if [ -n "$_ep_override" ]; then
             _ep_display="$_ep_override"
+            # Show resolved IP when the override is a DNS name, so the box
+            # reflects what the tunnel will actually connect to.
+            _ep_resolved="$(resolve_hostname "$_ep_override" 2>/dev/null || true)"
         else
             _ep_display="$(detect_wan_ip 2>/dev/null || true)"
             [ -z "$_ep_display" ] && _ep_display="auto"
         fi
         _dns_chain="$(dns_chain_label "$_iface")"
         if [ -n "$_dns_chain" ]; then _dns_chain="  ${_dns_chain}"; fi
-
-        box_top 44
-        box_line "  ${_st_ico} ${W}${_iface}${NC}  ${_st_txt}"
-        box_sep 44
-        box_line "  ${A}Address${NC}      ${W}${_addr}${NC}"
-        box_line "  ${A}Endpoint${NC}     ${W}${_ep_display}:${_port}${NC}"
-        box_line "  ${A}MTU${NC}          ${W}${_mtu}${NC}"
-        box_line "  ${A}DNS${NC}          ${W}${_dns}${NC}${_dns_chain}"
-        if [ -n "$_srv_pub_short" ]; then
-            box_line "  ${A}Public Key${NC}   ${DIM2}${_srv_pub_short}${NC}"
+        # Client-emitted DNS line: the LAN domain is appended as search
+        # suffix in reconstruct_peer_config, so display the full literal
+        # here too (what you see is what the .conf gets).
+        _dns_search="$(uci -q get "dhcp.@dnsmasq[0].domain" 2>/dev/null || true)"
+        if [ -n "$_dns_search" ]; then
+            _dns_shown="${_dns}, ${_dns_search}"
+        else
+            _dns_shown="$_dns"
         fi
-        box_sep 44
-        box_line "  ${A}FW Zone${NC}      ${W}${_zone}${NC}"
-        box_line "  ${A}Routing${NC}      ${_fwd_lan} LAN  ${_fwd_wan} WAN"
+
+        box_buf_reset
+        box_buf_line "  ${_st_ico} ${W}${_iface}${NC}  ${_st_txt}"
+
+        # Identity
+        box_buf_sep
+        box_buf_line "  ${A}Address${NC}      ${W}${_addr}${NC}"
+        if [ -n "$_srv_pub_short" ]; then
+            box_buf_line "  ${A}Public${NC}       ${DIM2}${_srv_pub_short}${NC}"
+        fi
+
+        # Client Config — what lands in emitted .conf
+        box_buf_sep
+        box_buf_line "  ${A}Endpoint${NC}     ${W}${_ep_display}:${_port}${NC}"
+        if [ -n "$_ep_resolved" ] && [ "$_ep_resolved" != "$_ep_display" ]; then
+            _ep_cat="$(classify_endpoint_ip "$_ep_resolved" 2>/dev/null || echo "")"
+            case "$_ep_cat" in
+                wan)      _ep_cat_lbl=" ${OK}(matches WAN)${NC}" ;;
+                hairpin)  _ep_cat_lbl=" ${WARN_C}(split-horizon DNS)${NC}" ;;
+                private)  _ep_cat_lbl=" ${ERR}(private — unreachable from WAN)${NC}" ;;
+                external) _ep_cat_lbl=" ${DIM2}(external, ≠ router WAN)${NC}" ;;
+                *)        _ep_cat_lbl="" ;;
+            esac
+            box_buf_line "               ${DIM2}↳ ${_ep_resolved}${NC}${_ep_cat_lbl}"
+            box_buf_line ""
+        fi
+        box_buf_line "  ${A}DNS${NC}          ${W}${_dns_shown}${NC}${_dns_chain}"
+        box_buf_line "  ${A}MTU${NC}          ${W}${_mtu}${NC}"
+
+        # Firewall
+        box_buf_sep
+        box_buf_line "  ${A}Zone${NC}         ${W}${_zone}${NC}"
+        box_buf_line "  ${A}Routing${NC}      ${_fwd_lan} LAN  ${_fwd_wan} WAN"
         if [ "${PK_INSTALLED:-0}" -eq 1 ]; then
             if [ "$PK_LINKED" -eq 0 ]; then
-                box_line "  ${A}Podkop${NC}       ${DIM2}Not linked${NC}"
+                box_buf_line "  ${A}Podkop${NC}       ${DIM2}Not linked${NC}"
             elif [ "$SB_RUNNING" -eq 1 ] && [ "$SB_DNS" -eq 1 ] && [ "$DM_OK" -eq 1 ]; then
-                box_line "  ${A}Podkop${NC}       ${OK}Active${NC}  ${DIM2}Sing-Box ✓  dns ✓${NC}"
+                box_buf_line "  ${A}Podkop${NC}       ${OK}Active${NC}  ${DIM2}Sing-Box ✓  dns ✓${NC}"
             elif [ "$SB_RUNNING" -eq 1 ] && [ "$SB_DNS" -eq 1 ]; then
-                box_line "  ${A}Podkop${NC}       ${OK}Active${NC}  ${WARN_C}dnsmasq misconfigured${NC}"
+                box_buf_line "  ${A}Podkop${NC}       ${OK}Active${NC}  ${WARN_C}dnsmasq misconfigured${NC}"
             elif [ "$SB_RUNNING" -eq 1 ]; then
-                box_line "  ${A}Podkop${NC}       ${WARN_C}Sing-Box running, DNS not listening${NC}"
+                box_buf_line "  ${A}Podkop${NC}       ${WARN_C}Sing-Box running, DNS not listening${NC}"
             else
-                box_line "  ${A}Podkop${NC}       ${ERR}Linked but Sing-Box stopped${NC}"
+                box_buf_line "  ${A}Podkop${NC}       ${ERR}Linked but Sing-Box stopped${NC}"
             fi
         elif [ "${SB_DNS:-0}" -eq 1 ] && [ "${DM_FWD:-0}" -eq 1 ]; then
-            box_line "  ${A}Sing-Box${NC}     ${OK}Active${NC}  ${DIM2}dnsmasq → ${CFG_SB_DNS_IP}${NC}"
+            box_buf_line "  ${A}Sing-Box${NC}     ${OK}Active${NC}  ${DIM2}dnsmasq → ${CFG_SB_DNS_IP}${NC}"
         elif [ "${SB_RUNNING:-0}" -eq 1 ]; then
-            box_line "  ${A}Sing-Box${NC}     ${WARN_C}Running${NC}  ${DIM2}DNS not configured${NC}"
+            box_buf_line "  ${A}Sing-Box${NC}     ${WARN_C}Running${NC}  ${DIM2}DNS not configured${NC}"
         fi
+
+        # Runtime — only when iface is up
         if [ -n "$_uptime_str" ] || [ -n "$_rx_sum" ]; then
-            box_sep 44
+            box_buf_sep
             if [ -n "$_uptime_str" ]; then
-                box_line "  ${A}Uptime${NC}       ${W}${_uptime_str}${NC}"
+                box_buf_line "  ${A}Uptime${NC}       ${W}${_uptime_str}${NC}"
             fi
             if [ -n "$_rx_sum" ]; then
-                box_line "  ${A}Traffic${NC}      ${DIM2}↓${NC} ${W}${_rx_sum}${NC}  ${DIM2}↑${NC} ${W}${_tx_sum}${NC}"
+                box_buf_line "  ${A}Traffic${NC}      ${DIM2}↓${NC} ${W}${_rx_sum}${NC}  ${DIM2}↑${NC} ${W}${_tx_sum}${NC}"
             fi
         fi
-        box_bot 44
+        box_buf_flush 44
 
         # ── Inline diagnostics ──
         _warnings=0
@@ -3373,7 +4924,7 @@ do_manage_interface() {
         else
             _toggle_label="${ERR}Disable${NC} Interface"
         fi
-        _is_l="$(uci -q get "network.${_iface}._liminal_iface" || true)"
+        _is_l="$(iface_get "$_iface" _liminal_iface)"
         [ -n "$_is_l" ] && _is_l="1" || _is_l="0"
 
         # ── Inline peer list ──
@@ -3382,12 +4933,12 @@ do_manage_interface() {
         _PS="\\033[28G"  # Status/info column
         echo -e "  ${DIM2}Peers${NC}"
         _pi=0; _peer_found=0
-        while uci -q get "network.@${_pt}[$_pi]" >/dev/null 2>&1; do
+        while peer_exists "$_pt" "$_pi"; do
             _peer_found=1; _pn=$((_pi + 1))
-            _pdesc="$(uci -q get "network.@${_pt}[$_pi].description" || echo "(unnamed)")"
-            _paip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "?")"
-            _ppub="$(uci -q get "network.@${_pt}[$_pi].public_key" || true)"
-            _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
+            _pdesc="$(peer_get "$_pt" "$_pi" description "(unnamed)")"
+            _paip="$(peer_get "$_pt" "$_pi" allowed_ips "?")"
+            _ppub="$(peer_get "$_pt" "$_pi" public_key)"
+            _pdis="$(peer_get "$_pt" "$_pi" disabled "0")"
             _phost="${_paip%%/*}"; _phost="${_phost##*.}"
 
             if [ "$_pdis" = "1" ]; then
@@ -3396,13 +4947,7 @@ do_manage_interface() {
                 _hs="$(get_peer_handshake "$_iface" "$_ppub")"
                 _hs_sec=9999
                 if [ -n "$_hs" ] && [ "$_hs" != "-" ] && [ "$_hs" != "never" ]; then
-                    _hs_sec="$(awg show "$_iface" 2>/dev/null | awk -v pk="$_ppub" '
-                        /peer:/{cur=$NF} cur==pk&&/latest handshake:/{
-                            sub(/.*latest handshake: /,"");t=0;
-                            for(i=1;i<=NF;i++){if($i~/^[0-9]+$/){n=$i;u=$(i+1);
-                                if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
-                                else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
-                            print t;exit}' 2>/dev/null)"
+                    _hs_sec="$(awg_peer_handshake_age "$_iface" "$_ppub")"
                     if [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null; then
                         echo -e "  ${B}${_pn}${NC} ${DIM2}›${NC} ${ICO_ON}${_PC}${W}${_pdesc}${NC}${_PS}${DIM2}#${_phost}${NC}"
                     else
@@ -3420,42 +4965,9 @@ do_manage_interface() {
         echo -e "  ${OK}+${NC} ${DIM2}›${NC} ${W}Add${NC} Peer"
         echo ""
 
-        # ── Settings ──
-        echo -e "  ${DIM2}Settings${NC}"
-        echo -e "  ${B}e${NC} ${DIM2}›${NC} ${W}Edit${NC} DNS / MTU"
-        echo -e "  ${B}p${NC} ${DIM2}›${NC} ${W}Change${NC} Port"
-        echo -e "  ${B}n${NC} ${DIM2}›${NC} ${W}Endpoint${NC}"
-
-        # Forwarding toggles
-        if [ "$_fwd_lan_on" -eq 1 ]; then
-            echo -e "  ${B}l${NC} ${DIM2}›${NC} ${ERR}Disable${NC} LAN Forwarding"
-        else
-            echo -e "  ${B}l${NC} ${DIM2}›${NC} ${OK}Enable${NC} LAN Forwarding"
-        fi
-        if [ "$_fwd_wan_on" -eq 1 ]; then
-            echo -e "  ${B}w${NC} ${DIM2}›${NC} ${ERR}Disable${NC} WAN Forwarding"
-        else
-            echo -e "  ${B}w${NC} ${DIM2}›${NC} ${OK}Enable${NC} WAN Forwarding"
-        fi
-
-        # Podkop toggle
-        if podkop_present; then
-            if podkop_has_interface "$_iface" 2>/dev/null; then
-                echo -e "  ${B}k${NC} ${DIM2}›${NC} ${ERR}Unlink${NC} Podkop"
-            else
-                echo -e "  ${B}k${NC} ${DIM2}›${NC} ${OK}Link${NC} Podkop"
-            fi
-        fi
-        echo ""
-
-        # ── Info ──
-        echo -e "  ${DIM2}Info${NC}"
-        echo -e "  ${B}i${NC} ${DIM2}›${NC} ${W}Show${NC} Public Key"
-        echo -e "  ${B}g${NC} ${DIM2}›${NC} ${W}Test${NC} DNS & Network"
-        echo ""
-
         # ── Interface ──
         echo -e "  ${DIM2}Interface${NC}"
+        echo -e "  ${B}c${NC} ${DIM2}›${NC} ${W}Configure${NC} Interface"
         if [ "$_is_l" = "1" ]; then
             echo -e "  ${B}m${NC} ${DIM2}›${NC} ${W}Rename${NC} Interface"
         fi
@@ -3478,253 +4990,9 @@ do_manage_interface() {
                     do_peer_menu "$_iface" "$CREATED_PEER_IDX" "$CREATED_PEER_NAME"
                 fi ;;
 
-            e|E) # Edit DNS / MTU
-                section "Edit DNS / MTU"
-                _cur_dns="$(uci -q get "network.${_iface}.dns" || echo "")"
-                _cur_mtu="$(uci -q get "network.${_iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
-                _changed=0; _mtu_changed=0; _dns_changed=0
+            c|C) _mi_configure "$_iface" "$_zone" ;;
 
-                _new_dns=""
-                if select_dns _new_dns "$_cur_dns"; then
-                    if [ -n "$_new_dns" ] && [ "$_new_dns" = "$_cur_dns" ]; then
-                        echo -e "  ${DIM2}DNS unchanged${NC}"
-                    elif [ -n "$_new_dns" ] && [ "$_new_dns" != "$_cur_dns" ]; then
-                        _TC="\033[36G"
-                        echo ""
-                        _ed_test="$(_dns_test "$_new_dns")"
-                        if [ "$_ed_test" = "fail" ]; then
-                            echo -e "  ${ICO_ERR} ${ERR}${_new_dns} is not a DNS server or is not responding${NC}"
-                            confirm "Use anyway?" "n" || { PAUSE; continue; }
-                        else
-                            echo -e "  ${ICO_OK} ${OK}DNS responds${NC}  $(_dns_fmt_latency "$_ed_test")"
-                        fi
-                        check_dns_poisoning "facebook.com" "$_new_dns"
-                        _ed_pr=$?
-                        if [ "$_ed_pr" -eq 0 ]; then
-                            echo -e "  ${ICO_OK} ${OK}DNS clean${NC}"
-                        elif [ "$_ed_pr" -eq 1 ]; then
-                            echo -e "  ${ICO_ERR} ${ERR}DNS poisoning detected (127.x.x.x)${NC}"
-                        else
-                            echo -e "  ${ICO_WARN} ${WARN_C}DNS poisoning check unavailable${NC}"
-                        fi
-                        uci set "network.${_iface}.dns=$_new_dns"
-                        _changed=1; _dns_changed=1
-                    fi
-                fi
-                echo ""
-                prompt _new_mtu "MTU" "$_cur_mtu" || continue
-                sigint_caught && continue
-                if [ -n "$_new_mtu" ] && [ "$_new_mtu" != "$_cur_mtu" ]; then
-                    case "$_new_mtu" in *[!0-9]*) warn "MTU must be numeric"; PAUSE; continue ;; esac
-                    uci set "network.${_iface}.mtu=$_new_mtu"
-                    _changed=1; _mtu_changed=1
-                fi
-
-                if [ "$_changed" -eq 1 ]; then
-                    echo ""
-                    confirm "Apply changes?" "y" || { uci revert network 2>/dev/null; echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; continue; }
-                    uci commit network
-                    spinner_start "Restarting ${_iface}..."
-                    ifdown "$_iface" >/dev/null 2>&1 || true
-                    ifup "$_iface" >/dev/null 2>&1 || true
-                    spinner_stop
-                    echo -e "  ${ICO_OK} ${OK}Settings updated${NC}"
-                    if [ "$_mtu_changed" -eq 1 ] || [ "$_dns_changed" -eq 1 ]; then
-                        echo ""
-                        echo -e "  ${WARN_C}Existing peer configs contain the old values.${NC}"
-                        echo -e "  ${WARN_C}Re-download configs or update clients manually.${NC}"
-                    fi
-                else
-                    echo -e "  ${DIM2}No changes${NC}"
-                fi
-                PAUSE ;;
-
-            p|P) # Change Port
-                section "Change Port"
-                _cur_port="$(uci -q get "network.${_iface}.listen_port" || echo "")"
-                echo -e "  ${WARN_C}All existing peer configs will need to be updated${NC}"
-                echo -e "  ${WARN_C}with the new port after this change.${NC}"
-                echo ""
-                prompt _new_port "New port" "$_cur_port" || continue
-                sigint_caught && continue
-                [ "$_new_port" = "$_cur_port" ] && { echo -e "  ${DIM2}No change${NC}"; PAUSE; continue; }
-                validate_port "$_new_port" || { PAUSE; continue; }
-                port_in_use "$_new_port" && { warn "Port $_new_port is already in use"; PAUSE; continue; }
-                confirm "Change port ${_cur_port} → ${_new_port}?" "n" || continue
-
-                autobackup_enabled && init_backup "Port Change"
-                uci set "network.${_iface}.listen_port=$_new_port"
-
-                # Update firewall rule if exists
-                _ri=0
-                while uci -q get "firewall.@rule[$_ri]" >/dev/null 2>&1; do
-                    _rl="$(uci -q get "firewall.@rule[$_ri]._liminal_iface" || true)"
-                    if [ "$_rl" = "$_iface" ]; then
-                        uci set "firewall.@rule[$_ri].dest_port=$_new_port"
-                        echo -e "  ${B}Updated${NC} FW rule port"
-                    fi
-                    _ri=$((_ri + 1))
-                done
-
-                uci commit network
-                uci commit firewall
-                echo -e "  ${B}Restarting${NC} ${_iface}..."
-                ifdown "$_iface" >/dev/null 2>&1 || true
-                ifup "$_iface" >/dev/null 2>&1 || true
-                echo -e "  ${B}Restarting${NC} firewall..."
-                /etc/init.d/firewall restart >/dev/null 2>&1 || true
-                echo -e "  ${ICO_OK} ${OK}Port changed to ${_new_port}${NC}"
-                echo -e "  ${WARN_C}Update all peer configs with new port${NC}"
-                PAUSE ;;
-
-            n|N) # Edit Endpoint
-                section "Edit Endpoint"
-                _cur_ep="$(uci -q get "network.${_iface}.endpoint_host" || true)"
-                if [ -n "$_cur_ep" ]; then
-                    echo -e "  ${A}Current endpoint:${NC} ${W}${_cur_ep}${NC}"
-                else
-                    _det_ep="$(detect_wan_ip 2>/dev/null || true)"
-                    echo -e "  ${A}Auto-detected WAN IP:${NC} ${W}${_det_ep:-unknown}${NC}"
-                fi
-                echo ""
-                echo -e "  ${DIM2}Enter a static IP or DDNS hostname.${NC}"
-                echo -e "  ${DIM2}Leave empty to reset to auto-detect.${NC}"
-                echo ""
-                prompt _new_ep "Endpoint host (empty = cancel)" "" || continue
-                sigint_caught && continue
-                if [ -z "$_new_ep" ]; then
-                    if [ -n "$_cur_ep" ]; then
-                        confirm "Reset to auto-detect?" "n" || continue
-                        uci delete "network.${_iface}.endpoint_host" 2>/dev/null || true
-                        uci commit network
-                        echo -e "  ${ICO_OK} ${OK}Endpoint reset to auto-detect${NC}"
-                        echo -e "  ${WARN_C}Re-download client configs to apply${NC}"
-                    else
-                        echo -e "  ${DIM2}Cancelled${NC}"
-                    fi
-                elif [ "$_new_ep" != "$_cur_ep" ]; then
-                    uci set "network.${_iface}.endpoint_host=$_new_ep"
-                    uci commit network
-                    echo -e "  ${ICO_OK} ${OK}Endpoint set to ${_new_ep}${NC}"
-                    echo -e "  ${WARN_C}Re-download client configs to apply${NC}"
-                else
-                    echo -e "  ${DIM2}No change${NC}"
-                fi
-                PAUSE ;;
-
-            l|L) # Toggle LAN forwarding
-                if [ "$_fwd_lan_on" -eq 1 ]; then
-                    # Remove LAN forwarding
-                    _fi=0
-                    while uci -q get "firewall.@forwarding[$_fi]" >/dev/null 2>&1; do
-                        _fsrc="$(uci -q get "firewall.@forwarding[$_fi].src" || true)"
-                        _fdst="$(uci -q get "firewall.@forwarding[$_fi].dest" || true)"
-                        _fl="$(uci -q get "firewall.@forwarding[$_fi]._liminal_iface" || true)"
-                        if [ "$_fl" = "$_iface" ] && [ "$_fsrc" = "$_zone" ] && [ "$_fdst" = "lan" ]; then
-                            uci delete "firewall.@forwarding[$_fi]"
-                            break
-                        fi
-                        _fi=$((_fi + 1))
-                    done
-                    uci commit firewall
-                    echo -e "  ${B}Restarting${NC} firewall..."
-                    /etc/init.d/firewall restart >/dev/null 2>&1 || true
-                    echo -e "  ${ICO_OK} ${OK}LAN forwarding disabled${NC}"
-                else
-                    # Add LAN forwarding
-                    uci add firewall forwarding >/dev/null
-                    _fwd_idx="$(uci show firewall \
-                        | sed -n 's/^firewall\.@forwarding\[\([0-9]\+\)\]=forwarding$/\1/p' | tail -n1)"
-                    uci set "firewall.@forwarding[$_fwd_idx].src=${_zone}"
-                    uci set "firewall.@forwarding[$_fwd_idx].dest=lan"
-                    uci set "firewall.@forwarding[$_fwd_idx]._liminal_iface=${_iface}"
-                    uci commit firewall
-                    echo -e "  ${B}Restarting${NC} firewall..."
-                    /etc/init.d/firewall restart >/dev/null 2>&1 || true
-                    echo -e "  ${ICO_OK} ${OK}LAN forwarding enabled${NC}"
-                fi
-                PAUSE ;;
-
-            w|W) # Toggle WAN forwarding
-                if [ "$_fwd_wan_on" -eq 1 ]; then
-                    _fi=0
-                    while uci -q get "firewall.@forwarding[$_fi]" >/dev/null 2>&1; do
-                        _fsrc="$(uci -q get "firewall.@forwarding[$_fi].src" || true)"
-                        _fdst="$(uci -q get "firewall.@forwarding[$_fi].dest" || true)"
-                        _fl="$(uci -q get "firewall.@forwarding[$_fi]._liminal_iface" || true)"
-                        if [ "$_fl" = "$_iface" ] && [ "$_fsrc" = "$_zone" ] && [ "$_fdst" = "wan" ]; then
-                            uci delete "firewall.@forwarding[$_fi]"
-                            break
-                        fi
-                        _fi=$((_fi + 1))
-                    done
-                    uci commit firewall
-                    echo -e "  ${B}Restarting${NC} firewall..."
-                    /etc/init.d/firewall restart >/dev/null 2>&1 || true
-                    echo -e "  ${ICO_OK} ${OK}WAN forwarding disabled${NC}"
-                else
-                    uci add firewall forwarding >/dev/null
-                    _fwd_idx="$(uci show firewall \
-                        | sed -n 's/^firewall\.@forwarding\[\([0-9]\+\)\]=forwarding$/\1/p' | tail -n1)"
-                    uci set "firewall.@forwarding[$_fwd_idx].src=${_zone}"
-                    uci set "firewall.@forwarding[$_fwd_idx].dest=wan"
-                    uci set "firewall.@forwarding[$_fwd_idx]._liminal_iface=${_iface}"
-                    uci commit firewall
-                    ensure_wan_masq
-                    echo -e "  ${B}Restarting${NC} firewall..."
-                    /etc/init.d/firewall restart >/dev/null 2>&1 || true
-                    echo -e "  ${ICO_OK} ${OK}WAN forwarding enabled${NC}"
-                fi
-                PAUSE ;;
-
-            k|K) # Toggle Podkop
-                if podkop_present; then
-                    if podkop_has_interface "$_iface" 2>/dev/null; then
-                        remove_podkop_interface "$_iface"
-                        echo -e "  ${B}Restarting${NC} Podkop..."
-                        [ -x /etc/init.d/podkop ] && /etc/init.d/podkop restart >/dev/null 2>&1 || true
-                        echo -e "  ${ICO_OK} ${OK}Podkop unlinked${NC}"
-                    else
-                        add_podkop_interface "$_iface"
-                        echo -e "  ${B}Restarting${NC} Podkop..."
-                        [ -x /etc/init.d/podkop ] && /etc/init.d/podkop restart >/dev/null 2>&1 || true
-                        echo -e "  ${ICO_OK} ${OK}Podkop linked${NC}"
-                    fi
-                    podkop_refresh
-                    PAUSE
-                fi ;;
-
-            i|I) # Show Public Key
-                echo ""
-                if [ -n "$_srv_pub" ]; then
-                    echo -e "  ${A}Public Key:${NC}"
-                    echo "  $_srv_pub"
-                else
-                    echo -e "  ${DIM2}Could not derive public key${NC}"
-                fi
-                PAUSE ;;
-
-            g|G) # Test DNS & Network
-                do_dns_network_test "$_iface"
-                PAUSE ;;
-
-            n|N) # Show WAN IP
-                echo ""
-                spinner_start "Detecting WAN IP..."
-                _wan="$(detect_wan_ip 2>/dev/null || true)"
-                spinner_stop
-                if [ -n "$_wan" ]; then
-                    echo -e "  ${A}WAN IP:${NC} ${W}${_wan}${NC}"
-                    echo -e "  ${A}Endpoint:${NC} ${W}${_wan}:${_port}${NC}"
-                else
-                    echo -e "  ${WARN_C}Could not detect WAN IP${NC}"
-                fi
-                PAUSE ;;
-
-            r|R) spinner_start "Restarting ${_iface}..."
-                ifdown "$_iface" >/dev/null 2>&1 || true
-                ifup "$_iface" >/dev/null 2>&1 || true
-                spinner_stop
+            r|R) restart_iface "$_iface"
                 echo -e "  ${ICO_OK} ${OK}Done${NC}"
                 PAUSE ;;
             t|T) if [ "$_disabled" = "1" ]; then
@@ -3755,7 +5023,7 @@ do_manage_interface() {
             "") crumb_pop; crumb_pop; return ;;
             *)  # Numeric = peer selection
                 _sel_idx=$((_mgmt_choice - 1)) 2>/dev/null || continue
-                _sel_desc="$(uci -q get "network.@${_pt}[$_sel_idx].description" 2>/dev/null || true)"
+                _sel_desc="$(peer_get "$_pt" "$_sel_idx" description)"
                 [ -n "$_sel_desc" ] && do_peer_menu "$_iface" "$_sel_idx" "$_sel_desc" ;;
         esac
     done
@@ -3772,7 +5040,7 @@ do_list() {
     # Find non-liminal interfaces
     _other=""
     for iface in $_all; do
-        _is_l="$(uci -q get "network.${iface}._liminal_iface" || true)"
+        _is_l="$(iface_get "$iface" _liminal_iface)"
         [ -n "$_is_l" ] || _other="${_other} ${iface}"
     done
     _other="${_other# }"
@@ -3799,7 +5067,7 @@ do_list() {
     clear
     echo -e "${W}Interfaces${NC}"
     echo ""
-    echo -e "${DIM}──────────────────────────────────────${NC}"
+    echo -e "${DIM2}──────────────────────────────────────${NC}"
     echo ""
 
     # Combined list for selection: liminal first, then other
@@ -3814,9 +5082,9 @@ do_list() {
             _peer_count="$(count_peers "$iface")"
             if interface_device_exists "$iface"; then
                 _active_count="$(count_active_peers "$iface")"
-                echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${W}${iface}${NC}  ${DIM}·${NC}  Active: ${OK}${_active_count}${NC} of ${_peer_count}"
+                echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${W}${iface}${NC}  ${DIM2}·${NC}  Active: ${OK}${_active_count}${NC} of ${_peer_count}"
             else
-                echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${W}${iface}${NC}  ${DIM}·${NC}  Peers: ${_peer_count}  ${DIM}·${NC}  ${ERR}Down${NC}"
+                echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${W}${iface}${NC}  ${DIM2}·${NC}  Peers: ${_peer_count}  ${DIM2}·${NC}  ${ERR}Down${NC}"
             fi
         done
     fi
@@ -3830,9 +5098,9 @@ do_list() {
             _peer_count="$(count_peers "$iface")"
             if interface_device_exists "$iface"; then
                 _active_count="$(count_active_peers "$iface")"
-                echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${DIM2}${iface}${NC}  ${DIM}·${NC}  Active: ${OK}${_active_count}${NC} of ${_peer_count}"
+                echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${DIM2}${iface}${NC}  ${DIM2}·${NC}  Active: ${OK}${_active_count}${NC} of ${_peer_count}"
             else
-                echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${DIM2}${iface}${NC}  ${DIM}·${NC}  Peers: ${_peer_count}  ${DIM}·${NC}  ${ERR}Down${NC}"
+                echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${DIM2}${iface}${NC}  ${DIM2}·${NC}  Peers: ${_peer_count}  ${DIM2}·${NC}  ${ERR}Down${NC}"
             fi
         done
     fi
@@ -3874,7 +5142,7 @@ do_rename_interface() {
     while true; do
         prompt _new "New interface name" "" || return 1
         sigint_caught && return 1
-        [ -z "$_new" ] && { echo -e "  ${DIM2}Cancelled${NC}"; return 1; }
+        [ -z "$_new" ] && { cancelled; return 1; }
         [ "$_new" = "$_old" ] && { warn "Same as current name"; continue; }
         validate_ifname "$_new" || continue
         uci_network_exists "$_new"     && { warn "Interface '$_new' already exists"; continue; }
@@ -3883,7 +5151,7 @@ do_rename_interface() {
     done
 
     _old_zone="$(find_zone_for_interface "$_old" 2>/dev/null || true)"
-    _old_port="$(uci -q get "network.${_old}.listen_port" || true)"
+    _old_port="$(iface_get "$_old" listen_port)"
     _has_podkop=0
     podkop_present && podkop_has_interface "$_old" 2>/dev/null && _has_podkop=1
 
@@ -3907,7 +5175,7 @@ do_rename_interface() {
     fi
     echo ""
 
-    confirm "Proceed with rename?" "n" || { echo -e "  ${DIM2}Cancelled${NC}"; return 1; }
+    confirm "Proceed with rename?" "n" || { cancelled; return 1; }
 
     init_backup "Pre-Interface Rename"
 
@@ -3915,31 +5183,19 @@ do_rename_interface() {
     ifdown "$_old" >/dev/null 2>&1 || true
     spinner_stop
 
-    # ── 1. Copy network interface ──
+    # ── 1. Copy network interface (schema-driven — new fields auto-propagate) ──
     echo -e "  ${B}Creating${NC} new interface ${W}${_new}${NC}"
     uci set "network.${_new}=interface"
-    # Copy all known fields from old to new
-    for _field in proto private_key listen_port mtu dns endpoint_host disabled; do
-        _val="$(uci -q get "network.${_old}.${_field}" || true)"
-        [ -n "$_val" ] && uci set "network.${_new}.${_field}=${_val}"
-    done
+    iface_copy_fields "$_old" "$_new"
     uci set "network.${_new}._liminal_iface=${_new}"
-    # Copy list fields (addresses)
-    for _addr_val in $(uci -q get "network.${_old}.addresses" 2>/dev/null || true); do
-        uci add_list "network.${_new}.addresses=${_addr_val}"
-    done
 
-    # ── 2. Copy all peers ──
+    # ── 2. Copy all peers (schema-driven) ──
     _old_pt="amneziawg_${_old}"
     _new_pt="amneziawg_${_new}"
     _pi=0
-    while uci -q get "network.@${_old_pt}[$_pi]" >/dev/null 2>&1; do
+    while peer_exists "$_old_pt" "$_pi"; do
         _sec="$(uci add network "$_new_pt")"
-        for _pf in public_key private_key preshared_key route_allowed_ips allowed_ips \
-                   persistent_keepalive description disabled client_allowed_ips endpoint_host; do
-            _pv="$(uci -q get "network.@${_old_pt}[$_pi].${_pf}" || true)"
-            [ -n "$_pv" ] && uci set "network.${_sec}.${_pf}=${_pv}"
-        done
+        peer_copy_fields "$_old_pt" "$_pi" "$_sec"
         _pi=$((_pi + 1))
     done
     echo -e "  ${B}Copied${NC} ${_pi} peer(s)"
@@ -3976,7 +5232,6 @@ do_rename_interface() {
         if [ "$_fl" = "$_old" ]; then
             _fsrc="$(uci -q get "firewall.@forwarding[$_fi].src" || true)"
             _fdst="$(uci -q get "firewall.@forwarding[$_fi].dest" || true)"
-            # Update zone references in src/dest
             [ "$_fsrc" = "$_old_zone" ] && uci set "firewall.@forwarding[$_fi].src=${_new_zone}"
             [ "$_fdst" = "$_old_zone" ] && uci set "firewall.@forwarding[$_fi].dest=${_new_zone}"
             uci set "firewall.@forwarding[$_fi]._liminal_iface=${_new}"
@@ -4010,16 +5265,10 @@ do_rename_interface() {
     fi
 
     # ── 9. Commit & reload ──
-    echo -e "  ${B}Committing${NC} config..."
-    uci commit network
-    uci commit firewall
-
-    echo -e "  ${B}Reloading${NC} network & firewall..."
-    /etc/init.d/network reload
-    /etc/init.d/firewall restart 2>/dev/null
-    if podkop_present && [ -x /etc/init.d/podkop ] && [ "$_has_podkop" -eq 1 ]; then
-        echo -e "  ${B}Restarting${NC} Podkop..."
-        /etc/init.d/podkop restart >/dev/null 2>&1 || true
+    if podkop_present && [ "$_has_podkop" -eq 1 ]; then
+        apply_all podkop
+    else
+        apply_all
     fi
 
     echo -e "\n  ${OK}Interface renamed: ${_old} → ${_new}${NC}"
@@ -4036,7 +5285,7 @@ do_rename_interface() {
 do_delete_interface() {
     DEL_IFACE="$1"
 
-    DEL_PORT="$(uci -q get "network.${DEL_IFACE}.listen_port" || true)"
+    DEL_PORT="$(iface_get "$DEL_IFACE" listen_port)"
     DEL_ZONE="$(find_zone_for_interface "$DEL_IFACE" 2>/dev/null || true)"
 
     section "Will be removed"
@@ -4128,17 +5377,7 @@ do_delete_interface() {
     fi
 
     # ── Commit & reload ──
-    echo -e "  ${B}Committing${NC} config..."
-    uci commit network
-    uci commit firewall
-
-    echo -e "  ${B}Reloading${NC} network & firewall..."
-    /etc/init.d/network reload
-    /etc/init.d/firewall restart 2>/dev/null
-    if podkop_present && [ -x /etc/init.d/podkop ]; then
-        echo -e "  ${B}Restarting${NC} Podkop..."
-        /etc/init.d/podkop restart >/dev/null 2>&1 || true
-    fi
+    if podkop_present; then apply_all podkop; else apply_all; fi
 
     echo -e "\n  ${OK}Interface '${DEL_IFACE}' deleted${NC}"
     echo -e "  ${A}Backups:${NC} $BACKUP_DIR"
@@ -4154,7 +5393,7 @@ do_create() {
     trap_cancel
     clear
     echo -e "${W}Create Interface${NC}"
-    echo -e "${DIM}──────────────────────────────────────${NC}"
+    echo -e "${DIM2}──────────────────────────────────────${NC}"
     echo ""
     echo -e "  ${WARN_C}NOTE: A static public IP address (or a DDNS hostname) and${NC}"
     echo -e "  ${WARN_C}NAT port forwarding (UDP) on your upstream router are${NC}"
@@ -4190,7 +5429,7 @@ do_create() {
                     | sed -n "s/^network\.\([^.]*\)\.addresses=.*/\1/p" \
                     | sort -u)"
                 for _eif in $_all_ifaces; do
-                    for _ev in $(uci -q get "network.${_eif}.addresses" 2>/dev/null); do
+                    for _ev in $(iface_get "$_eif" addresses); do
                         case "$_ev" in */*) ;; *) continue ;; esac
                         _esubnet="$(network_base_from_cidr "$_ev")"
                         if [ "$_esubnet" = "$_new_subnet" ] || cidr_contains_ip "$_ev" "$_new_ip"; then
@@ -4218,7 +5457,7 @@ do_create() {
                 | sed -n "s/^network\.\([^.]*\)\.addresses=.*/\1/p" \
                 | sort -u)"
             for _eif in $_all_ifaces; do
-                for _ev in $(uci -q get "network.${_eif}.addresses" 2>/dev/null); do
+                for _ev in $(iface_get "$_eif" addresses); do
                     case "$_ev" in */*) ;; *) continue ;; esac
                     _esubnet="$(network_base_from_cidr "$_ev")"
                     if [ "$_esubnet" = "$_new_subnet" ] || cidr_contains_ip "$_ev" "$_new_ip"; then
@@ -4246,8 +5485,13 @@ do_create() {
         break
     done
 
+    # MTU default: detect upstream MTU and subtract 80 (AWG/WG overhead).
+    # Fall back to the static suggestion from liminal.settings if detection fails.
+    _mtu_hint="$(recommend_mtu 1.1.1.1 2>/dev/null || echo "$CFG_MTU_SUGGESTION")"
+    [ "$_mtu_hint" -lt 1200 ] 2>/dev/null && _mtu_hint="$CFG_MTU_SUGGESTION"
+    echo -e "  ${DIM2}Recommended: ${W}${_mtu_hint}${DIM2} (upstream MTU − 80)${NC}"
     while true; do
-        prompt MTU_VALUE "MTU" "$CFG_MTU_SUGGESTION" || { trap_restore; return; }
+        prompt MTU_VALUE "MTU" "$_mtu_hint" || { trap_restore; return; }
         is_cancelled && { trap_restore; return; }
         case "$MTU_VALUE" in *[!0-9]*) warn "MTU must be numeric"; continue ;; esac
         [ "$MTU_VALUE" -ge 1200 ] 2>/dev/null || warn "MTU below 1200 is unusual"
@@ -4411,6 +5655,21 @@ do_create() {
     KEYS="$(generate_awg_keys)"
     SERVER_PRIVKEY="$(printf '%s\n' "$KEYS" | sed -n '1p')"
     SERVER_PUBKEY="$(printf  '%s\n' "$KEYS" | sed -n '2p')"
+
+    echo -e "  ${B}Generating${NC} obfuscation params..."
+    OBF="$(generate_awg_obfuscation)"
+    AWG_JC="$(printf   '%s\n' "$OBF" | sed -n '1p')"
+    AWG_JMIN="$(printf '%s\n' "$OBF" | sed -n '2p')"
+    AWG_JMAX="$(printf '%s\n' "$OBF" | sed -n '3p')"
+    AWG_S1="$(printf   '%s\n' "$OBF" | sed -n '4p')"
+    AWG_S2="$(printf   '%s\n' "$OBF" | sed -n '5p')"
+    AWG_S3="$(printf   '%s\n' "$OBF" | sed -n '6p')"
+    AWG_S4="$(printf   '%s\n' "$OBF" | sed -n '7p')"
+    AWG_H1="$(printf   '%s\n' "$OBF" | sed -n '8p')"
+    AWG_H2="$(printf   '%s\n' "$OBF" | sed -n '9p')"
+    AWG_H3="$(printf   '%s\n' "$OBF" | sed -n '10p')"
+    AWG_H4="$(printf   '%s\n' "$OBF" | sed -n '11p')"
+    AWG_I1="$(printf   '%s\n' "$OBF" | sed -n '12p')"
     echo ""
 
     echo -e "  ${A}Interface${NC}    ${W}$IFNAME${NC}"
@@ -4425,6 +5684,7 @@ do_create() {
     echo -e "  ${A}-> LAN${NC}       $( [ "$ALLOW_LAN_FORWARD" = "1" ] && echo -e "${OK}yes${NC}" || echo -e "${DIM2}no${NC}" )"
     echo -e "  ${A}-> WAN${NC}       $( [ "$ALLOW_WAN_FORWARD" = "1" ] && echo -e "${OK}yes${NC}" || echo -e "${DIM2}no${NC}" )"
     echo -e "  ${A}Podkop${NC}       $( [ "$USE_PODKOP" = "1" ] && echo -e "${OK}yes${NC}" || echo -e "${DIM2}no${NC}" )"
+    echo -e "  ${A}Obfuscation${NC}  ${DIM2}Jc=${NC}${W}$AWG_JC${NC} ${DIM2}Jmin=${NC}${W}$AWG_JMIN${NC} ${DIM2}Jmax=${NC}${W}$AWG_JMAX${NC} ${DIM2}S1=${NC}${W}$AWG_S1${NC} ${DIM2}S2=${NC}${W}$AWG_S2${NC}"
     echo ""
 
     trap_restore
@@ -4442,6 +5702,17 @@ do_create() {
     uci add_list "network.${IFNAME}.addresses=${IFADDR}"
     uci set "network.${IFNAME}.mtu=${MTU_VALUE}"
     uci set "network.${IFNAME}.dns=${DNS_IP}"
+    uci set "network.${IFNAME}.awg_jc=${AWG_JC}"
+    uci set "network.${IFNAME}.awg_jmin=${AWG_JMIN}"
+    uci set "network.${IFNAME}.awg_jmax=${AWG_JMAX}"
+    uci set "network.${IFNAME}.awg_s1=${AWG_S1}"
+    uci set "network.${IFNAME}.awg_s2=${AWG_S2}"
+    uci set "network.${IFNAME}.awg_s3=${AWG_S3}"
+    uci set "network.${IFNAME}.awg_s4=${AWG_S4}"
+    uci set "network.${IFNAME}.awg_h1=${AWG_H1}"
+    uci set "network.${IFNAME}.awg_h2=${AWG_H2}"
+    uci set "network.${IFNAME}.awg_h3=${AWG_H3}"
+    uci set "network.${IFNAME}.awg_h4=${AWG_H4}"
 
     # ── Apply: firewall zone ──
     echo -e "  ${B}Creating${NC} FW zone ${W}$ZONE_NAME${NC}"
@@ -4496,22 +5767,13 @@ do_create() {
     fi
 
     # ── Commit & reload ──
-    echo -e "  ${B}Committing${NC} config..."
-    uci commit network
-    uci commit firewall
-
-    echo -e "  ${B}Reloading${NC} network & firewall..."
-    /etc/init.d/network reload
-    /etc/init.d/firewall restart 2>/dev/null
+    apply_all
 
     # ── Podkop integration ──
     if [ "$USE_PODKOP" = "1" ]; then
         if confirm "Add '$IFNAME' to Podkop source interfaces?" "y"; then
             add_podkop_interface "$IFNAME"
-            if [ -x /etc/init.d/podkop ]; then
-                echo -e "  ${B}Restarting${NC} Podkop..."
-                /etc/init.d/podkop restart >/dev/null 2>&1 || warn "Podkop restart failed"
-            fi
+            svc_restart podkop
         fi
     fi
 
@@ -4544,9 +5806,9 @@ do_backup_menu() {
 
     while true; do
         clear
-        echo -e "${W}Backup${NC} ${DIM}·${NC} ${W}${_bname}${NC}"
+        echo -e "${W}Backup${NC} ${DIM2}·${NC} ${W}${_bname}${NC}"
         echo ""
-        echo -e "${DIM}──────────────────────────────────────${NC}"
+        echo -e "${DIM2}──────────────────────────────────────${NC}"
         echo ""
         _bsize="$(du -sh "$_bdir" 2>/dev/null | cut -f1 || echo "?")"
         echo -e "  ${A}Date${NC}         ${W}${_date}${NC}"
@@ -4565,7 +5827,7 @@ do_backup_menu() {
         echo -e "  ${A}Podkop${NC}       ${_has_pk}"
         echo -e "  ${A}Liminal${NC}      ${_has_lim}"
         echo ""
-        echo -e "${DIM}──────────────────────────────────────${NC}"
+        echo -e "${DIM2}──────────────────────────────────────${NC}"
         echo ""
         echo -e "  ${DIM2}Actions${NC}"
         echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Restore${NC} From This Backup"
@@ -4604,7 +5866,7 @@ do_manage_backups() {
         fi
         echo -e "${W}Manage Backups${NC}"
         echo ""
-        echo -e "${DIM}──────────────────────────────────────${NC}"
+        echo -e "${DIM2}──────────────────────────────────────${NC}"
         echo ""
         echo -e "  ${A}Auto-Backup${NC}  ${_ab_status}"
         echo ""
@@ -4620,13 +5882,13 @@ do_manage_backups() {
             _reason="$(cat "${d}/.reason" 2>/dev/null || echo "Unknown")"
             _date="$(cat "${d}/.date" 2>/dev/null || echo "$(basename "$d")")"
             _bsize="$(du -sh "$d" 2>/dev/null | cut -f1 || echo "?")"
-            echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${W}${_date}${NC} ${DIM}·${NC} ${A}${_reason}${NC} ${DIM2}${_bsize}${NC}"
+            echo -e "  ${B}${_n}${NC} ${DIM2}›${NC} ${W}${_date}${NC} ${DIM2}·${NC} ${A}${_reason}${NC} ${DIM2}${_bsize}${NC}"
         done
 
         [ "$_n" -eq 0 ] && echo -e "${DIM2}No backups found${NC}"
 
         echo ""
-        echo -e "${DIM}──────────────────────────────────────${NC}"
+        echo -e "${DIM2}──────────────────────────────────────${NC}"
         echo ""
         if autobackup_enabled; then
             _ab_toggle="${ERR}Disable${NC} Auto-Backup"
@@ -4699,7 +5961,7 @@ do_full_reset() {
     clear
     echo -e "${W}Full Reset${NC}"
     echo ""
-    echo -e "${DIM}──────────────────────────────────────${NC}"
+    echo -e "${DIM2}──────────────────────────────────────${NC}"
     echo ""
     echo -e "  ${A}This will:${NC}"
     echo -e "  ${ERR}-${NC} Delete all AmneziaWG interfaces"
@@ -4718,7 +5980,7 @@ do_full_reset() {
         echo ""
     fi
 
-    echo -e "${DIM}──────────────────────────────────────${NC}"
+    echo -e "${DIM2}──────────────────────────────────────${NC}"
     echo ""
     echo -e "  ${ERR}This action cannot be undone.${NC}"
     echo ""
@@ -4726,22 +5988,18 @@ do_full_reset() {
 
     # Delete each interface with full cleanup
     for iface in $interfaces; do
-        _port="$(uci -q get "network.${iface}.listen_port" || true)"
+        _port="$(iface_get "$iface" listen_port)"
         _zone="$(find_zone_for_interface "$iface" 2>/dev/null || true)"
 
-        # Delete DNS hostrecords
         remove_iface_hostrecords "$iface"
 
-        # Delete peers
         while uci -q get "network.@amneziawg_${iface}[0]" >/dev/null 2>&1; do
             uci delete "network.@amneziawg_${iface}[0]"
         done
 
-        # Delete interface
         echo -e "  ${B}Removing${NC} ${W}${iface}${NC}..."
         uci delete "network.${iface}" 2>/dev/null || true
 
-        # Delete forwardings (reverse order, by _liminal_iface)
         _cnt=0
         while uci -q get "firewall.@forwarding[$_cnt]" >/dev/null 2>&1; do
             _cnt=$((_cnt + 1))
@@ -4753,7 +6011,6 @@ do_full_reset() {
             _fi=$((_fi - 1))
         done
 
-        # Delete zone by _liminal_iface
         if [ -n "$_zone" ]; then
             _zi="$(find_zone_index "$_zone" || true)"
             if [ -n "$_zi" ]; then
@@ -4762,7 +6019,6 @@ do_full_reset() {
             fi
         fi
 
-        # Delete firewall rules (reverse order, by _liminal_iface)
         _cnt=0
         while uci -q get "firewall.@rule[$_cnt]" >/dev/null 2>&1; do
             _cnt=$((_cnt + 1))
@@ -4785,11 +6041,11 @@ do_full_reset() {
     uci commit firewall 2>/dev/null || true
 
     echo -e "  ${B}Reloading${NC} network & firewall..."
-    /etc/init.d/network reload 2>/dev/null || true
-    /etc/init.d/firewall restart 2>/dev/null || true
+    svc_reload network
+    svc_restart firewall
     if podkop_present && [ -x /etc/init.d/podkop ]; then
         echo -e "  ${B}Restarting${NC} Podkop..."
-        /etc/init.d/podkop restart >/dev/null 2>&1 || true
+        svc_restart podkop
     fi
 
     # Delete backups
@@ -4898,48 +6154,14 @@ do_export_config() {
     _json='{"liminal_version":"'"$LIMINAL_VERSION"'","exported":"'"$(date '+%Y-%m-%d %H:%M:%S')"'","interfaces":[]}'
 
     for iface in $_interfaces; do
-        _addr="$(uci -q get "network.${iface}.addresses" || echo "")"
-        _port="$(uci -q get "network.${iface}.listen_port" || echo "")"
-        _privkey="$(uci -q get "network.${iface}.private_key" || echo "")"
-        _mtu="$(uci -q get "network.${iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
-        _dns="$(uci -q get "network.${iface}.dns" || echo "")"
-        _zone="$(find_zone_for_interface "$iface" 2>/dev/null || echo "")"
-
-        _iface_json="$(jq -n \
-            --arg name "$iface" \
-            --arg addr "$_addr" \
-            --arg port "$_port" \
-            --arg privkey "$_privkey" \
-            --arg mtu "$_mtu" \
-            --arg dns "$_dns" \
-            --arg zone "$_zone" \
-            '{name:$name, addresses:$addr, listen_port:$port, private_key:$privkey, mtu:$mtu, dns:$dns, zone:$zone, peers:[]}'
-        )"
-
-        # Export peers
+        _iface_json="$(iface_to_json "$iface")"
         _pt="amneziawg_${iface}"
         _pi=0
-        while uci -q get "network.@${_pt}[$_pi]" >/dev/null 2>&1; do
-            _pdesc="$(uci -q get "network.@${_pt}[$_pi].description" || echo "")"
-            _ppub="$(uci -q get "network.@${_pt}[$_pi].public_key" || echo "")"
-            _ppriv="$(uci -q get "network.@${_pt}[$_pi].private_key" || echo "")"
-            _paip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "")"
-            _pka="$(uci -q get "network.@${_pt}[$_pi].persistent_keepalive" || echo "$CFG_DEFAULT_KEEPALIVE")"
-            _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
-
-            _peer_json="$(jq -n \
-                --arg desc "$_pdesc" \
-                --arg pub "$_ppub" \
-                --arg priv "$_ppriv" \
-                --arg aip "$_paip" \
-                --arg ka "$_pka" \
-                --arg dis "$_pdis" \
-                '{description:$desc, public_key:$pub, private_key:$priv, allowed_ips:$aip, persistent_keepalive:$ka, disabled:$dis}'
-            )"
+        while peer_exists "$_pt" "$_pi"; do
+            _peer_json="$(peer_to_json "$_pt" "$_pi")"
             _iface_json="$(echo "$_iface_json" | jq --argjson p "$_peer_json" '.peers += [$p]')"
             _pi=$((_pi + 1))
         done
-
         _json="$(echo "$_json" | jq --argjson i "$_iface_json" '.interfaces += [$i]')"
     done
 
@@ -4965,7 +6187,7 @@ do_import_config() {
     section "Import"
 
     prompt _import_file "Path to export JSON file" "" || return
-    [ -z "${_import_file:-}" ] && { echo -e "  ${DIM2}Cancelled${NC}"; PAUSE; return; }
+    [ -z "${_import_file:-}" ] && { cancelled; PAUSE; return; }
     [ -f "$_import_file" ] || { warn "File not found: $_import_file"; PAUSE; return; }
 
     _ver="$(jq -r '.liminal_version // empty' "$_import_file" 2>/dev/null || true)"
@@ -4989,12 +6211,8 @@ do_import_config() {
 
     _idx=0
     while [ "$_idx" -lt "$_icount" ]; do
-        _iname="$(jq -r ".interfaces[$_idx].name" "$_import_file")"
-        _iaddr="$(jq -r ".interfaces[$_idx].addresses" "$_import_file")"
-        _iport="$(jq -r ".interfaces[$_idx].listen_port" "$_import_file")"
-        _iprivkey="$(jq -r ".interfaces[$_idx].private_key" "$_import_file")"
-        _imtu="$(jq -r ".interfaces[$_idx].mtu" "$_import_file")"
-        _idns="$(jq -r ".interfaces[$_idx].dns" "$_import_file")"
+        _iobj="$(jq -c ".interfaces[$_idx]" "$_import_file")"
+        _iname="$(printf '%s' "$_iobj" | jq -r '.name')"
 
         if uci_network_exists "$_iname"; then
             warn "Interface '$_iname' already exists — skipping"
@@ -5003,36 +6221,20 @@ do_import_config() {
 
         echo -e "  ${B}Creating${NC} interface ${W}${_iname}${NC}..."
         uci set "network.${_iname}=interface"
-        uci set "network.${_iname}.proto=amneziawg"
+        iface_apply_json_fields "$_iname" "$_iobj"
         uci set "network.${_iname}._liminal_iface=${_iname}"
-        uci set "network.${_iname}.private_key=${_iprivkey}"
-        uci set "network.${_iname}.listen_port=${_iport}"
-        uci add_list "network.${_iname}.addresses=${_iaddr}"
-        uci set "network.${_iname}.mtu=${_imtu}"
-        uci set "network.${_iname}.dns=${_idns}"
 
-        # Import peers
         _pt="amneziawg_${_iname}"
-        _pcnt="$(jq ".interfaces[$_idx].peers | length" "$_import_file")"
+        _pcnt="$(printf '%s' "$_iobj" | jq '.peers | length')"
         _pidx=0
         while [ "$_pidx" -lt "$_pcnt" ]; do
-            _pdesc="$(jq -r ".interfaces[$_idx].peers[$_pidx].description" "$_import_file")"
-            _ppub="$(jq -r ".interfaces[$_idx].peers[$_pidx].public_key" "$_import_file")"
-            _ppriv="$(jq -r ".interfaces[$_idx].peers[$_pidx].private_key" "$_import_file")"
-            _paip="$(jq -r ".interfaces[$_idx].peers[$_pidx].allowed_ips" "$_import_file")"
-            _pka="$(jq -r ".interfaces[$_idx].peers[$_pidx].persistent_keepalive" "$_import_file")"
-            _pdis="$(jq -r ".interfaces[$_idx].peers[$_pidx].disabled" "$_import_file")"
-
+            _pobj="$(printf '%s' "$_iobj" | jq -c ".peers[$_pidx]")"
+            _pdesc="$(printf '%s' "$_pobj" | jq -r '.description // ""')"
             echo -e "    ${B}Adding${NC} peer ${W}${_pdesc}${NC}..."
             _sec="$(uci add network "$_pt")"
-            uci set "network.${_sec}.public_key=${_ppub}"
-            uci set "network.${_sec}.private_key=${_ppriv}"
+            peer_apply_json_fields "$_sec" "$_pobj"
+            # Always set route_allowed_ips=1 (not in schema — it's a UCI default for liminal peers)
             uci set "network.${_sec}.route_allowed_ips=1"
-            uci set "network.${_sec}.allowed_ips=${_paip}"
-            uci set "network.${_sec}.persistent_keepalive=${_pka}"
-            uci set "network.${_sec}.description=${_pdesc}"
-            [ "$_pdis" = "1" ] && uci set "network.${_sec}.disabled=1"
-
             _pidx=$((_pidx + 1))
         done
 
@@ -5042,8 +6244,7 @@ do_import_config() {
     uci commit network
 
     echo -e "  ${B}Reloading${NC} network..."
-    /etc/init.d/network reload >/dev/null 2>&1 || true
-
+    svc_reload network
     echo ""
     echo -e "  ${OK}Import complete${NC}"
     echo -e "  ${DIM2}Note: Firewall zones/rules were not imported — recreate them manually or re-run Create.${NC}"
@@ -5055,7 +6256,7 @@ do_export_import_menu() {
         clear
         echo -e "${W}Export / Import${NC}"
         echo ""
-        echo -e "${DIM}──────────────────────────────────────${NC}"
+        echo -e "${DIM2}──────────────────────────────────────${NC}"
         echo ""
         echo -e "  ${DIM2}Data${NC}"
         echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Export${NC} Configuration"
@@ -5096,9 +6297,9 @@ do_live_dashboard() {
             echo -e "  ${DIM2}No Liminal interfaces found${NC}"
         else
             for iface in $_interfaces; do
-                _addr="$(uci -q get "network.${iface}.addresses" || echo "n/a")"
-                _port="$(uci -q get "network.${iface}.listen_port" || echo "n/a")"
-                _disabled="$(uci -q get "network.${iface}.disabled" || echo "0")"
+                _addr="$(iface_get "$iface" addresses "n/a")"
+                _port="$(iface_get "$iface" listen_port "n/a")"
+                _disabled="$(iface_get "$iface" disabled "0")"
 
                 if [ "$_disabled" = "1" ]; then
                     box_top 100
@@ -5134,11 +6335,11 @@ do_live_dashboard() {
 
                 _pt="amneziawg_${iface}"
                 _pi=0
-                while uci -q get "network.@${_pt}[$_pi]" >/dev/null 2>&1; do
-                    _pdesc="$(uci -q get "network.@${_pt}[$_pi].description" || echo "peer$((_pi+1))")"
-                    _ppub="$(uci -q get "network.@${_pt}[$_pi].public_key" || true)"
-                    _paip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "?")"
-                    _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
+                while peer_exists "$_pt" "$_pi"; do
+                    _pdesc="$(peer_get "$_pt" "$_pi" description "peer$((_pi+1))")"
+                    _ppub="$(peer_get "$_pt" "$_pi" public_key)"
+                    _paip="$(peer_get "$_pt" "$_pi" allowed_ips "?")"
+                    _pdis="$(peer_get "$_pt" "$_pi" disabled "0")"
 
                     if [ "$_pdis" = "1" ]; then
                         echo -e "${DIM}${BOX_V}${NC}${_G1}${DIM2}${_pdesc}${_G2}${ICO_DIS} ${DIM2}Disabled${_G3}${_paip}${NC}"
@@ -5153,13 +6354,7 @@ do_live_dashboard() {
                     _ico="${ICO_OFF}"; _status="${ERR}Offline${NC}"
                     _hs_sec="9999"
                     if [ -n "$_hs" ] && [ "$_hs" != "-" ] && [ "$_hs" != "never" ]; then
-                        _hs_sec="$(awg show "$iface" 2>/dev/null | awk -v pk="$_ppub" '
-                            /peer:/{cur=$NF} cur==pk&&/latest handshake:/{
-                                sub(/.*latest handshake: /,"");t=0;
-                                for(i=1;i<=NF;i++){if($i~/^[0-9]+$/){n=$i;u=$(i+1);
-                                    if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
-                                    else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
-                                print t;exit}' 2>/dev/null)"
+                        _hs_sec="$(awg_peer_handshake_age "$iface" "$_ppub")"
                         if [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null; then
                             _ico="${ICO_ON}"; _status="${OK}Online${NC}"
                         fi
@@ -5195,10 +6390,10 @@ do_connectivity_check() {
     clear
     echo -e "${W}Connectivity Check${NC}"
     echo ""
-    echo -e "${DIM}──────────────────────────────────────${NC}"
+    echo -e "${DIM2}──────────────────────────────────────${NC}"
 
     for iface in $_interfaces; do
-        _disabled="$(uci -q get "network.${iface}.disabled" || echo "0")"
+        _disabled="$(iface_get "$iface" disabled "0")"
         echo ""
         echo -e "  ${A}Interface${NC} ${W}${iface}${NC}"
 
@@ -5222,7 +6417,7 @@ do_connectivity_check() {
         fi
 
         # Check 3: listen port
-        _port="$(uci -q get "network.${iface}.listen_port" || echo "")"
+        _port="$(iface_get "$iface" listen_port)"
         if [ -n "$_port" ] && port_in_use "$_port"; then
             echo -e "  ${DIM2}Port ${_port}${NC}    ${OK}Listening${NC}"
         else
@@ -5252,11 +6447,11 @@ do_connectivity_check() {
         # Check 6: ping online peers only
         _pt="amneziawg_${iface}"
         _pi=0; _online_found=0
-        while uci -q get "network.@${_pt}[$_pi]" >/dev/null 2>&1; do
-            _pdesc="$(uci -q get "network.@${_pt}[$_pi].description" || echo "peer$((_pi+1))")"
-            _ppub="$(uci -q get "network.@${_pt}[$_pi].public_key" || true)"
-            _paip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "")"
-            _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
+        while peer_exists "$_pt" "$_pi"; do
+            _pdesc="$(peer_get "$_pt" "$_pi" description "peer$((_pi+1))")"
+            _ppub="$(peer_get "$_pt" "$_pi" public_key)"
+            _paip="$(peer_get "$_pt" "$_pi" allowed_ips)"
+            _pdis="$(peer_get "$_pt" "$_pi" disabled "0")"
             _pip="${_paip%/*}"
 
             # Skip disabled and offline peers
@@ -5265,13 +6460,7 @@ do_connectivity_check() {
             fi
             _is_online=0
             if [ -n "$_ppub" ]; then
-                _hs_sec="$(awg show "$iface" 2>/dev/null | awk -v pk="$_ppub" '
-                    /peer:/{cur=$NF} cur==pk&&/latest handshake:/{
-                        sub(/.*latest handshake: /,"");t=0;
-                        for(i=1;i<=NF;i++){if($i~/^[0-9]+$/){n=$i;u=$(i+1);
-                            if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
-                            else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
-                        print t;exit}' 2>/dev/null)"
+                _hs_sec="$(awg_peer_handshake_age "$iface" "$_ppub")"
                 [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null && _is_online=1
             fi
             if [ "$_is_online" -eq 0 ]; then
@@ -5290,7 +6479,7 @@ do_connectivity_check() {
     done
 
     echo ""
-    echo -e "${DIM}──────────────────────────────────────${NC}"
+    echo -e "${DIM2}──────────────────────────────────────${NC}"
     PAUSE
 }
 
@@ -5304,13 +6493,13 @@ show_menu() {
         clear
         AWG_COUNT="$(get_awg_interfaces | wc -w)"
         if have_cmd awg; then
-            _awg_ver="$(awg version 2>/dev/null | sed -n 's/.*tools \(v[^ ]*\).*/\1/p')"
+            _awg_ver="$(pkg_version amneziawg-tools 2>/dev/null)"
             _awg_s="${ICO_OK} ${OK}${_awg_ver:-ok}${NC}"
         else
             _awg_s="${ICO_ERR} ${DIM2}n/a${NC}"
         fi
-        if podkop_present && have_cmd podkop; then
-            _pk_ver="$(podkop get_system_info 2>/dev/null | sed -n 's/.*"podkop_version"[^"]*"\([^"]*\)".*/\1/p')"
+        if podkop_present; then
+            _pk_ver="$(pkg_version podkop 2>/dev/null)"
             _pk_s="${ICO_OK} ${OK}${_pk_ver:-ok}${NC}"
         else
             _pk_s="${ICO_ERR} ${DIM2}n/a${NC}"
@@ -5327,9 +6516,9 @@ show_menu() {
         echo -ne "${A}⠀⠀⣇⠀⢻⢿⠀⠀⡼⠇⠘⣆⠀⠠⣸⢀⣙⣢⣀⢢⣶⣥⢿⣯⠀⢸⢿${NC}" && echo -e "${_C}${DIM2}·${NC} ${A}GitHub${NC}     ${W}@tickcount${NC}"
         echo -ne "${A}⠀⠀⢿⠀⠰⣾⣾⠼⣷⣭⢿⡆⠳⢿⡚⢲⢿⢿⠓⠉⠉⢻⢿⢿⣀⢿⢿${NC}" && echo -e "${_C}${DIM2}·${NC} ${A}Website${NC}    ${W}aemeath.eu${NC}"
         echo -e "${A}⠀⠀⠸⡀⢠⢿⢿⡀⢧⠈⠒⠀⠀⣀⠀⠀⠁⠉⢛⠀⣠⡟⢿⢿⢿⢿⢿${NC}"
-        echo -e "${DIM}⠀⠀⠀⣇⢿⢿⢿⢿⣶⣕⣤⢿⢿⣇⣀⣀⣤⠒⠓⠋⠋⠀⢿⢿⢿⢿⡟${NC}"
-        echo -e "${DIM}⠀⠀⢠⣏⢿⢿⢿⠀⠀⠀⣼⢿⢿⡟⣾⢿⠟⠉⣦⠀⠀⠘⠋⠈⢿⢿⠃${NC}"
-        echo -e "${DIM}⠀⢀⢿⢿⠋⠉⠀⠀⡞⠉⠉⢻⣛⢋⣶⠏⠀⣰⠁⠀⠀⠀⠀⠀⢻⢿⣧${NC}"
+        echo -e "${DIM2}⠀⠀⠀⣇⢿⢿⢿⢿⣶⣕⣤⢿⢿⣇⣀⣀⣤⠒⠓⠋⠋⠀⢿⢿⢿⢿⡟${NC}"
+        echo -e "${DIM2}⠀⠀⢠⣏⢿⢿⢿⠀⠀⠀⣼⢿⢿⡟⣾⢿⠟⠉⣦⠀⠀⠘⠋⠈⢿⢿⠃${NC}"
+        echo -e "${DIM2}⠀⢀⢿⢿⠋⠉⠀⠀⡞⠉⠉⢻⣛⢋⣶⠏⠀⣰⠁⠀⠀⠀⠀⠀⢻⢿⣧${NC}"
         echo ""
 
         _has_awg=0; have_cmd awg && _has_awg=1
@@ -5360,7 +6549,7 @@ show_menu() {
                 _iface_n=$((_iface_n + 1))
                 _iface_list="${_iface_list} ${iface}"
                 _pc="$(count_peers "$iface")"
-                _dis="$(uci -q get "network.${iface}.disabled" || echo "0")"
+                _dis="$(iface_get "$iface" disabled "0")"
                 if [ "$_dis" = "1" ]; then
                     echo -e "  ${B}${_iface_n}${NC} ${DIM2}›${NC} ${ICO_DIS} ${DIM2}${iface}${NC}  ${DIM2}${_pc} peers${NC}"
                 elif interface_device_exists "$iface"; then
@@ -5373,7 +6562,7 @@ show_menu() {
 
             # Non-liminal AWG interfaces
             for iface in $_all_awg; do
-                _is_l="$(uci -q get "network.${iface}._liminal_iface" || true)"
+                _is_l="$(iface_get "$iface" _liminal_iface)"
                 [ -n "$_is_l" ] && _is_l="1" || _is_l="0"
                 [ "$_is_l" = "1" ] && continue
                 _iface_n=$((_iface_n + 1))
@@ -5582,218 +6771,7 @@ show_menu() {
     done
 }
 
-# ═════════════════════════════════════════════════════════════════════
-#  CLI (NON-INTERACTIVE) MODE
-# ═════════════════════════════════════════════════════════════════════
-
-cli_usage() {
-    cat <<USAGE
-Liminal v${LIMINAL_VERSION} — AmneziaWG manager for OpenWRT
-
-Usage: $SCRIPT_NAME <command> [options]
-
-Commands:
-  status                 Show all interfaces and peers (one-shot dashboard)
-  check                  Run connectivity check
-  list                   List interfaces (names only)
-  peers <interface>      List peers for an interface
-  export [file]          Export config to JSON (default: \$EXPORT_DIR/...)
-  import <file>          Import config from JSON
-  update                 Check for updates and install if available
-  version                Print version
-
-Run without arguments for interactive menu.
-USAGE
-}
-
-cli_status() {
-    have_cmd awg || die "AmneziaWG is not installed"
-    _interfaces="$(get_awg_interfaces)"
-    [ -z "$_interfaces" ] && { echo "No Liminal interfaces"; exit 0; }
-
-    for iface in $_interfaces; do
-        _addr="$(uci -q get "network.${iface}.addresses" || echo "n/a")"
-        _port="$(uci -q get "network.${iface}.listen_port" || echo "n/a")"
-        _disabled="$(uci -q get "network.${iface}.disabled" || echo "0")"
-
-        if [ "$_disabled" = "1" ]; then
-            printf "%-12s  DISABLED  %s :%s\n" "$iface" "$_addr" "$_port"
-            continue
-        elif ! interface_device_exists "$iface"; then
-            printf "%-12s  DOWN      %s :%s\n" "$iface" "$_addr" "$_port"
-            continue
-        fi
-
-        _active="$(count_active_peers "$iface")"
-        _total="$(count_peers "$iface")"
-        printf "%-12s  UP        %s :%s  peers: %s/%s\n" "$iface" "$_addr" "$_port" "$_active" "$_total"
-
-        _pt="amneziawg_${iface}"
-        _pi=0
-        while uci -q get "network.@${_pt}[$_pi]" >/dev/null 2>&1; do
-            _pdesc="$(uci -q get "network.@${_pt}[$_pi].description" || echo "peer$((_pi+1))")"
-            _ppub="$(uci -q get "network.@${_pt}[$_pi].public_key" || true)"
-            _paip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "?")"
-            _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
-
-            if [ "$_pdis" = "1" ]; then
-                printf "  %-16s  DISABLED  %s\n" "$_pdesc" "$_paip"
-            else
-                _hs="$(get_peer_handshake "$iface" "$_ppub")"
-                _online="OFFLINE"
-                if [ -n "$_hs" ] && [ "$_hs" != "-" ] && [ "$_hs" != "never" ]; then
-                    _hs_sec="$(awg show "$iface" 2>/dev/null | awk -v pk="$_ppub" '
-                        /peer:/{cur=$NF} cur==pk&&/latest handshake:/{
-                            sub(/.*latest handshake: /,"");t=0;
-                            for(i=1;i<=NF;i++){if($i~/^[0-9]+$/){n=$i;u=$(i+1);
-                                if(u~/^second/)t+=n;else if(u~/^minute/)t+=n*60;
-                                else if(u~/^hour/)t+=n*3600;else if(u~/^day/)t+=n*86400}}
-                            print t;exit}' 2>/dev/null)"
-                    [ "${_hs_sec:-9999}" -le "120" ] 2>/dev/null && _online="ONLINE"
-                fi
-                _rx="$(get_peer_rx "$iface" "$_ppub")"
-                _tx="$(get_peer_tx "$iface" "$_ppub")"
-                printf "  %-16s  %-7s   %s  hs:%s  rx:%s  tx:%s\n" \
-                    "$_pdesc" "$_online" "$_paip" "${_hs:-never}" "${_rx:--}" "${_tx:--}"
-            fi
-            _pi=$((_pi + 1))
-        done
-    done
-}
-
-cli_list() {
-    _interfaces="$(get_awg_interfaces)"
-    [ -z "$_interfaces" ] && exit 0
-    for iface in $_interfaces; do echo "$iface"; done
-}
-
-cli_peers() {
-    [ -z "${1:-}" ] && die "Usage: $SCRIPT_NAME peers <interface>"
-    _iface="$1"
-    uci_network_exists "$_iface" || die "Interface '$_iface' not found"
-    _pt="amneziawg_${_iface}"
-    _pi=0
-    while uci -q get "network.@${_pt}[$_pi]" >/dev/null 2>&1; do
-        _pdesc="$(uci -q get "network.@${_pt}[$_pi].description" || echo "peer$((_pi+1))")"
-        _paip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "?")"
-        _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
-        [ "$_pdis" = "1" ] && _st="disabled" || _st="enabled"
-        printf "%s\t%s\t%s\n" "$_pdesc" "$_paip" "$_st"
-        _pi=$((_pi + 1))
-    done
-}
-
-cli_export() {
-    have_cmd jq || die "jq is required for export"
-    _interfaces="$(get_awg_interfaces)"
-    [ -z "$_interfaces" ] && die "No Liminal interfaces to export"
-
-    _outfile="${1:-}"
-    if [ -z "$_outfile" ]; then
-        mkdir -p "$EXPORT_DIR"
-        _outfile="${EXPORT_DIR}/liminal-export-$(date +%Y%m%d-%H%M%S).json"
-    fi
-
-    _json='{"liminal_version":"'"$LIMINAL_VERSION"'","exported":"'"$(date '+%Y-%m-%d %H:%M:%S')"'","interfaces":[]}'
-
-    for iface in $_interfaces; do
-        _addr="$(uci -q get "network.${iface}.addresses" || echo "")"
-        _port="$(uci -q get "network.${iface}.listen_port" || echo "")"
-        _privkey="$(uci -q get "network.${iface}.private_key" || echo "")"
-        _mtu="$(uci -q get "network.${iface}.mtu" || echo "$CFG_DEFAULT_MTU")"
-        _dns="$(uci -q get "network.${iface}.dns" || echo "")"
-        _zone="$(find_zone_for_interface "$iface" 2>/dev/null || echo "")"
-
-        _iface_json="$(jq -n \
-            --arg name "$iface" --arg addr "$_addr" --arg port "$_port" \
-            --arg privkey "$_privkey" --arg mtu "$_mtu" --arg dns "$_dns" --arg zone "$_zone" \
-            '{name:$name, addresses:$addr, listen_port:$port, private_key:$privkey, mtu:$mtu, dns:$dns, zone:$zone, peers:[]}'
-        )"
-
-        _pt="amneziawg_${iface}"; _pi=0
-        while uci -q get "network.@${_pt}[$_pi]" >/dev/null 2>&1; do
-            _pdesc="$(uci -q get "network.@${_pt}[$_pi].description" || echo "")"
-            _ppub="$(uci -q get "network.@${_pt}[$_pi].public_key" || echo "")"
-            _ppriv="$(uci -q get "network.@${_pt}[$_pi].private_key" || echo "")"
-            _paip="$(uci -q get "network.@${_pt}[$_pi].allowed_ips" || echo "")"
-            _pka="$(uci -q get "network.@${_pt}[$_pi].persistent_keepalive" || echo "$CFG_DEFAULT_KEEPALIVE")"
-            _pdis="$(uci -q get "network.@${_pt}[$_pi].disabled" || echo "0")"
-
-            _peer_json="$(jq -n \
-                --arg desc "$_pdesc" --arg pub "$_ppub" --arg priv "$_ppriv" \
-                --arg aip "$_paip" --arg ka "$_pka" --arg dis "$_pdis" \
-                '{description:$desc, public_key:$pub, private_key:$priv, allowed_ips:$aip, persistent_keepalive:$ka, disabled:$dis}'
-            )"
-            _iface_json="$(echo "$_iface_json" | jq --argjson p "$_peer_json" '.peers += [$p]')"
-            _pi=$((_pi + 1))
-        done
-        _json="$(echo "$_json" | jq --argjson i "$_iface_json" '.interfaces += [$i]')"
-    done
-
-    echo "$_json" | jq '.' > "$_outfile"
-    echo "$_outfile"
-}
-
-cli_update() {
-    check_dns || die "DNS is not working"
-    _remote_ver="$(fetch_remote_version)"
-    [ -z "$_remote_ver" ] && die "Could not fetch remote version (rate limit or no internet)"
-    if [ "$_remote_ver" = "$LIMINAL_VERSION" ]; then
-        echo "Up to date (v${LIMINAL_VERSION})"
-        exit 0
-    fi
-    if ! version_newer "$_remote_ver" "$LIMINAL_VERSION"; then
-        echo "Local version (v${LIMINAL_VERSION}) is newer than remote (v${_remote_ver})"
-        exit 0
-    fi
-    echo "Update available: v${LIMINAL_VERSION} -> v${_remote_ver}"
-
-    # Backup before major version change
-    _cur_major="$(version_major "$LIMINAL_VERSION")"
-    _rem_major="$(version_major "$_remote_ver")"
-    if [ "$_cur_major" != "$_rem_major" ]; then
-        autobackup_enabled && init_backup "Pre-Update v${LIMINAL_VERSION}→v${_remote_ver}"
-        echo "Backup created: ${BACKUP_DIR}"
-    fi
-
-    _tmp="$(mktemp /tmp/liminal-update.XXXXXX)" || die "mktemp failed"
-    wget_retry "$LIMINAL_RAW_URL" "$_tmp" || { rm -f "$_tmp"; die "Download failed after ${DOWNLOAD_RETRIES} attempts"; }
-    head -c2 "$_tmp" | grep -q '#!' || { rm -f "$_tmp"; die "Invalid download"; }
-    cp "$_tmp" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    rm -f "$_tmp"
-    echo "Updated to v${_remote_ver}"
-}
-
-handle_cli() {
-    _cmd="${1:-}"; shift 2>/dev/null || true
-    case "$_cmd" in
-        status)   cli_status ;;
-        check)    do_connectivity_check ;;
-        list)     cli_list ;;
-        peers)    cli_peers "$@" ;;
-        export)   cli_export "$@" ;;
-        import)
-            [ -z "${1:-}" ] && die "Usage: $SCRIPT_NAME import <file>"
-            # Non-interactive import is not supported — open menu
-            echo "Import requires interactive mode. Run without arguments."
-            exit 1 ;;
-        update)   cli_update ;;
-        version)  echo "Liminal v${LIMINAL_VERSION}" ;;
-        help|-h|--help) cli_usage ;;
-        *)        cli_usage; exit 1 ;;
-    esac
-    exit 0
-}
-
-
 # ═══ Entry point ═════════════════════════════════════════════════════
-
-# CLI mode: if arguments given, handle non-interactively
-if [ $# -gt 0 ]; then
-    ensure_required_tools
-    handle_cli "$@"
-fi
 
 ensure_required_tools
 ensure_base_firewall
