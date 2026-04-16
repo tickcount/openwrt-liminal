@@ -2899,7 +2899,7 @@ reconstruct_peer_config() {
     _peer_ip="$(peer_get "$_pt" "$_idx" "allowed_ips" "?")"
     _keepalive="$(peer_get "$_pt" "$_idx" "persistent_keepalive" "$CFG_DEFAULT_KEEPALIVE")"
     _psk="$(peer_get "$_pt" "$_idx" "preshared_key")"
-    _client_allowed_ips="$(peer_get "$_pt" "$_idx" "client_allowed_ips" "0.0.0.0/0")"
+    _client_allowed_ips="$(peer_get "$_pt" "$_idx" "client_allowed_ips" "0.0.0.0/0, ::/0")"
     _peer_obf="$(peer_get "$_pt" "$_idx" "_liminal_obfuscation")"
 
     _server_priv="$(iface_get "$_iface" "private_key")"
@@ -3471,7 +3471,7 @@ do_peer_menu() {
         # (ANSI cursor positioning). Value column starts at ~24.
         _SV="\\033[26G"
 
-        _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0")"
+        _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0, ::/0")"
         _cur_advsec="$(peer_get "$_pt" "$_idx" _liminal_advanced_security)"
         case "${_cur_advsec:-}" in
             on|off) _as_label="${_cur_advsec}" ;;
@@ -3555,11 +3555,11 @@ do_peer_menu() {
                 crumb_pop; return ;;
             a) # Edit AllowedIPs
                 section "Edit AllowedIPs"
-                _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0")"
+                _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0, ::/0")"
                 echo -e "  ${A}Current:${NC} ${W}${_cur_caip}${NC}"
                 echo ""
                 echo -e "  ${DIM2}Presets:${NC}"
-                echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Full tunnel${NC}   ${DIM2}0.0.0.0/0${NC}"
+                echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Full tunnel${NC}   ${DIM2}0.0.0.0/0, ::/0${NC}"
                 echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Custom${NC}       ${DIM2}enter manually${NC}"
                 echo -e "  ${DIM2}Enter › Cancel${NC}"
                 echo ""
@@ -3567,7 +3567,7 @@ do_peer_menu() {
                 sigint_caught && continue
                 [ -z "$_aip_choice" ] && { cancelled; PAUSE; continue; }
                 case "$_aip_choice" in
-                    1) _new_caip="0.0.0.0/0" ;;
+                    1) _new_caip="0.0.0.0/0, ::/0" ;;
                     2) prompt _new_caip "AllowedIPs" "$_cur_caip" || continue
                        sigint_caught && continue
                        [ -z "$_new_caip" ] && { cancelled; PAUSE; continue; } ;;
@@ -3963,7 +3963,7 @@ do_add_peer() {
     fi
 
     if [ "$_has_wan_fwd" = "1" ]; then
-        _client_allowed_ips="0.0.0.0/0"
+        _client_allowed_ips="0.0.0.0/0, ::/0"
     elif [ "$_has_lan_fwd" = "1" ] && [ -n "$_lan_cidr" ]; then
         _client_allowed_ips="$_lan_cidr"
     else
