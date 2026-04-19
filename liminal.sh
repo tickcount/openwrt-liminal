@@ -8,7 +8,7 @@ set -eu
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 BACKUP_DIR=""
-LIMINAL_VERSION="1.4"
+LIMINAL_VERSION="1.5"
 LIMINAL_REPO="tickcount/openwrt-liminal"
 LIMINAL_RAW_URL="https://raw.githubusercontent.com/${LIMINAL_REPO}/refs/heads/main/liminal.sh"
 
@@ -175,8 +175,7 @@ IFACE_SCHEMA_SCALAR="proto private_key listen_port mtu dns endpoint_host disable
 IFACE_SCHEMA_LIST="addresses"
 
 PEER_SCHEMA_SCALAR="public_key private_key preshared_key route_allowed_ips allowed_ips
-    persistent_keepalive description disabled client_allowed_ips endpoint_host
-    _liminal_obfuscation _liminal_advanced_security"
+    persistent_keepalive description disabled client_allowed_ips endpoint_host"
 
 # ─── UCI helpers (reduce boilerplate, enforce schema) ────────────────
 
@@ -271,12 +270,21 @@ peer_to_json() {
 }
 
 # iface_apply_json_fields IFACE JSON — write schema fields from JSON to UCI.
-# Empty/missing values → field not set.
+# Empty/missing values → field not set. Rejects malformed WG keys.
 iface_apply_json_fields() {
     _name="$1"; _src="$2"
     for _f in $IFACE_SCHEMA_SCALAR; do
         _v="$(printf '%s' "$_src" | jq -r --arg k "$_f" '.[$k] // ""')"
-        [ -n "$_v" ] && uci set "network.${_name}.${_f}=${_v}"
+        [ -z "$_v" ] && continue
+        case "$_f" in
+            private_key)
+                if ! validate_wg_key "$_v" 2>/dev/null; then
+                    warn "Invalid private_key in JSON for ${_name} — skipping"
+                    continue
+                fi
+                ;;
+        esac
+        uci set "network.${_name}.${_f}=${_v}"
     done
     for _f in $IFACE_SCHEMA_LIST; do
         _v="$(printf '%s' "$_src" | jq -r --arg k "$_f" '.[$k] // ""')"
@@ -286,30 +294,32 @@ iface_apply_json_fields() {
 }
 
 # peer_apply_json_fields SEC JSON — write peer schema fields to UCI section.
-# Backward compat: reads JSON `obfuscation` into `_liminal_obfuscation`.
+# Rejects malformed WG keys so corrupted imports can't brick the iface.
 peer_apply_json_fields() {
     _sec="$1"; _src="$2"
     for _f in $PEER_SCHEMA_SCALAR; do
         _v="$(printf '%s' "$_src" | jq -r --arg k "$_f" '.[$k] // ""')"
-        # legacy JSON key fallback
-        if [ -z "$_v" ] && [ "$_f" = "_liminal_obfuscation" ]; then
-            _v="$(printf '%s' "$_src" | jq -r '.obfuscation // ""')"
-        fi
-        [ -n "$_v" ] && [ "$_v" != "null" ] && uci set "network.${_sec}.${_f}=${_v}"
+        [ -z "$_v" ] || [ "$_v" = "null" ] && continue
+        case "$_f" in
+            public_key|private_key|preshared_key)
+                if ! validate_wg_key "$_v" 2>/dev/null; then
+                    warn "Invalid ${_f} for peer — skipping field"
+                    continue
+                fi
+                ;;
+        esac
+        uci set "network.${_sec}.${_f}=${_v}"
     done
     return 0
 }
 
 # restart_iface IFACE [MSG]        — ifdown/ifup with spinner; MSG overrides default.
-# After the interface comes back up, re-apply per-peer _liminal_advanced_security
-# flags (the netifd amneziawg.sh handler does not persist them through ifup).
 restart_iface() {
     _msg="${2:-Restarting $1...}"
     spinner_start "$_msg"
     ifdown "$1" >/dev/null 2>&1 || true
     ifup   "$1" >/dev/null 2>&1 || true
     spinner_stop
-    apply_advsec_flags "$1" 2>/dev/null || true
 }
 
 # ─── Live AWG operations (no interface restart = no SSH drop) ────────
@@ -397,29 +407,6 @@ live_peer_sync_from_uci() {
     _ka="$(peer_get  "$_pt" "$_idx" persistent_keepalive)"
     _ep="$(peer_get  "$_pt" "$_idx" endpoint_host)"
     live_peer_add "$_if" "$_pk" "$_aip" "$_ep" "$_psk" "$_ka"
-}
-
-# live_peer_set_advsec IFACE PUBKEY on|off
-live_peer_set_advsec() {
-    have_cmd awg || return 1
-    awg set "$1" peer "$2" advanced-security "$3" 2>/dev/null
-}
-
-# apply_advsec_flags IFACE — re-push each peer's _liminal_advanced_security
-# flag to the kernel. Needed after ifup: the netifd handler doesn't persist
-# advanced-security through a restart.
-apply_advsec_flags() {
-    _if="$1"; _pt="amneziawg_${_if}"
-    _pi=0
-    while peer_exists "$_pt" "$_pi"; do
-        _pk="$(peer_get "$_pt" "$_pi" public_key)"
-        _as="$(peer_get "$_pt" "$_pi" _liminal_advanced_security)"
-        if [ -n "$_pk" ] && [ -n "$_as" ]; then
-            live_peer_set_advsec "$_if" "$_pk" "$_as" || true
-        fi
-        _pi=$((_pi + 1))
-    done
-    return 0
 }
 
 # awg_peer_field IFACE PUBKEY KEY — read a field from human `awg show` output.
@@ -1940,6 +1927,210 @@ validate_port() {
     [ "$1" -le 65535 ] 2>/dev/null || { warn "Port must be <= 65535"; return 1; }
 }
 
+# validate_ipv4_cidr CIDR — "IP/mask" with mask 0-32. Uses validate_ipv4 for
+# the IP portion (re-warns on bad IP).
+validate_ipv4_cidr() {
+    case "${1:-}" in
+        */0|*/[1-9]|*/[12][0-9]|*/3[0-2]) ;;
+        *) warn "Invalid CIDR mask in: ${1:-<empty>}"; return 1 ;;
+    esac
+    validate_ipv4 "${1%/*}"
+}
+
+# validate_ipv6_cidr CIDR — loose "any:colons/mask0-128" check. Only syntactic,
+# no range/expansion validation (enough to catch obvious typos).
+validate_ipv6_cidr() {
+    _cv="${1:-}"
+    case "$_cv" in
+        *:*/*) ;;
+        *) warn "Invalid IPv6 CIDR: ${_cv:-<empty>}"; return 1 ;;
+    esac
+    _mask="${_cv##*/}"
+    case "$_mask" in
+        ''|*[!0-9]*) warn "Invalid IPv6 mask: ${_mask}"; return 1 ;;
+    esac
+    [ "$_mask" -ge 0 ] && [ "$_mask" -le 128 ] 2>/dev/null || {
+        warn "IPv6 mask out of range 0-128: ${_mask}"; return 1
+    }
+    # Addr part must contain at least one ':'
+    case "${_cv%/*}" in
+        *:*) return 0 ;;
+        *) warn "Invalid IPv6 address: ${_cv%/*}"; return 1 ;;
+    esac
+}
+
+# validate_allowed_ips STR — comma/space-separated list of IPv4[/N] or
+# IPv6[/N] entries. Warns on the first bad entry.
+validate_allowed_ips() {
+    _al="${1:-}"
+    [ -z "$_al" ] && { warn "AllowedIPs is empty"; return 1; }
+    # Split on comma and/or whitespace
+    _oldifs="$IFS"; IFS=', 	'
+    # shellcheck disable=SC2086
+    set -- $_al
+    IFS="$_oldifs"
+    for _e in "$@"; do
+        [ -z "$_e" ] && continue
+        case "$_e" in
+            *:*) validate_ipv6_cidr "$_e" || return 1 ;;
+            */*) validate_ipv4_cidr "$_e" || return 1 ;;
+            *)   validate_ipv4 "$_e"      || return 1 ;;
+        esac
+    done
+    return 0
+}
+
+# validate_fqdn STR — loose FQDN check (labels 1-63 chars, letters/digits/hyphen,
+# no leading/trailing hyphen per label, at least one dot OR single-label name).
+validate_fqdn() {
+    _fq="${1:-}"
+    [ -z "$_fq" ] && { warn "Hostname is empty"; return 1; }
+    [ "${#_fq}" -le 253 ] || { warn "Hostname too long (>253 chars)"; return 1; }
+    printf '%s' "$_fq" | grep -Eq '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$' || {
+        warn "Invalid hostname: ${_fq}"; return 1
+    }
+}
+
+# validate_host_or_ip STR — accepts IPv4, IPv6 literal, or FQDN.
+validate_host_or_ip() {
+    _hv="${1:-}"
+    case "$_hv" in
+        *:*) return 0 ;;  # IPv6 literal — accept without deeper check
+        *[!0-9.]*)
+            validate_fqdn "$_hv"
+            return $?
+            ;;
+        *)
+            validate_ipv4 "$_hv"
+            return $?
+            ;;
+    esac
+}
+
+# validate_generated_conf TEXT — sanity-check a rendered WG/AWG .conf before
+# it leaves the tool. Catches corrupted UCI values that would give the client
+# a dead config. Warns on first failure and returns 1.
+validate_generated_conf() {
+    _gc="${1:-}"
+    [ -z "$_gc" ] && { warn "Generated config is empty"; return 1; }
+
+    # sed-based: takes everything after the first '=' — awk -F' *= *' would
+    # wrongly split on '=' that appears inside values (e.g. base64 padding).
+    _gc_get() {
+        printf '%s\n' "$_gc" \
+            | sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" \
+            | head -n1
+    }
+
+    _gc_priv="$(_gc_get PrivateKey)"
+    _gc_pub="$(_gc_get PublicKey)"
+    _gc_psk="$(_gc_get PresharedKey)"
+    _gc_addr="$(_gc_get Address)"
+    _gc_aips="$(_gc_get AllowedIPs)"
+    _gc_ep="$(_gc_get Endpoint)"
+    _gc_mtu="$(_gc_get MTU)"
+    _gc_dns="$(_gc_get DNS)"
+    _gc_ka="$(_gc_get PersistentKeepAlive)"
+
+    # Required fields
+    validate_wg_key "$_gc_priv" 2>/dev/null || { warn "Bad client PrivateKey in generated conf"; return 1; }
+    validate_wg_key "$_gc_pub"  2>/dev/null || { warn "Bad server PublicKey in generated conf"; return 1; }
+    [ -n "$_gc_addr" ] || { warn "Missing Address in generated conf"; return 1; }
+    validate_ipv4_cidr "$_gc_addr" 2>/dev/null || { warn "Bad Address: $_gc_addr"; return 1; }
+    [ -n "$_gc_aips" ] || { warn "Missing AllowedIPs in generated conf"; return 1; }
+    validate_allowed_ips "$_gc_aips" 2>/dev/null || { warn "Bad AllowedIPs: $_gc_aips"; return 1; }
+    [ -n "$_gc_ep" ] || { warn "Missing Endpoint in generated conf"; return 1; }
+    _gc_ep_host="${_gc_ep%:*}"
+    _gc_ep_port="${_gc_ep##*:}"
+    validate_host_or_ip "$_gc_ep_host" 2>/dev/null || { warn "Bad Endpoint host: $_gc_ep_host"; return 1; }
+    validate_port        "$_gc_ep_port" 2>/dev/null || { warn "Bad Endpoint port: $_gc_ep_port"; return 1; }
+
+    # Optional fields
+    if [ -n "$_gc_psk" ]; then
+        validate_wg_key "$_gc_psk" 2>/dev/null || { warn "Bad PresharedKey in generated conf"; return 1; }
+    fi
+    if [ -n "$_gc_mtu" ]; then
+        case "$_gc_mtu" in *[!0-9]*) warn "Bad MTU: $_gc_mtu"; return 1 ;; esac
+        [ "$_gc_mtu" -ge 576 ] && [ "$_gc_mtu" -le 65535 ] 2>/dev/null \
+            || { warn "MTU out of range: $_gc_mtu"; return 1; }
+    fi
+    if [ -n "$_gc_ka" ]; then
+        case "$_gc_ka" in *[!0-9]*) warn "Bad PersistentKeepAlive: $_gc_ka"; return 1 ;; esac
+        [ "$_gc_ka" -le 65535 ] 2>/dev/null || { warn "KeepAlive out of range: $_gc_ka"; return 1; }
+    fi
+    if [ -n "$_gc_dns" ]; then
+        _gc_oi="$IFS"; IFS=','
+        # shellcheck disable=SC2086
+        set -- $_gc_dns
+        IFS="$_gc_oi"
+        for _gc_t in "$@"; do
+            _gc_t="${_gc_t# }"; _gc_t="${_gc_t% }"
+            [ -z "$_gc_t" ] && continue
+            validate_host_or_ip "$_gc_t" 2>/dev/null \
+                || { warn "Bad DNS entry: $_gc_t"; return 1; }
+        done
+    fi
+
+    # AWG obfuscation params — enforce ranges from docs.amnezia.org/amnezia-wg.
+    _jc="$(_gc_get Jc)"
+    _jmin="$(_gc_get Jmin)"
+    _jmax="$(_gc_get Jmax)"
+    _s1="$(_gc_get S1)"; _s2="$(_gc_get S2)"; _s3="$(_gc_get S3)"; _s4="$(_gc_get S4)"
+    _h1="$(_gc_get H1)"; _h2="$(_gc_get H2)"; _h3="$(_gc_get H3)"; _h4="$(_gc_get H4)"
+
+    # NAME VAL LO HI — integer in [LO,HI]. Empty VAL is OK (skip).
+    _check_range() {
+        [ -z "$2" ] && return 0
+        case "$2" in ''|*[!0-9]*) warn "$1 not integer: $2"; return 1 ;; esac
+        [ "$2" -ge "$3" ] 2>/dev/null && [ "$2" -le "$4" ] 2>/dev/null \
+            || { warn "$1 out of range $3-$4: $2"; return 1; }
+        return 0
+    }
+    _check_range Jc   "$_jc"   0 10   || return 1
+    _check_range Jmin "$_jmin" 64 1024 || return 1
+    _check_range Jmax "$_jmax" 64 1024 || return 1
+    if [ -n "$_jmin" ] && [ -n "$_jmax" ]; then
+        [ "$_jmin" -le "$_jmax" ] 2>/dev/null \
+            || { warn "Jmin ($_jmin) must be <= Jmax ($_jmax)"; return 1; }
+    fi
+    _check_range S1 "$_s1" 0 64 || return 1
+    _check_range S2 "$_s2" 0 64 || return 1
+    _check_range S3 "$_s3" 0 64 || return 1
+    _check_range S4 "$_s4" 0 32 || return 1
+    _check_range H1 "$_h1" 0 4294967295 || return 1
+    _check_range H2 "$_h2" 0 4294967295 || return 1
+    _check_range H3 "$_h3" 0 4294967295 || return 1
+    _check_range H4 "$_h4" 0 4294967295 || return 1
+    # H1-H4 must all be distinct — overlapping magic bytes break dispatch.
+    # NAME_A VAL_A NAME_B VAL_B — fail if A and B both set and equal.
+    _check_distinct() {
+        { [ -z "$2" ] || [ -z "$4" ]; } && return 0
+        [ "$2" != "$4" ] || { warn "$1/$3 collide — must be distinct (both=$2)"; return 1; }
+    }
+    _check_distinct H1 "$_h1" H2 "$_h2" || return 1
+    _check_distinct H1 "$_h1" H3 "$_h3" || return 1
+    _check_distinct H1 "$_h1" H4 "$_h4" || return 1
+    _check_distinct H2 "$_h2" H3 "$_h3" || return 1
+    _check_distinct H2 "$_h2" H4 "$_h4" || return 1
+    _check_distinct H3 "$_h3" H4 "$_h4" || return 1
+    # I1-I5 — hex blob; accept '0x' prefix and optional whitespace
+    for _gc_k in I1 I2 I3 I4 I5; do
+        _gc_v="$(_gc_get "$_gc_k")"
+        [ -z "$_gc_v" ] && continue
+        _gc_vs="${_gc_v#0x}"
+        _gc_vs="$(printf '%s' "$_gc_vs" | tr -d ' ')"
+        case "$_gc_vs" in
+            ''|*[!0-9a-fA-F]*) warn "Bad $_gc_k (not hex): $_gc_v"; return 1 ;;
+        esac
+        # Hex blobs must be even-length (whole bytes)
+        case $(( ${#_gc_vs} % 2 )) in
+            0) ;;
+            *) warn "$_gc_k hex has odd length: $_gc_v"; return 1 ;;
+        esac
+    done
+    return 0
+}
+
 # validate_wg_key KEY — a WireGuard/AmneziaWG key is 32 bytes of base64,
 # which is always exactly 44 characters long and ends with '='. Matches the
 # regex LuCI uses (luci-proto-amneziawg/amneziawg.js).
@@ -2225,6 +2416,45 @@ port_in_use() {
     die "Neither 'ss' nor 'netstat' is available"
 }
 
+# port_allowed_in_zone PORT ZONE [PROTO] — 0 if there is a firewall.@rule
+# accepting PORT/PROTO into the zone (i.e. exposed to it). PROTO defaults to
+# "udp". Matches single values, space-separated lists, and ranges "N-M".
+port_allowed_in_zone() {
+    _pz_port="$1"; _pz_zone="$2"; _pz_proto="${3:-udp}"
+    [ -z "$_pz_port" ] || [ -z "$_pz_zone" ] && return 1
+    _pz_i=0
+    while uci -q get "firewall.@rule[$_pz_i]" >/dev/null 2>&1; do
+        _pz_src="$(uci -q get "firewall.@rule[$_pz_i].src" 2>/dev/null || true)"
+        _pz_tgt="$(uci -q get "firewall.@rule[$_pz_i].target" 2>/dev/null || true)"
+        _pz_proto_rule="$(uci -q get "firewall.@rule[$_pz_i].proto" 2>/dev/null || true)"
+        _pz_dport="$(uci -q get "firewall.@rule[$_pz_i].dest_port" 2>/dev/null || true)"
+        _pz_enabled="$(uci -q get "firewall.@rule[$_pz_i].enabled" 2>/dev/null || true)"
+        _pz_i=$((_pz_i + 1))
+        [ "$_pz_src" = "$_pz_zone" ] || continue
+        [ "$_pz_tgt" = "ACCEPT" ] || continue
+        [ "${_pz_enabled:-1}" = "0" ] && continue
+        case "$_pz_proto_rule" in
+            ''|any|"$_pz_proto"|*"$_pz_proto"*) ;;
+            *) continue ;;
+        esac
+        # dest_port: "51820", "51820 51830", or "51820-51830"
+        case " $_pz_dport " in
+            *" $_pz_port "*) return 0 ;;
+        esac
+        case "$_pz_dport" in
+            *-*)
+                _pz_lo="${_pz_dport%-*}"
+                _pz_hi="${_pz_dport#*-}"
+                case "$_pz_lo$_pz_hi" in *[!0-9]*) continue ;; esac
+                [ "$_pz_port" -ge "$_pz_lo" ] 2>/dev/null \
+                    && [ "$_pz_port" -le "$_pz_hi" ] 2>/dev/null \
+                    && return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 firewall_port_in_use() {
     port="$1"; i=0
     while uci -q get "firewall.@rule[$i]" >/dev/null 2>&1; do
@@ -2359,16 +2589,19 @@ awg_rand_range() {
 # I1 left "0" — this is a tagged-junk string (AWG 2.0); default keeps
 # backward compatibility with older AmneziaWG kernel modules.
 generate_awg_obfuscation() {
-    _Jc="$(awg_rand_range 4 8)"
-    _Jmin="$(awg_rand_range 40 80)"
-    _Jmax="$(awg_rand_range 900 1200)"
-    _S1="$(awg_rand_range 15 100)"
-    _S2="$(awg_rand_range 15 100)"
+    # Ranges per docs.amnezia.org/documentation/amnezia-wg.
+    # Jmin/Jmax: 64-1024 bytes; S1/S2/S3: 0-64; S4: 0-32; Jc: 0-10.
+    _Jc="$(awg_rand_range 4 10)"
+    _Jmin="$(awg_rand_range 64 128)"
+    _Jmax="$(awg_rand_range 256 1024)"
+    _S1="$(awg_rand_range 15 64)"
+    _S2="$(awg_rand_range 15 64)"
+    # S2 must not equal S1+56 (WireGuard init message size) — causes collision.
     while [ $((_S1 + 56)) -eq "$_S2" ]; do
-        _S2="$(awg_rand_range 15 100)"
+        _S2="$(awg_rand_range 15 64)"
     done
-    _S3="$(awg_rand_range 15 100)"
-    _S4="$(awg_rand_range 15 100)"
+    _S3="$(awg_rand_range 15 64)"
+    _S4="$(awg_rand_range 8 32)"
 
     _reserved="1 2 3 4 5"
     _picked=""
@@ -2780,20 +3013,60 @@ active_peer_names() {
     echo "$_names"
 }
 
-# get_peer_handshake IFACE PUBKEY — human-readable age ("5m", "1h 23m", ...),
-# "never" if no handshake yet, "-" if peer not found.
-get_peer_handshake() {
-    _line="$(awg_dump_peer "$1" "$2")"
-    [ -z "$_line" ] && { echo "-"; return; }
-    _ts="$(printf '%s\n' "$_line" | awk -F'\t' '{print $5}')"
-    if [ -z "$_ts" ] || [ "$_ts" = "0" ]; then echo "never"; return; fi
-    _age=$(( $(date +%s) - _ts ))
+# sample_throughput IFACE [INTERVAL_MS] — measure rx/tx bytes delta over the
+# interval (default 500ms). Echoes "RX_BPS TX_BPS". Zero if iface has no stats.
+sample_throughput() {
+    _st_if="$1"; _st_ms="${2:-500}"
+    _rx_f="/sys/class/net/${_st_if}/statistics/rx_bytes"
+    _tx_f="/sys/class/net/${_st_if}/statistics/tx_bytes"
+    [ -r "$_rx_f" ] && [ -r "$_tx_f" ] || { echo "0 0"; return 0; }
+    _rx0="$(cat "$_rx_f" 2>/dev/null || echo 0)"
+    _tx0="$(cat "$_tx_f" 2>/dev/null || echo 0)"
+    # BusyBox 'sleep' accepts only integers; usleep takes microseconds.
+    # Trailing `|| true` swallows SIGINT-death in child so `set -e` doesn't fire.
+    if [ "$_st_ms" -ge 1000 ]; then
+        sleep $((_st_ms / 1000)) 2>/dev/null || true
+    elif have_cmd usleep; then
+        usleep $(( _st_ms * 1000 )) 2>/dev/null || true
+    else
+        sleep 1 2>/dev/null || true
+    fi
+    _rx1="$(cat "$_rx_f" 2>/dev/null || echo 0)"
+    _tx1="$(cat "$_tx_f" 2>/dev/null || echo 0)"
+    awk -v r0="$_rx0" -v r1="$_rx1" -v t0="$_tx0" -v t1="$_tx1" -v ms="$_st_ms" \
+        'BEGIN { s=ms/1000; if (s<=0) s=1; printf "%d %d\n", (r1-r0)/s, (t1-t0)/s }'
+    return 0
+}
+
+# fmt_rate BPS — bytes/sec → human-readable ("1.23 MB/s", "456 KB/s", "89 B/s").
+fmt_rate() {
+    awk -v b="${1:-0}" 'BEGIN {
+        if      (b >= 1073741824) printf "%.2f GB/s\n", b/1073741824
+        else if (b >= 1048576)    printf "%.2f MB/s\n", b/1048576
+        else if (b >= 1024)       printf "%.2f KB/s\n", b/1024
+        else                      printf "%d B/s\n",    b
+    }'
+}
+
+# fmt_handshake_age SECONDS — terse duration ("12s", "3m", "1h 20m", "2d 4h").
+fmt_handshake_age() {
+    _age="${1:-0}"
     [ "$_age" -lt 0 ] && _age=0
     if   [ "$_age" -lt 60 ];    then printf '%ds\n'     "$_age"
     elif [ "$_age" -lt 3600 ];  then printf '%dm\n'     "$((_age/60))"
     elif [ "$_age" -lt 86400 ]; then printf '%dh %dm\n' "$((_age/3600))" "$(((_age%3600)/60))"
     else                             printf '%dd %dh\n' "$((_age/86400))" "$(((_age%86400)/3600))"
     fi
+}
+
+# get_peer_handshake IFACE PUBKEY — human-readable age, "never" if no handshake
+# yet, "-" if peer not found.
+get_peer_handshake() {
+    _line="$(awg_dump_peer "$1" "$2")"
+    [ -z "$_line" ] && { echo "-"; return; }
+    _ts="$(printf '%s\n' "$_line" | awk -F'\t' '{print $5}')"
+    if [ -z "$_ts" ] || [ "$_ts" = "0" ]; then echo "never"; return; fi
+    fmt_handshake_age "$(( $(date +%s) - _ts ))"
 }
 
 get_peer_rx() {
@@ -2835,7 +3108,7 @@ list_used_hosts() {
         | grep "=${_pt}$" \
         | sed "s/^network\.//; s/=${_pt}$//" \
         | while read -r _sec; do
-            iface_get "$_sec" allowed_ips
+            printf '%s\n' "$(iface_get "$_sec" allowed_ips)"
         done \
         | sed -n "s/.*${_prefix}\.\([0-9]\{1,3\}\)\/32.*/\1/p" \
         | sort -n -u
@@ -2853,6 +3126,34 @@ pick_free_ip() {
         return 0
     done
     die "No free IPs in ${_prefix}.2-254"
+}
+
+# pick_random_free_ip IFACE PREFIX — random /32 from the 2-254 range, skipping
+# used hosts. Falls back to sequential if the pool is ≥90% full (random becomes
+# pathological at that density).
+pick_random_free_ip() {
+    _iface="$1"; _prefix="$2"
+    _used="$(list_used_hosts "$_iface" "$_prefix")"
+    _used_count="$(printf '%s\n' "$_used" | grep -c '^[0-9]' 2>/dev/null || echo 0)"
+    if [ "${_used_count:-0}" -ge 228 ]; then
+        pick_free_ip "$_iface" "$_prefix"
+        return $?
+    fi
+    _tries=0
+    while [ "$_tries" -lt 200 ]; do
+        _r=$(( (RANDOM % 253) + 2 ))
+        if ! echo "$_used" | grep -qx "$_r" 2>/dev/null; then
+            printf '%s.%s/32\n' "$_prefix" "$_r"
+            return 0
+        fi
+        _tries=$((_tries + 1))
+    done
+    pick_free_ip "$_iface" "$_prefix"
+}
+
+# ip_is_used IFACE PREFIX HOST — 0 if host octet already assigned, 1 otherwise.
+ip_is_used() {
+    list_used_hosts "$1" "$2" | grep -qx "$3"
 }
 
 awg_iface_show_val() {
@@ -2900,7 +3201,6 @@ reconstruct_peer_config() {
     _keepalive="$(peer_get "$_pt" "$_idx" "persistent_keepalive" "$CFG_DEFAULT_KEEPALIVE")"
     _psk="$(peer_get "$_pt" "$_idx" "preshared_key")"
     _client_allowed_ips="$(peer_get "$_pt" "$_idx" "client_allowed_ips" "0.0.0.0/0, ::/0")"
-    _peer_obf="$(peer_get "$_pt" "$_idx" "_liminal_obfuscation")"
 
     _server_priv="$(iface_get "$_iface" "private_key")"
     _server_pub="$(printf '%s' "$_server_priv" | awg pubkey 2>/dev/null || true)"
@@ -2921,15 +3221,21 @@ reconstruct_peer_config() {
         _dns_line="$_dns"
     fi
 
-    printf "[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %s\n" \
-        "$_client_priv" "$_peer_ip" "$_dns_line" "$_mtu"
-    if [ "$_peer_obf" = "1" ]; then
-        _obf_block="$(render_awg_obfuscation_block "$_iface")"
-        [ -n "$_obf_block" ] && printf '%s\n' "$_obf_block"
+    _out="$(printf "[Interface]\nPrivateKey = %s\nAddress = %s\nDNS = %s\nMTU = %s\n" \
+        "$_client_priv" "$_peer_ip" "$_dns_line" "$_mtu")"
+    _obf_block="$(render_awg_obfuscation_block "$_iface")"
+    [ -n "$_obf_block" ] && _out="$(printf '%s\n%s' "$_out" "$_obf_block")"
+    _out="$(printf '%s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\nEndpoint = %s:%s\nPersistentKeepAlive = %s' \
+        "$_out" "$_server_pub" "$_client_allowed_ips" "$_endpoint_host" "$_port" "$_keepalive")"
+    [ -n "$_psk" ] && _out="$(printf '%s\nPresharedKey = %s' "$_out" "$_psk")"
+
+    # Validate before emitting — catches corrupted UCI values that would give
+    # the client a dead config. On failure, empty output lets callers bail out
+    # via their existing `[ -z "$_conf" ]` guards.
+    if ! validate_generated_conf "$_out"; then
+        return 1
     fi
-    printf "\n[Peer]\nPublicKey = %s\nAllowedIPs = %s\nEndpoint = %s:%s\nPersistentKeepAlive = %s\n" \
-        "$_server_pub" "$_client_allowed_ips" "$_endpoint_host" "$_port" "$_keepalive"
-    [ -n "$_psk" ] && printf "PresharedKey = %s\n" "$_psk"
+    printf '%s\n' "$_out"
     return 0
 }
 
@@ -3128,42 +3434,6 @@ do_rename_peer() {
     return 0
 }
 
-# _pm_toggle_obfuscation IFACE PT IDX — flip _liminal_obfuscation. Affects
-# only what gets written into newly-emitted .conf; kernel state is untouched.
-_pm_toggle_obfuscation() {
-    _iface="$1"; _pt="$2"; _idx="$3"
-    _cur="$(peer_get "$_pt" "$_idx" _liminal_obfuscation)"
-    section "Obfuscation (in config)"
-    echo -e "  ${A}Current:${NC} ${W}${_cur:-unset}${NC}"
-    echo ""
-    echo -e "  ${DIM2}Controls AWG obfuscation lines in the emitted .conf.${NC}"
-    echo -e "  ${DIM2}'on'  — include Jc/Jmin/Jmax/S1-S4/H1-H4/I1-I5${NC}"
-    echo -e "  ${DIM2}'off' — plain WireGuard .conf${NC}"
-    echo -e "  ${DIM2}Existing clients keep the config they already downloaded;${NC}"
-    echo -e "  ${DIM2}re-download via 'Generate Config' to get the new shape.${NC}"
-    echo ""
-    echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}on${NC}"
-    echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}off${NC}"
-    echo -e "  ${DIM2}Enter › Cancel${NC}"
-    echo ""
-    prompt _po_choice "Select" "" || return 0
-    sigint_caught && return 0
-    case "${_po_choice:-}" in
-        1) _new="1" ;;
-        2) _new="0" ;;
-        *) return 0 ;;
-    esac
-    if [ "$_new" = "$_cur" ]; then
-        echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0
-    fi
-    peer_set "$_pt" "$_idx" _liminal_obfuscation "$_new"
-    uci commit network
-    echo -e "  ${ICO_OK} ${OK}Obfuscation set to $([ "$_new" = "1" ] && echo on || echo off)${NC}"
-    echo -e "  ${WARN_C}Re-download client config to apply${NC}"
-    PAUSE
-    return 0
-}
-
 # _pm_edit_endpoint IFACE PT IDX — per-peer endpoint_host override. Empty
 # value clears the override so the peer inherits the interface setting.
 _pm_edit_endpoint() {
@@ -3191,6 +3461,9 @@ _pm_edit_endpoint() {
     case "${_new_ep:-}" in
         ""|clear|CLEAR|inherit|INHERIT|Inherit|none|NONE) _new_ep="" ;;
     esac
+    if [ -n "$_new_ep" ]; then
+        validate_host_or_ip "$_new_ep" || { PAUSE; return 0; }
+    fi
     if [ "$_new_ep" = "$_cur" ]; then
         echo -e "  ${DIM2}No change${NC}"; PAUSE; return 0
     fi
@@ -3337,7 +3610,12 @@ do_peer_menu() {
             fi
         fi
 
-        _hs_col="$(hs_colored "${_hs:--}" "${_hs_sec}")"
+        _hs_disp="${_hs:--}"
+        case "$_hs_disp" in
+            -|never|"") ;;
+            *) _hs_disp="${_hs_disp} ago" ;;
+        esac
+        _hs_col="$(hs_colored "$_hs_disp" "${_hs_sec}")"
 
         detect_podkop_state "$_iface"
 
@@ -3354,6 +3632,9 @@ do_peer_menu() {
             _peer_dns_shown="$_peer_dns"
         fi
 
+        _peer_psk="$(peer_get "$_pt" "$_idx" preshared_key)"
+        _peer_ep_override="$(peer_get "$_pt" "$_idx" endpoint_host)"
+
         box_buf_reset
         box_buf_line "  ${_st_ico} ${W}${_desc}${NC}  ${_online}"
 
@@ -3361,6 +3642,12 @@ do_peer_menu() {
         box_buf_sep
         box_buf_line "  ${A}Address${NC}      ${W}${_aip}${NC}"
         box_buf_line "  ${A}Public${NC}       ${DIM2}${_shortpub}${NC}"
+        if [ -n "$_peer_psk" ]; then
+            _shortpsk="$(printf '%s' "$_peer_psk" | cut -c1-10)..."
+            box_buf_line "  ${A}PSK${NC}          ${DIM2}${_shortpsk}${NC}"
+        else
+            box_buf_line "  ${A}PSK${NC}          ${DIM2}—${NC}"
+        fi
         if [ -n "$_hr_fqdn" ]; then
             box_buf_line "  ${A}Hostname${NC}     ${W}${_hr_fqdn}${NC}"
         else
@@ -3373,6 +3660,9 @@ do_peer_menu() {
             box_buf_line "  ${A}Handshake${NC}    ${_hs_col}"
             if [ "$_is_online" -eq 1 ] && [ -n "$_ep" ]; then
                 box_buf_line "  ${A}Endpoint${NC}     ${W}${_ep}${NC}"
+            fi
+            if [ -n "$_peer_ep_override" ]; then
+                box_buf_line "  ${A}Configured${NC}   ${W}${_peer_ep_override}${NC}  ${DIM2}(override)${NC}"
             fi
             _rx_show="${_rx:-0 B}"
             _tx_show="${_tx:-0 B}"
@@ -3472,18 +3762,7 @@ do_peer_menu() {
         _SV="\\033[26G"
 
         _cur_caip="$(peer_get "$_pt" "$_idx" client_allowed_ips "0.0.0.0/0, ::/0")"
-        _cur_advsec="$(peer_get "$_pt" "$_idx" _liminal_advanced_security)"
-        case "${_cur_advsec:-}" in
-            on|off) _as_label="${_cur_advsec}" ;;
-            *)      _as_label="inherit" ;;
-        esac
         _hr_disp="${_hr_fqdn:-none}"
-        _cur_pobf="$(peer_get "$_pt" "$_idx" _liminal_obfuscation)"
-        case "${_cur_pobf:-}" in
-            1) _pobf_label="on"  ;;
-            0) _pobf_label="off" ;;
-            *) _pobf_label="—"   ;;
-        esac
         _cur_pep="$(peer_get "$_pt" "$_idx" endpoint_host)"
         _pep_label="${_cur_pep:-inherit}"
 
@@ -3491,10 +3770,6 @@ do_peer_menu() {
         echo -e "  ${B}a${NC} ${DIM2}›${NC} ${W}AllowedIPs${NC}${_SV}${DIM2}${_cur_caip}${NC}"
         echo -e "  ${B}k${NC} ${DIM2}›${NC} ${W}Keepalive${NC}${_SV}${DIM2}${_ka}s${NC}"
         echo -e "  ${B}e${NC} ${DIM2}›${NC} ${W}Endpoint${NC}${_SV}${DIM2}${_pep_label}${NC}"
-        echo ""
-        echo -e "  ${DIM2}Security${NC}"
-        echo -e "  ${B}s${NC} ${DIM2}›${NC} ${W}Adv. Security${NC}${_SV}${DIM2}${_as_label}${NC}"
-        echo -e "  ${B}o${NC} ${DIM2}›${NC} ${W}Obfuscation${NC}${_SV}${DIM2}${_pobf_label}  ${DIM2}(in .conf)${NC}"
         echo ""
         echo -e "  ${DIM2}DNS${NC}"
         echo -e "  ${B}h${NC} ${DIM2}›${NC} ${W}Hostname${NC}${_SV}${DIM2}${_hr_disp}${NC}"
@@ -3515,7 +3790,6 @@ do_peer_menu() {
 
         case "${_peer_choice:-}" in
             c|C) _pm_generate_config "$_iface" "$_idx" "$_desc" ;;
-            o|O) _pm_toggle_obfuscation "$_iface" "$_pt" "$_idx" ;;
             e|E) _pm_edit_endpoint      "$_iface" "$_pt" "$_idx" ;;
             6)  PEER_NEW_NAME=""
                 if do_rename_peer "$_iface" "$_idx" "$_desc"; then
@@ -3570,7 +3844,9 @@ do_peer_menu() {
                     1) _new_caip="0.0.0.0/0, ::/0" ;;
                     2) prompt _new_caip "AllowedIPs" "$_cur_caip" || continue
                        sigint_caught && continue
-                       [ -z "$_new_caip" ] && { cancelled; PAUSE; continue; } ;;
+                       [ -z "$_new_caip" ] && { cancelled; PAUSE; continue; }
+                       validate_allowed_ips "$_new_caip" || { PAUSE; continue; }
+                       ;;
                     *) continue ;;
                 esac
                 if [ "$_new_caip" != "$_cur_caip" ]; then
@@ -3698,46 +3974,6 @@ do_peer_menu() {
                 fi
                 PAUSE ;;
 
-            s|S) # Advanced Security (per-peer obfuscation toggle)
-                section "Advanced Security"
-                _cur_advsec="$(peer_get "$_pt" "$_idx" _liminal_advanced_security)"
-                echo -e "  ${A}Current:${NC} ${W}${_cur_advsec:-inherit from interface}${NC}"
-                echo ""
-                echo -e "  ${DIM2}Controls packet obfuscation for THIS peer only.${NC}"
-                echo -e "  ${DIM2}'on'  — AmneziaWG obfuscated handshake (default)${NC}"
-                echo -e "  ${DIM2}'off' — plain WireGuard (for vanilla WG clients)${NC}"
-                echo -e "  ${DIM2}'inherit' — use interface-wide setting${NC}"
-                echo ""
-                echo -e "  ${WARN_C}Note: setting is lost on ifup (reboot or iface restart).${NC}"
-                echo -e "  ${WARN_C}Liminal re-applies via 'apply_advsec_flags' after restart.${NC}"
-                echo ""
-                echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}on${NC}"
-                echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}off${NC}"
-                echo -e "  ${B}3${NC} ${DIM2}›${NC} ${W}inherit${NC} (clear override)"
-                echo -e "  ${DIM2}Enter › Cancel${NC}"
-                echo ""
-                prompt _as_choice "Select" "" || continue
-                sigint_caught && continue
-                case "${_as_choice:-}" in
-                    1) _new_advsec="on" ;;
-                    2) _new_advsec="off" ;;
-                    3) _new_advsec="" ;;
-                    *) continue ;;
-                esac
-                if [ "$_new_advsec" = "$_cur_advsec" ]; then
-                    echo -e "  ${DIM2}No change${NC}"; PAUSE; continue
-                fi
-                peer_set "$_pt" "$_idx" _liminal_advanced_security "$_new_advsec"
-                uci commit network
-                # Apply live. If clearing the override, restore to interface default ("on").
-                _apply_val="${_new_advsec:-on}"
-                if [ -n "$_pub" ]; then
-                    live_peer_set_advsec "$_iface" "$_pub" "$_apply_val" \
-                        || warn "Live apply failed; will take effect on next interface restart"
-                fi
-                echo -e "  ${ICO_OK} ${OK}Advanced Security set to ${_apply_val}${NC}"
-                PAUSE ;;
-
             g|G) # Test DNS & Network Diagnostics
                 do_dns_network_test "$_iface" "${_aip%%/*}" "$_hr_fqdn" "$_is_online"
                 PAUSE ;;
@@ -3842,7 +4078,46 @@ do_add_peer() {
     _prefix="$(get_ip_prefix "$_addr")"
     _iface_subnet="$(network_base_from_cidr "$_addr")"
 
-    _peer_ip="$(pick_free_ip "$_iface" "$_prefix")"
+    echo ""
+    echo -e "  ${A}IP assignment:${NC}"
+    echo ""
+    echo -e "    ${B}1${NC} ${DIM2}›${NC} ${W}First available${NC}  ${DIM2}(lowest free in ${_prefix}.2-254)${NC}"
+    echo -e "    ${B}2${NC} ${DIM2}›${NC} ${W}Random${NC}           ${DIM2}(random free host)${NC}"
+    echo -e "    ${B}3${NC} ${DIM2}›${NC} ${W}Custom${NC}           ${DIM2}(enter manually)${NC}"
+    echo ""
+    _peer_ip=""
+    while [ -z "$_peer_ip" ]; do
+        prompt _ip_mode "Select" "1" || { trap_restore; return; }
+        is_cancelled && { trap_restore; return; }
+        case "${_ip_mode:-1}" in
+            1) _peer_ip="$(pick_free_ip        "$_iface" "$_prefix")" ;;
+            2) _peer_ip="$(pick_random_free_ip "$_iface" "$_prefix")" ;;
+            3)
+                while true; do
+                    prompt _ip_in "Host octet or full IP" "" || break
+                    is_cancelled && break
+                    [ -z "$_ip_in" ] && break
+                    case "$_ip_in" in
+                        *.*.*.*) _cand="${_ip_in%/*}" ;;
+                        *)       _cand="${_prefix}.${_ip_in}" ;;
+                    esac
+                    if ! cidr_contains_ip "$_iface_subnet" "$_cand"; then
+                        warn "IP ${_cand} is outside subnet ${_iface_subnet}"; continue
+                    fi
+                    _host="${_cand##*.}"
+                    if [ "$_host" = "1" ] || [ "$_host" = "0" ] || [ "$_host" = "255" ]; then
+                        warn "Reserved host octet (${_host})"; continue
+                    fi
+                    if ip_is_used "$_iface" "$_prefix" "$_host"; then
+                        warn "IP ${_cand} is already assigned"; continue
+                    fi
+                    _peer_ip="${_cand}/32"
+                    break
+                done
+                ;;
+            *) warn "Invalid choice"; continue ;;
+        esac
+    done
 
     _peer_ip_bare="${_peer_ip%/*}"
     if ! cidr_contains_ip "$_iface_subnet" "$_peer_ip_bare"; then
@@ -3986,29 +4261,6 @@ do_add_peer() {
     _server_pub="$(printf '%s' "$_server_priv" | awg pubkey)"
     echo -e "  ${ICO_OK} ${OK}Keys:${NC} generated"
 
-    # ── Obfuscation ──────────────────────────────────────────────────
-    _iface_has_obf=0
-    [ -n "$(iface_get "$_iface" awg_jc)" ] && _iface_has_obf=1
-
-    section "Obfuscation"
-
-    if [ "$_iface_has_obf" -eq 1 ]; then
-        echo -e "  ${DIM2}Server has AmneziaWG obfuscation enabled.${NC}"
-        echo -e "  ${DIM2}Include obfuscation params (Jc/Jmin/Jmax/S1/S2/H1-H4/I1)${NC}"
-        echo -e "  ${DIM2}in the peer .conf for AmneziaWG-aware clients.${NC}"
-        _obf_default="y"
-    else
-        echo -e "  ${DIM2}Server has no obfuscation configured.${NC}"
-        echo -e "  ${DIM2}Plain WireGuard clients will connect normally.${NC}"
-        _obf_default="n"
-    fi
-    echo ""
-    if confirm "Enable obfuscation in peer config?" "$_obf_default"; then
-        _peer_obf=1
-    else
-        _peer_obf=0
-    fi
-
     # ── Summary ──────────────────────────────────────────────────────
     section "Summary"
 
@@ -4019,7 +4271,11 @@ do_add_peer() {
     echo -e "  ${A}MTU${NC}          ${W}$_mtu${NC}"
     echo -e "  ${A}AllowedIPs${NC}   ${W}$_client_allowed_ips${NC}"
     echo -e "  ${A}PSK${NC}          ${W}yes${NC}"
-    echo -e "  ${A}Obfuscation${NC}  $( [ "$_peer_obf" = "1" ] && echo -e "${OK}enabled${NC}" || echo -e "${DIM2}disabled${NC}" )"
+    if [ -n "$(iface_get "$_iface" awg_jc)" ]; then
+        echo -e "  ${A}Obfuscation${NC}  ${OK}enabled${NC} ${DIM2}(inherits from interface)${NC}"
+    else
+        echo -e "  ${A}Obfuscation${NC}  ${DIM2}plain WireGuard${NC}"
+    fi
     echo ""
 
     confirm "Create peer?" "y" || { cancelled; PAUSE; return 0; }
@@ -4034,7 +4290,6 @@ do_add_peer() {
     uci set "network.${_sec}.description=$PEER_NAME"
     [ -n "$_psk" ] && uci set "network.${_sec}.preshared_key=$_psk"
     uci set "network.${_sec}.client_allowed_ips=$_client_allowed_ips"
-    uci set "network.${_sec}._liminal_obfuscation=$_peer_obf"
     # Only persist endpoint override if the user explicitly chose Custom;
     # Interface/WAN selections inherit via _resolve_endpoint_host at render.
     [ -n "$_peer_endpoint_override" ] && \
@@ -4163,6 +4418,48 @@ _mi_obfuscation() {
     section "Obfuscation"
     if [ -n "$_cur_jc" ]; then
         _show_obfuscation_summary "$_iface"
+        # Spec compliance check (docs.amnezia.org — Jc 0-10, Jmin/Jmax 64-1024,
+        # S1-S3 0-64, S4 0-32, H1-H4 distinct).
+        _ob_viol=""
+        _ob_add_viol() { _ob_viol="${_ob_viol}${_ob_viol:+, }$1"; }
+        _ob_check() {
+            _n="$1"; _v="$2"; _lo="$3"; _hi="$4"
+            [ -z "$_v" ] && return 0
+            case "$_v" in *[!0-9]*) _ob_add_viol "$_n not integer"; return 0 ;; esac
+            if [ "$_v" -lt "$_lo" ] 2>/dev/null || [ "$_v" -gt "$_hi" ] 2>/dev/null; then
+                _ob_add_viol "$_n=$_v (spec $_lo-$_hi)"
+            fi
+        }
+        _o_jmin="$(iface_get "$_iface" awg_jmin)"
+        _o_jmax="$(iface_get "$_iface" awg_jmax)"
+        _ob_check Jc   "$_cur_jc" 0 10
+        _ob_check Jmin "$_o_jmin" 64 1024
+        _ob_check Jmax "$_o_jmax" 64 1024
+        if [ -n "$_o_jmin" ] && [ -n "$_o_jmax" ] \
+           && [ "$_o_jmin" -gt "$_o_jmax" ] 2>/dev/null; then
+            _ob_add_viol "Jmin>Jmax"
+        fi
+        _ob_check S1 "$(iface_get "$_iface" awg_s1)" 0 64
+        _ob_check S2 "$(iface_get "$_iface" awg_s2)" 0 64
+        _ob_check S3 "$(iface_get "$_iface" awg_s3)" 0 64
+        _ob_check S4 "$(iface_get "$_iface" awg_s4)" 0 32
+        _h1v="$(iface_get "$_iface" awg_h1)"
+        _h2v="$(iface_get "$_iface" awg_h2)"
+        _h3v="$(iface_get "$_iface" awg_h3)"
+        _h4v="$(iface_get "$_iface" awg_h4)"
+        for _hv in "H1:$_h1v:H2:$_h2v" "H1:$_h1v:H3:$_h3v" "H1:$_h1v:H4:$_h4v" \
+                   "H2:$_h2v:H3:$_h3v" "H2:$_h2v:H4:$_h4v" "H3:$_h3v:H4:$_h4v"; do
+            _a_n="${_hv%%:*}"; _r1="${_hv#*:}"; _a_v="${_r1%%:*}"
+            _r2="${_r1#*:}"; _b_n="${_r2%%:*}"; _b_v="${_r2#*:}"
+            { [ -z "$_a_v" ] || [ -z "$_b_v" ]; } && continue
+            [ "$_a_v" = "$_b_v" ] && _ob_add_viol "${_a_n}=${_b_n} collide"
+        done
+        if [ -n "$_ob_viol" ]; then
+            echo ""
+            echo -e "  ${ICO_WARN} ${WARN_C}Values out of AmneziaWG spec:${NC} ${DIM2}${_ob_viol}${NC}"
+            echo -e "  ${DIM2}Clients may still work, but .conf emit will refuse.${NC}"
+            echo -e "  ${DIM2}Use 'Regenerate' to replace with spec-compliant values.${NC}"
+        fi
         echo ""
         echo -e "  ${B}r${NC} ${DIM2}›${NC} ${WARN_C}Regenerate${NC} (rotate all params)"
         echo -e "  ${B}d${NC} ${DIM2}›${NC} ${ERR}Remove${NC} Obfuscation"
@@ -4174,28 +4471,28 @@ _mi_obfuscation() {
         case "${_obf_choice:-}" in
             r|R)
                 echo ""
-                echo -e "  ${WARN_C}All peer .conf files with obfuscation enabled${NC}"
-                echo -e "  ${WARN_C}will stop working until clients re-download configs.${NC}"
+                echo -e "  ${WARN_C}ALL existing clients will stop connecting until they${NC}"
+                echo -e "  ${WARN_C}re-download their .conf (new Jc/S1/H1... values).${NC}"
                 echo ""
                 confirm "Regenerate obfuscation params?" "n" || { cancelled; PAUSE; return 0; }
                 _apply_obfuscation "$_iface"
                 uci commit network
                 live_iface_set_obf "$_iface" || restart_iface "$_iface"
                 echo -e "  ${ICO_OK} ${OK}Obfuscation rotated${NC}"
-                echo -e "  ${WARN_C}Re-download all peer configs${NC}"
+                echo -e "  ${WARN_C}Regenerate and redistribute every client .conf.${NC}"
                 PAUSE
                 ;;
             d|D)
                 echo ""
-                echo -e "  ${WARN_C}Peers with obfuscation flag will stop connecting${NC}"
-                echo -e "  ${WARN_C}until clients re-download plain configs.${NC}"
+                echo -e "  ${WARN_C}ALL existing clients will stop connecting until they${NC}"
+                echo -e "  ${WARN_C}re-download their .conf (plain WireGuard mode).${NC}"
                 echo ""
                 confirm "Remove obfuscation from interface?" "n" || { cancelled; PAUSE; return 0; }
                 _remove_obfuscation "$_iface"
                 uci commit network
                 live_iface_clear_obf "$_iface" || restart_iface "$_iface"
                 echo -e "  ${ICO_OK} ${OK}Obfuscation removed${NC}"
-                echo -e "  ${WARN_C}Re-download peer configs (plain WG mode)${NC}"
+                echo -e "  ${WARN_C}Regenerate and redistribute every client .conf.${NC}"
                 PAUSE
                 ;;
             *) ;;
@@ -4204,6 +4501,9 @@ _mi_obfuscation() {
         echo -e "  ${DIM2}Not configured — plain WireGuard on the wire.${NC}"
         echo -e "  ${DIM2}Setup will generate random AmneziaWG params:${NC}"
         echo -e "  ${DIM2}  Jc/Jmin/Jmax, S1/S2, H1-H4 (I1 left default).${NC}"
+        echo ""
+        echo -e "  ${WARN_C}ALL existing clients will stop connecting until they${NC}"
+        echo -e "  ${WARN_C}re-download their .conf with the new AWG params.${NC}"
         echo ""
         confirm "Setup obfuscation now?" "y" || { cancelled; PAUSE; return 0; }
         _apply_obfuscation "$_iface"
@@ -4214,8 +4514,7 @@ _mi_obfuscation() {
         uci commit network
         live_iface_set_obf "$_iface" || restart_iface "$_iface"
         echo -e "  ${ICO_OK} ${OK}Obfuscation enabled${NC}"
-        echo -e "  ${WARN_C}Existing peers need obfuscation flag set${NC}"
-        echo -e "  ${WARN_C}to receive matching client configs.${NC}"
+        echo -e "  ${WARN_C}Regenerate and redistribute every client .conf.${NC}"
         PAUSE
     fi
     return 0
@@ -4236,6 +4535,61 @@ _mi_show_pubkey() {
         echo -e "  ${DIM2}Could not derive public key${NC}"
     fi
     PAUSE
+}
+
+# _mi_monitor_throughput IFACE — live RX/TX rate + peak + average tracking.
+# Redraws every second until Ctrl+C. Peaks reset each time the view opens.
+_mi_monitor_throughput() {
+    _iface="$1"
+    if ! interface_device_exists "$_iface"; then
+        warn "Interface is down"; PAUSE; return 0
+    fi
+    _rx_f="/sys/class/net/${_iface}/statistics/rx_bytes"
+    _tx_f="/sys/class/net/${_iface}/statistics/tx_bytes"
+    if [ ! -r "$_rx_f" ] || [ ! -r "$_tx_f" ]; then
+        warn "Cannot read kernel stats for ${_iface}"; PAUSE; return 0
+    fi
+    # Drop `set -e` for the duration — we want SIGINT-in-sleep to just break
+    # out, not unwind the whole script. Restored on exit.
+    set +e
+    trap '_CANCELLED=1' INT
+    _CANCELLED=0
+    _peak_rx=0; _peak_tx=0
+    _sum_rx=0; _sum_tx=0
+    _start_ts="$(date +%s)"
+    _rx0="$(cat "$_rx_f" 2>/dev/null || echo 0)"
+    _tx0="$(cat "$_tx_f" 2>/dev/null || echo 0)"
+    while [ "$_CANCELLED" -eq 0 ]; do
+        sleep 1
+        [ "$_CANCELLED" -ne 0 ] && break
+        _rx1="$(cat "$_rx_f" 2>/dev/null || echo 0)"
+        _tx1="$(cat "$_tx_f" 2>/dev/null || echo 0)"
+        _rx_bps=$(( _rx1 - _rx0 ))
+        _tx_bps=$(( _tx1 - _tx0 ))
+        _rx0="$_rx1"; _tx0="$_tx1"
+        [ "$_rx_bps" -gt "$_peak_rx" ] && _peak_rx="$_rx_bps"
+        [ "$_tx_bps" -gt "$_peak_tx" ] && _peak_tx="$_tx_bps"
+        _sum_rx=$(( _sum_rx + _rx_bps ))
+        _sum_tx=$(( _sum_tx + _tx_bps ))
+        _elapsed=$(( $(date +%s) - _start_ts ))
+        [ "$_elapsed" -lt 1 ] && _elapsed=1
+        _rx_c="$(fmt_rate "$_rx_bps")"; _tx_c="$(fmt_rate "$_tx_bps")"
+        _rx_p="$(fmt_rate "$_peak_rx")"; _tx_p="$(fmt_rate "$_peak_tx")"
+        _rx_a="$(fmt_rate $((_sum_rx / _elapsed)))"
+        _tx_a="$(fmt_rate $((_sum_tx / _elapsed)))"
+        clear
+        section "Monitor Throughput — ${_iface}"
+        echo -e "  ${DIM2}Live sample every 1s. ${W}Ctrl+C${NC}${DIM2} to exit.${NC}"
+        echo ""
+        echo -e "  ${A}Since opened${NC}   ${W}${_elapsed}s${NC}"
+        echo -e "  ${A}Current${NC}        ${DIM2}↓${NC} ${W}${_rx_c}${NC}   ${DIM2}↑${NC} ${W}${_tx_c}${NC}"
+        echo -e "  ${A}Peak${NC}           ${DIM2}↓${NC} ${W}${_rx_p}${NC}   ${DIM2}↑${NC} ${W}${_tx_p}${NC}"
+        echo -e "  ${A}Avg${NC}            ${DIM2}↓${NC} ${W}${_rx_a}${NC}   ${DIM2}↑${NC} ${W}${_tx_a}${NC}"
+        echo ""
+    done
+    trap on_error INT
+    set -e
+    _CANCELLED=0
 }
 
 # _mi_show_live_conf IFACE — dump running kernel state via `awg showconf`.
@@ -4501,6 +4855,7 @@ _mi_edit_endpoint() {
             cancelled
         fi
     elif [ "$_new_ep" != "$_cur_ep" ]; then
+        validate_host_or_ip "$_new_ep" || { PAUSE; return 0; }
         # Resolve the hostname and classify the resulting IP so the user
         # can verify at a glance that the endpoint points at the right place.
         echo ""
@@ -4638,6 +4993,7 @@ _mi_configure() {
         echo -e "  ${DIM2}Info${NC}"
         echo -e "  ${B}i${NC} ${DIM2}›${NC} ${W}Show${NC} Public Key"
         echo -e "  ${B}v${NC} ${DIM2}›${NC} ${W}Show${NC} Live Config  ${DIM2}(kernel state)${NC}"
+        echo -e "  ${B}r${NC} ${DIM2}›${NC} ${W}Monitor${NC} Throughput  ${DIM2}(live rate)${NC}"
         echo -e "  ${B}g${NC} ${DIM2}›${NC} ${W}Test${NC} DNS & Network"
         echo ""
         echo -e "  ${DIM2}Enter › Back${NC}"
@@ -4660,6 +5016,7 @@ _mi_configure() {
             x|X) _mi_edit_nohostroute "$_iface" ;;
             i|I) _mi_show_pubkey "$_iface" ;;
             v|V) _mi_show_live_conf "$_iface" ;;
+            r|R) _mi_monitor_throughput "$_iface" ;;
             g|G) do_dns_network_test "$_iface"; PAUSE ;;
             *)   warn "Unknown option"; PAUSE ;;
         esac
@@ -4787,7 +5144,8 @@ do_manage_interface() {
         fi
 
         # Total Rx/Tx across all peers — sum raw bytes from `awg show dump`.
-        _rx_sum=""; _tx_sum=""
+        # Packet counts come from kernel netdev stats (awg dump has no pkts).
+        _rx_sum=""; _tx_sum=""; _rx_pkts=""; _tx_pkts=""
         if [ "$_disabled" != "1" ] && interface_device_exists "$_iface" && have_cmd awg; then
             _sums="$(awg show "$_iface" dump 2>/dev/null | awk -F'\t' '
                 NR>1 { rx+=$6; tx+=$7 } END { printf "%d %d\n", rx+0, tx+0 }')"
@@ -4795,6 +5153,22 @@ do_manage_interface() {
                 _rx_sum="$(fmt_bytes "${_sums%% *}")"
                 _tx_sum="$(fmt_bytes "${_sums##* }")"
             fi
+            if [ -r "/sys/class/net/${_iface}/statistics/rx_packets" ]; then
+                _rx_pkts="$(cat "/sys/class/net/${_iface}/statistics/rx_packets" 2>/dev/null || true)"
+                _tx_pkts="$(cat "/sys/class/net/${_iface}/statistics/tx_packets" 2>/dev/null || true)"
+            fi
+            _rx_err=0; _rx_drp=0; _tx_err=0; _tx_drp=0
+            for _k in rx_errors rx_dropped tx_errors tx_dropped; do
+                _f="/sys/class/net/${_iface}/statistics/${_k}"
+                [ -r "$_f" ] || continue
+                _val="$(cat "$_f" 2>/dev/null || echo 0)"
+                case "$_k" in
+                    rx_errors)  _rx_err="${_val:-0}" ;;
+                    rx_dropped) _rx_drp="${_val:-0}" ;;
+                    tx_errors)  _tx_err="${_val:-0}" ;;
+                    tx_dropped) _tx_drp="${_val:-0}" ;;
+                esac
+            done
         fi
 
         # Podkop status
@@ -4851,10 +5225,27 @@ do_manage_interface() {
         fi
         box_buf_line "  ${A}DNS${NC}          ${W}${_dns_shown}${NC}${_dns_chain}"
         box_buf_line "  ${A}MTU${NC}          ${W}${_mtu}${NC}"
+        _ifc_jc="$(iface_get "$_iface" awg_jc)"
+        if [ -n "$_ifc_jc" ]; then
+            _ifc_jmin="$(iface_get "$_iface" awg_jmin "?")"
+            _ifc_jmax="$(iface_get "$_iface" awg_jmax "?")"
+            box_buf_line "  ${A}Obfuscation${NC}  ${OK}AmneziaWG${NC}  ${DIM2}Jc=${_ifc_jc} Jmin=${_ifc_jmin} Jmax=${_ifc_jmax}${NC}"
+        else
+            box_buf_line "  ${A}Obfuscation${NC}  ${DIM2}plain WireGuard${NC}"
+        fi
 
         # Firewall
         box_buf_sep
         box_buf_line "  ${A}Zone${NC}         ${W}${_zone}${NC}"
+        if [ -n "$_port" ]; then
+            _wan_zone_now="$(detect_wan_zone 2>/dev/null || true)"
+            if [ -n "$_wan_zone_now" ] \
+               && port_allowed_in_zone "$_port" "$_wan_zone_now" udp; then
+                box_buf_line "  ${A}Port${NC}         ${ICO_OK} ${_port}"
+            else
+                box_buf_line "  ${A}Port${NC}         ${ICO_ERR} Unreachable"
+            fi
+        fi
         box_buf_line "  ${A}Routing${NC}      ${_fwd_lan} LAN  ${_fwd_wan} WAN"
         if [ "${PK_INSTALLED:-0}" -eq 1 ]; then
             if [ "$PK_LINKED" -eq 0 ]; then
@@ -4881,7 +5272,45 @@ do_manage_interface() {
                 box_buf_line "  ${A}Uptime${NC}       ${W}${_uptime_str}${NC}"
             fi
             if [ -n "$_rx_sum" ]; then
-                box_buf_line "  ${A}Traffic${NC}      ${DIM2}↓${NC} ${W}${_rx_sum}${NC}  ${DIM2}↑${NC} ${W}${_tx_sum}${NC}"
+                # Pad rx/tx to the same width so pkts counts column-align.
+                _pk_w="${#_rx_sum}"
+                [ "${#_tx_sum}" -gt "$_pk_w" ] && _pk_w="${#_tx_sum}"
+                _rx_pad="$(printf "%-${_pk_w}s" "$_rx_sum")"
+                _tx_pad="$(printf "%-${_pk_w}s" "$_tx_sum")"
+                _rx_pkts_s=""; _tx_pkts_s=""
+                [ -n "$_rx_pkts" ] && _rx_pkts_s=" ${DIM2}(${_rx_pkts} pkts)${NC}"
+                [ -n "$_tx_pkts" ] && _tx_pkts_s=" ${DIM2}(${_tx_pkts} pkts)${NC}"
+                box_buf_line "  ${A}Packets${NC}      ${DIM2}↓${NC} ${W}${_rx_pad}${NC}${_rx_pkts_s}"
+                box_buf_line "               ${DIM2}↑${NC} ${W}${_tx_pad}${NC}${_tx_pkts_s}"
+                if [ "${_rx_err:-0}" -gt 0 ] || [ "${_rx_drp:-0}" -gt 0 ] \
+                   || [ "${_tx_err:-0}" -gt 0 ] || [ "${_tx_drp:-0}" -gt 0 ]; then
+                    _rx_err_s=""; _tx_err_s=""
+                    _sep_rx=""; _sep_tx=""
+                    if [ "${_rx_err:-0}" -gt 0 ]; then
+                        _rx_e_n="error"; [ "$_rx_err" -gt 1 ] && _rx_e_n="errors"
+                        _rx_err_s=" ${ERR}${_rx_err} ${_rx_e_n}${NC}"
+                        _sep_rx=","
+                    fi
+                    if [ "${_rx_drp:-0}" -gt 0 ]; then
+                        _rx_err_s="${_rx_err_s}${_sep_rx} ${WARN_C}${_rx_drp} dropped${NC}"
+                    fi
+                    if [ "${_tx_err:-0}" -gt 0 ]; then
+                        _tx_e_n="error"; [ "$_tx_err" -gt 1 ] && _tx_e_n="errors"
+                        _tx_err_s=" ${ERR}${_tx_err} ${_tx_e_n}${NC}"
+                        _sep_tx=","
+                    fi
+                    if [ "${_tx_drp:-0}" -gt 0 ]; then
+                        _tx_err_s="${_tx_err_s}${_sep_tx} ${WARN_C}${_tx_drp} dropped${NC}"
+                    fi
+                    if [ -n "$_rx_err_s" ] && [ -n "$_tx_err_s" ]; then
+                        box_buf_line "  ${A}Errors${NC}       ${DIM2}↓${NC}${_rx_err_s}"
+                        box_buf_line "               ${DIM2}↑${NC}${_tx_err_s}"
+                    elif [ -n "$_rx_err_s" ]; then
+                        box_buf_line "  ${A}Errors${NC}       ${DIM2}↓${NC}${_rx_err_s}"
+                    elif [ -n "$_tx_err_s" ]; then
+                        box_buf_line "  ${A}Errors${NC}       ${DIM2}↑${NC}${_tx_err_s}"
+                    fi
+                fi
             fi
         fi
         box_buf_flush 44
