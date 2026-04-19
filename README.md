@@ -23,27 +23,38 @@ Creates AmneziaWG interfaces and peers on OpenWrt, handling all the UCI/firewall
 - Create with guided wizard — subnet auto-picked from free `10.x.0.1/24` range, firewall zone/rules/forwarding generated automatically
 - LAN IP, LAN/WAN zones detected from UCI — manual input only when auto-detect fails
 - Rename — propagates to peers, firewall zone, rules, forwardings, DNS records, Podkop
-- Edit DNS, MTU, listen port, endpoint override from the interface menu
+- Configure submenu: DNS, MTU, listen port, endpoint override, fwmark, routing table, tunlink, nohostroute, AmneziaWG obfuscation
 - Toggle LAN/WAN forwarding, link/unlink Podkop per interface
+- Live firewall check — warns when the listen port isn't allowed in the WAN zone
+- Zero-downtime restart via `awg syncconf` when possible (no dropped sessions)
 - Disable, enable, restart, delete with full cleanup
 - Supports non-Liminal AWG interfaces (created outside the script) in read-only mode
 
 ### Peers
 
-- Add with auto IP allocation from the interface subnet
+- Add with IP assignment mode of choice: first available / random / custom
 - AllowedIPs set automatically based on firewall forwarding state (WAN present → `0.0.0.0/0`, LAN only → LAN CIDR, nothing → VPN subnet only)
 - PreSharedKey generated for every peer
 - Endpoint selection — interface override, WAN IP auto-detect, or manual
-- Config export: WireGuard `.conf`, QR code, download link, `vpn://` key for AmneziaVPN
+- Config export: WireGuard `.conf`, QR code, download link, `vpn://` key for AmneziaVPN — profile label in AmneziaVPN carries the peer name so multiple profiles are distinguishable
 - Optional DNS hostrecord (`peer.interface.lan`) via dnsmasq — auto-name or custom
-- Edit AllowedIPs, keepalive, hostname after creation
-- Rename, regenerate keys, disable/enable, delete
+- Configure submenu: AllowedIPs, keepalive, endpoint override, hostname, rotate keys/PSK
+- Every emitted config is pre-validated (keys, CIDR, endpoint, MTU, AWG obfuscation param ranges) — refuses to hand out a broken file
+- Rename, regenerate secrets, disable/enable, delete
 - Online/offline status via handshake age, per-peer traffic stats
+
+### Obfuscation
+
+- AmneziaWG parameter setup with presets: `random` (balanced), `mobile` (narrow junk sized for carrier DPI), `strict` (maximum junk), `none` (plain WireGuard)
+- All generated values stay within official spec (Jc 0-10, Jmin/Jmax 64-1024, S1-S3 0-64, S4 0-32, H1-H4 distinct)
+- Warns when existing params drift out of spec with a one-click regenerate
 
 ### Monitoring
 
 - Live dashboard — all interfaces and peers on one screen, auto-refresh every 3s
+- Live throughput monitor per interface — current rate, peak, running average
 - Connectivity check — device status, port listening, firewall zone, forwarding, ping to online peers
+- Packet counters and RX/TX errors surfaced in the interface box when non-zero
 - Inline diagnostics on interface and peer screens — warns about down device, closed port, missing forwarding, DNS chain issues
 
 ### Podkop / Sing-Box
@@ -62,7 +73,6 @@ Creates AmneziaWG interfaces and peers on OpenWrt, handling all the UCI/firewall
 
 - Self-update from GitHub with version check
 - Install missing packages from the menu (AmneziaWG, Podkop, qrencode, jq, base64)
-- CLI mode: `liminal status`, `liminal peers <iface>`, `liminal export`, `liminal check`
 
 ## Install
 
