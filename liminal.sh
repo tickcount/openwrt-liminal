@@ -6294,11 +6294,57 @@ do_create() {
             else
                 echo -e "  ${ICO_WARN} ${WARN_C}DNS poisoning check unavailable${NC}"
             fi
-            break
+            echo ""
+            confirm "Use ${DNS_IP} as DNS?" "y" && break
         done
     fi
 
     check_dangerous_forwarding "$ZONE_NAME"
+
+    # ── Endpoint override ────────────────────────────────────────────
+    # Optional: hostname/IP clients dial. Empty keeps the auto-detect
+    # WAN-IP behaviour (resolved at .conf emit time).
+    section "Endpoint"
+    ENDPOINT_HOST=""
+    _ep_wan_hint="$(detect_wan_ip 2>/dev/null || true)"
+    if [ -n "$_ep_wan_hint" ]; then
+        echo -e "  ${DIM2}Auto-detected WAN IP: ${W}${_ep_wan_hint}${NC}"
+    fi
+    echo -e "  ${DIM2}Leave empty to use the WAN IP (resolved at emit time),${NC}"
+    echo -e "  ${DIM2}or enter a DDNS hostname / static IP for client configs.${NC}"
+    echo ""
+    while true; do
+        prompt ENDPOINT_HOST "Endpoint (empty = auto-detect WAN)" "" || { trap_restore; return; }
+        is_cancelled && { trap_restore; return; }
+        [ -z "$ENDPOINT_HOST" ] && break
+        validate_host_or_ip "$ENDPOINT_HOST" || continue
+        # Classify — same logic as _mi_edit_endpoint.
+        _ep_new_ip="$(resolve_hostname "$ENDPOINT_HOST" 2>/dev/null || true)"
+        if [ -n "$_ep_new_ip" ]; then
+            _ep_cls="$(classify_endpoint_ip "$_ep_new_ip" 2>/dev/null || echo "")"
+            case "$_ep_cls" in
+                wan)      echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_ep_new_ip}${NC}  ${DIM2}(matches router WAN)${NC}" ;;
+                hairpin)  echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_ep_new_ip}${NC}  ${DIM2}(router LAN IP — split-horizon DNS)${NC}" ;;
+                private)  echo -e "  ${ICO_WARN} ${WARN_C}Resolves to private IP${NC} ${W}${_ep_new_ip}${NC} — external clients won't reach it" ;;
+                external) echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_ep_new_ip}${NC}  ${DIM2}(external, ≠ router WAN)${NC}" ;;
+                *)        echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_ep_new_ip}${NC}" ;;
+            esac
+        else
+            case "$ENDPOINT_HOST" in
+                *[!0-9.]*) echo -e "  ${ICO_WARN} ${WARN_C}Could not resolve ${ENDPOINT_HOST} from router${NC}  ${DIM2}(ok if transient)${NC}" ;;
+            esac
+        fi
+        echo ""
+        confirm "Use this endpoint?" "y" && break
+    done
+
+    # ── Obfuscation preset ───────────────────────────────────────────
+    section "Obfuscation"
+    while true; do
+        OBF_PRESET="$(_obf_preset_prompt)" || { trap_restore; cancelled; return; }
+        echo ""
+        confirm "Use preset '${OBF_PRESET}'?" "y" && break
+    done
 
     # ── Summary ──────────────────────────────────────────────────────
     section "Summary"
@@ -6308,20 +6354,25 @@ do_create() {
     SERVER_PRIVKEY="$(printf '%s\n' "$KEYS" | sed -n '1p')"
     SERVER_PUBKEY="$(printf  '%s\n' "$KEYS" | sed -n '2p')"
 
-    echo -e "  ${B}Generating${NC} obfuscation params..."
-    OBF="$(generate_awg_obfuscation)"
-    AWG_JC="$(printf   '%s\n' "$OBF" | sed -n '1p')"
-    AWG_JMIN="$(printf '%s\n' "$OBF" | sed -n '2p')"
-    AWG_JMAX="$(printf '%s\n' "$OBF" | sed -n '3p')"
-    AWG_S1="$(printf   '%s\n' "$OBF" | sed -n '4p')"
-    AWG_S2="$(printf   '%s\n' "$OBF" | sed -n '5p')"
-    AWG_S3="$(printf   '%s\n' "$OBF" | sed -n '6p')"
-    AWG_S4="$(printf   '%s\n' "$OBF" | sed -n '7p')"
-    AWG_H1="$(printf   '%s\n' "$OBF" | sed -n '8p')"
-    AWG_H2="$(printf   '%s\n' "$OBF" | sed -n '9p')"
-    AWG_H3="$(printf   '%s\n' "$OBF" | sed -n '10p')"
-    AWG_H4="$(printf   '%s\n' "$OBF" | sed -n '11p')"
-    AWG_I1="$(printf   '%s\n' "$OBF" | sed -n '12p')"
+    AWG_JC=""; AWG_JMIN=""; AWG_JMAX=""
+    AWG_S1=""; AWG_S2=""; AWG_S3=""; AWG_S4=""
+    AWG_H1=""; AWG_H2=""; AWG_H3=""; AWG_H4=""; AWG_I1=""
+    if [ "$OBF_PRESET" != "none" ]; then
+        echo -e "  ${B}Generating${NC} obfuscation params (preset: ${OBF_PRESET})..."
+        OBF="$(generate_awg_obfuscation "$OBF_PRESET")"
+        AWG_JC="$(printf   '%s\n' "$OBF" | sed -n '1p')"
+        AWG_JMIN="$(printf '%s\n' "$OBF" | sed -n '2p')"
+        AWG_JMAX="$(printf '%s\n' "$OBF" | sed -n '3p')"
+        AWG_S1="$(printf   '%s\n' "$OBF" | sed -n '4p')"
+        AWG_S2="$(printf   '%s\n' "$OBF" | sed -n '5p')"
+        AWG_S3="$(printf   '%s\n' "$OBF" | sed -n '6p')"
+        AWG_S4="$(printf   '%s\n' "$OBF" | sed -n '7p')"
+        AWG_H1="$(printf   '%s\n' "$OBF" | sed -n '8p')"
+        AWG_H2="$(printf   '%s\n' "$OBF" | sed -n '9p')"
+        AWG_H3="$(printf   '%s\n' "$OBF" | sed -n '10p')"
+        AWG_H4="$(printf   '%s\n' "$OBF" | sed -n '11p')"
+        AWG_I1="$(printf   '%s\n' "$OBF" | sed -n '12p')"
+    fi
     echo ""
 
     echo -e "  ${A}Interface${NC}    ${W}$IFNAME${NC}"
@@ -6331,12 +6382,21 @@ do_create() {
     echo -e "  ${A}MTU${NC}          ${W}$MTU_VALUE${NC}"
     echo -e "  ${A}LAN IP${NC}       ${W}$ROUTER_LAN_IP${NC}"
     echo -e "  ${A}DNS${NC}          ${W}$DNS_IP${NC}"
+    if [ -n "$ENDPOINT_HOST" ]; then
+        echo -e "  ${A}Endpoint${NC}     ${W}$ENDPOINT_HOST${NC}"
+    else
+        echo -e "  ${A}Endpoint${NC}     ${DIM2}auto (WAN IP)${NC}"
+    fi
     echo -e "  ${A}FW Zone${NC}      ${W}$ZONE_NAME${NC}"
     echo -e "  ${A}FW Rule${NC}      ${W}$INCOMING_RULE_NAME${NC}"
     echo -e "  ${A}-> LAN${NC}       $( [ "$ALLOW_LAN_FORWARD" = "1" ] && echo -e "${OK}yes${NC}" || echo -e "${DIM2}no${NC}" )"
     echo -e "  ${A}-> WAN${NC}       $( [ "$ALLOW_WAN_FORWARD" = "1" ] && echo -e "${OK}yes${NC}" || echo -e "${DIM2}no${NC}" )"
     echo -e "  ${A}Podkop${NC}       $( [ "$USE_PODKOP" = "1" ] && echo -e "${OK}yes${NC}" || echo -e "${DIM2}no${NC}" )"
-    echo -e "  ${A}Obfuscation${NC}  ${DIM2}Jc=${NC}${W}$AWG_JC${NC} ${DIM2}Jmin=${NC}${W}$AWG_JMIN${NC} ${DIM2}Jmax=${NC}${W}$AWG_JMAX${NC} ${DIM2}S1=${NC}${W}$AWG_S1${NC} ${DIM2}S2=${NC}${W}$AWG_S2${NC}"
+    if [ "$OBF_PRESET" = "none" ]; then
+        echo -e "  ${A}Obfuscation${NC}  ${DIM2}plain WireGuard${NC}"
+    else
+        echo -e "  ${A}Obfuscation${NC}  ${W}${OBF_PRESET}${NC}  ${DIM2}Jc=${NC}${W}$AWG_JC${NC} ${DIM2}Jmin=${NC}${W}$AWG_JMIN${NC} ${DIM2}Jmax=${NC}${W}$AWG_JMAX${NC}"
+    fi
     echo ""
 
     trap_restore
@@ -6354,17 +6414,20 @@ do_create() {
     uci add_list "network.${IFNAME}.addresses=${IFADDR}"
     uci set "network.${IFNAME}.mtu=${MTU_VALUE}"
     uci set "network.${IFNAME}.dns=${DNS_IP}"
-    uci set "network.${IFNAME}.awg_jc=${AWG_JC}"
-    uci set "network.${IFNAME}.awg_jmin=${AWG_JMIN}"
-    uci set "network.${IFNAME}.awg_jmax=${AWG_JMAX}"
-    uci set "network.${IFNAME}.awg_s1=${AWG_S1}"
-    uci set "network.${IFNAME}.awg_s2=${AWG_S2}"
-    uci set "network.${IFNAME}.awg_s3=${AWG_S3}"
-    uci set "network.${IFNAME}.awg_s4=${AWG_S4}"
-    uci set "network.${IFNAME}.awg_h1=${AWG_H1}"
-    uci set "network.${IFNAME}.awg_h2=${AWG_H2}"
-    uci set "network.${IFNAME}.awg_h3=${AWG_H3}"
-    uci set "network.${IFNAME}.awg_h4=${AWG_H4}"
+    [ -n "$ENDPOINT_HOST" ] && uci set "network.${IFNAME}.endpoint_host=${ENDPOINT_HOST}"
+    if [ "$OBF_PRESET" != "none" ]; then
+        uci set "network.${IFNAME}.awg_jc=${AWG_JC}"
+        uci set "network.${IFNAME}.awg_jmin=${AWG_JMIN}"
+        uci set "network.${IFNAME}.awg_jmax=${AWG_JMAX}"
+        uci set "network.${IFNAME}.awg_s1=${AWG_S1}"
+        uci set "network.${IFNAME}.awg_s2=${AWG_S2}"
+        uci set "network.${IFNAME}.awg_s3=${AWG_S3}"
+        uci set "network.${IFNAME}.awg_s4=${AWG_S4}"
+        uci set "network.${IFNAME}.awg_h1=${AWG_H1}"
+        uci set "network.${IFNAME}.awg_h2=${AWG_H2}"
+        uci set "network.${IFNAME}.awg_h3=${AWG_H3}"
+        uci set "network.${IFNAME}.awg_h4=${AWG_H4}"
+    fi
 
     # ── Apply: firewall zone ──
     echo -e "  ${B}Creating${NC} FW zone ${W}$ZONE_NAME${NC}"
