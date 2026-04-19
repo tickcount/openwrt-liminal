@@ -2986,6 +2986,17 @@ get_all_awg_interfaces() {
         | sed "s/network\.//"
 }
 
+# is_local_only_tld HOSTNAME — 0 if HOSTNAME ends in a TLD public DNS will
+# never resolve (.lan / .local / .internal / .home / .home.arpa /
+# .localdomain / .intranet / .private). Probing 1.1.1.1 for these is
+# pointless and showing "unreachable" misleads the admin.
+is_local_only_tld() {
+    case "${1:-}" in
+        *.lan|*.local|*.internal|*.home|*.home.arpa|*.localdomain|*.intranet|*.private) return 0 ;;
+    esac
+    return 1
+}
+
 # resolve_hostname HOSTNAME — echo the first A-record IP for HOSTNAME, or
 # empty if input is already an IP / is an IPv6 literal / fails to resolve.
 # Tries getent first (NSS path), falls back to nslookup (busybox).
@@ -3037,13 +3048,30 @@ resolve_hostname_via() {
 classify_endpoint_ip() {
     _cip="$1"
     [ -z "$_cip" ] && return 1
+    # Obviously-broken addresses: the tunnel won't work at all.
+    case "$_cip" in
+        0.0.0.0|255.255.255.255)        echo "invalid";  return 0 ;;
+        22[4-9].*|23[0-9].*)             echo "invalid";  return 0 ;;  # multicast
+        127.*)                           echo "loopback"; return 0 ;;
+    esac
     # Router's own LAN IP → intentional split-horizon / hairpin DNS setup.
     _lan_ip="$(detect_router_lan_ip 2>/dev/null || true)"
     if [ -n "$_lan_ip" ] && [ "$_cip" = "$_lan_ip" ]; then
         echo "hairpin"; return 0
     fi
+    # Any other IP from one of our AWG tunnel subnets → circular endpoint.
+    _all_awg="$(uci -q show network 2>/dev/null \
+        | sed -n 's/^network\.\([^.]*\)\.proto=.amneziawg.$/\1/p' | sort -u)"
+    for _cep_if in $_all_awg; do
+        for _cep_a in $(iface_get "$_cep_if" addresses); do
+            case "$_cep_a" in */*) ;; *) continue ;; esac
+            if cidr_contains_ip "$_cep_a" "$_cip" 2>/dev/null; then
+                echo "tunnel"; return 0
+            fi
+        done
+    done
     case "$_cip" in
-        10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|169.254.*|127.*)
+        10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|169.254.*)
             echo "private"; return 0 ;;
     esac
     _wan_ip="$(detect_wan_ip 2>/dev/null || true)"
@@ -4445,6 +4473,29 @@ do_add_peer() {
     else
         _client_allowed_ips="$_peer_ip"
     fi
+    echo -e "  ${DIM2}Auto-computed from routing:${NC} ${W}$_client_allowed_ips${NC}"
+    echo ""
+    echo -e "  ${B}1${NC} ${DIM2}›${NC} ${W}Accept${NC}         ${DIM2}(use the value above)${NC}"
+    echo -e "  ${B}2${NC} ${DIM2}›${NC} ${W}Full tunnel${NC}    ${DIM2}0.0.0.0/0, ::/0${NC}"
+    echo -e "  ${B}3${NC} ${DIM2}›${NC} ${W}Custom${NC}         ${DIM2}enter manually${NC}"
+    echo ""
+    while true; do
+        prompt _aipc "Select" "1" || { trap_restore; return; }
+        is_cancelled && { trap_restore; return; }
+        case "${_aipc:-1}" in
+            1) break ;;
+            2) _client_allowed_ips="0.0.0.0/0, ::/0"; break ;;
+            3) while true; do
+                   prompt _client_allowed_ips "AllowedIPs" "$_client_allowed_ips" || continue
+                   is_cancelled && { trap_restore; return; }
+                   [ -z "$_client_allowed_ips" ] && { warn "Required field"; continue; }
+                   validate_allowed_ips "$_client_allowed_ips" || continue
+                   break
+               done
+               break ;;
+            *) warn "Invalid selection"; continue ;;
+        esac
+    done
     echo -e "  ${ICO_OK} ${OK}AllowedIPs:${NC} ${W}$_client_allowed_ips${NC}"
 
     # ── Security ─────────────────────────────────────────────────────
@@ -5090,40 +5141,76 @@ _mi_edit_endpoint() {
         # Resolve the hostname and classify the resulting IP so the user
         # can verify at a glance that the endpoint points at the right place.
         echo ""
-        _new_ep_ip="$(resolve_hostname "$_new_ep" 2>/dev/null || true)"
+        # Literal IPv4 inputs bypass resolve_hostname (it returns empty for
+        # numeric input); use the input itself as the resolved address.
+        case "$_new_ep" in
+            *[!0-9.]*) _new_ep_ip="$(resolve_hostname "$_new_ep" 2>/dev/null || true)" ;;
+            *)         _new_ep_ip="$_new_ep" ;;
+        esac
         if [ -n "$_new_ep_ip" ]; then
             _ep_class="$(classify_endpoint_ip "$_new_ep_ip" 2>/dev/null || echo "")"
             case "$_ep_class" in
                 wan)
-                    echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_new_ep_ip}${NC}  ${DIM2}(matches router WAN)${NC}"
+                    echo -e "  ${ICO_OK}  ${A}Endpoint${NC}     ${W}${_new_ep_ip}${NC}  ${DIM2}(matches router WAN)${NC}"
                     ;;
                 hairpin)
-                    # Router LAN IP → local DNS has a split-horizon record.
-                    # Helpful, but external clients see a different answer
-                    # — probe 1.1.1.1 for the public view.
-                    echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_new_ep_ip}${NC}  ${DIM2}(router LAN IP — split-horizon DNS)${NC}"
-                    _ext_ip="$(resolve_hostname_via "$_new_ep" 1.1.1.1 2>/dev/null || true)"
-                    if [ -n "$_ext_ip" ]; then
-                        _wan_now="$(detect_wan_ip 2>/dev/null || true)"
-                        if [ -n "$_wan_now" ] && [ "$_ext_ip" = "$_wan_now" ]; then
-                            echo -e "  ${DIM2}External (1.1.1.1) → ${_ext_ip}  (matches router WAN)${NC}"
-                        else
-                            echo -e "  ${DIM2}External (1.1.1.1) → ${_ext_ip}${NC}"
-                        fi
-                    else
-                        echo -e "  ${DIM2}Couldn't verify public answer via 1.1.1.1.${NC}"
-                    fi
+                    # Router LAN IP. If the user typed a literal IP there's
+                    # no split-horizon — it's just an unreachable-from-outside
+                    # address and clients off-LAN will never connect.
+                    case "$_new_ep" in
+                        *[a-zA-Z]*)
+                            echo -e "  ${ICO_OK}  ${A}Endpoint${NC}     ${W}${_new_ep_ip}${NC}  ${DIM2}(split-horizon DNS)${NC}"
+                            if is_local_only_tld "$_new_ep"; then
+                                echo -e "     ${DIM2}Local-only TLD — external probe skipped.${NC}"
+                            else
+                                _ext_ip="$(resolve_hostname_via "$_new_ep" 1.1.1.1 2>/dev/null || true)"
+                                if [ -n "$_ext_ip" ]; then
+                                    _wan_now="$(detect_wan_ip 2>/dev/null || true)"
+                                    if [ -n "$_wan_now" ] && [ "$_ext_ip" = "$_wan_now" ]; then
+                                        echo -e "     ${A}Public${NC}       ${W}${_ext_ip}${NC}  ${DIM2}(via 1.1.1.1, matches WAN)${NC}"
+                                    else
+                                        echo -e "     ${WARN_C}Public${NC}       ${W}${_ext_ip}${NC}  ${DIM2}(via 1.1.1.1)${NC}"
+                                        [ -n "$_wan_now" ] && \
+                                            echo -e "     ${A}WAN${NC}          ${W}${_wan_now}${NC}  ${DIM2}(router)${NC}"
+                                    fi
+                                else
+                                    echo -e "     ${DIM2}Public view unreachable via 1.1.1.1${NC}"
+                                fi
+                            fi
+                            ;;
+                        *)
+                            echo -e "  ${ICO_ERR}  ${ERR}Endpoint${NC}     ${W}${_new_ep_ip}${NC}  ${ERR}(router LAN IP)${NC}"
+                            echo -e "     ${DIM2}This is only reachable from the LAN itself — no external${NC}"
+                            echo -e "     ${DIM2}client will connect. Use a DDNS hostname or the WAN IP.${NC}"
+                            ;;
+                    esac
                     ;;
                 private)
-                    echo -e "  ${ICO_WARN} ${WARN_C}Resolves to private IP${NC} ${W}${_new_ep_ip}${NC}"
-                    echo -e "  ${DIM2}External clients won't reach an RFC1918 address.${NC}"
+                    echo -e "  ${ICO_WARN}  ${WARN_C}Endpoint${NC}     ${W}${_new_ep_ip}${NC}  ${DIM2}(RFC1918 private)${NC}"
+                    echo -e "     ${DIM2}External clients won't reach a private address.${NC}"
+                    ;;
+                loopback)
+                    echo -e "  ${ICO_ERR}  ${ERR}Endpoint${NC}     ${W}${_new_ep_ip}${NC}  ${ERR}(loopback)${NC}"
+                    echo -e "     ${DIM2}127.x.x.x is this very router — no client can connect to that.${NC}"
+                    ;;
+                tunnel)
+                    echo -e "  ${ICO_ERR}  ${ERR}Endpoint${NC}     ${W}${_new_ep_ip}${NC}  ${ERR}(tunnel address)${NC}"
+                    echo -e "     ${DIM2}This IP is inside an existing AmneziaWG subnet — circular.${NC}"
+                    ;;
+                invalid)
+                    echo -e "  ${ICO_ERR}  ${ERR}Endpoint${NC}     ${W}${_new_ep_ip}${NC}  ${ERR}(invalid / multicast)${NC}"
+                    echo -e "     ${DIM2}Not a routable unicast address.${NC}"
                     ;;
                 external)
-                    echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_new_ep_ip}${NC}  ${DIM2}(external — not this router's WAN)${NC}"
-                    echo -e "  ${DIM2}OK for CGNAT / upstream-forwarded setups.${NC}"
+                    _wan_now="$(detect_wan_ip 2>/dev/null || true)"
+                    echo -e "  ${ICO_WARN}  ${WARN_C}Endpoint${NC}     ${W}${_new_ep_ip}${NC}"
+                    [ -n "$_wan_now" ] && \
+                        echo -e "     ${A}WAN${NC}          ${W}${_wan_now}${NC}  ${DIM2}(router)${NC}"
+                    echo -e "     ${DIM2}Addresses differ — clients outside your network may not reach${NC}"
+                    echo -e "     ${DIM2}the server. OK for CGNAT or upstream-forwarded setups.${NC}"
                     ;;
                 *)
-                    echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_new_ep_ip}${NC}"
+                    echo -e "  ${ICO_OK}  ${A}Endpoint${NC}     ${W}${_new_ep_ip}${NC}"
                     ;;
             esac
         else
@@ -6318,16 +6405,72 @@ do_create() {
         is_cancelled && { trap_restore; return; }
         [ -z "$ENDPOINT_HOST" ] && break
         validate_host_or_ip "$ENDPOINT_HOST" || continue
-        # Classify — same logic as _mi_edit_endpoint.
-        _ep_new_ip="$(resolve_hostname "$ENDPOINT_HOST" 2>/dev/null || true)"
+        # Classify — same logic as _mi_edit_endpoint. Literal IPv4 inputs
+        # bypass resolve_hostname (which returns empty for numeric input).
+        case "$ENDPOINT_HOST" in
+            *[!0-9.]*) _ep_new_ip="$(resolve_hostname "$ENDPOINT_HOST" 2>/dev/null || true)" ;;
+            *)         _ep_new_ip="$ENDPOINT_HOST" ;;
+        esac
         if [ -n "$_ep_new_ip" ]; then
             _ep_cls="$(classify_endpoint_ip "$_ep_new_ip" 2>/dev/null || echo "")"
             case "$_ep_cls" in
-                wan)      echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_ep_new_ip}${NC}  ${DIM2}(matches router WAN)${NC}" ;;
-                hairpin)  echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_ep_new_ip}${NC}  ${DIM2}(router LAN IP — split-horizon DNS)${NC}" ;;
-                private)  echo -e "  ${ICO_WARN} ${WARN_C}Resolves to private IP${NC} ${W}${_ep_new_ip}${NC} — external clients won't reach it" ;;
-                external) echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_ep_new_ip}${NC}  ${DIM2}(external, ≠ router WAN)${NC}" ;;
-                *)        echo -e "  ${ICO_OK} ${OK}Resolves to${NC} ${W}${_ep_new_ip}${NC}" ;;
+                wan)      echo -e "  ${ICO_OK}  ${A}Endpoint${NC}     ${W}${_ep_new_ip}${NC}  ${DIM2}(matches router WAN)${NC}" ;;
+                hairpin)
+                    # Router LAN IP. Literal IP → unreachable from outside;
+                    # FQDN → legitimate split-horizon DNS setup, probe 1.1.1.1.
+                    case "$ENDPOINT_HOST" in
+                        *[a-zA-Z]*)
+                            echo -e "  ${ICO_OK}  ${A}Endpoint${NC}     ${W}${_ep_new_ip}${NC}  ${DIM2}(split-horizon DNS)${NC}"
+                            if is_local_only_tld "$ENDPOINT_HOST"; then
+                                echo -e "     ${DIM2}Local-only TLD — external probe skipped.${NC}"
+                            else
+                                _ext_ip="$(resolve_hostname_via "$ENDPOINT_HOST" 1.1.1.1 2>/dev/null || true)"
+                                if [ -n "$_ext_ip" ]; then
+                                    _wan_now="$(detect_wan_ip 2>/dev/null || true)"
+                                    if [ -n "$_wan_now" ] && [ "$_ext_ip" = "$_wan_now" ]; then
+                                        echo -e "     ${A}Public${NC}       ${W}${_ext_ip}${NC}  ${DIM2}(via 1.1.1.1, matches WAN)${NC}"
+                                    else
+                                        echo -e "     ${WARN_C}Public${NC}       ${W}${_ext_ip}${NC}  ${DIM2}(via 1.1.1.1)${NC}"
+                                        [ -n "$_wan_now" ] && \
+                                            echo -e "     ${A}WAN${NC}          ${W}${_wan_now}${NC}  ${DIM2}(router)${NC}"
+                                    fi
+                                else
+                                    echo -e "     ${DIM2}Public view unreachable via 1.1.1.1${NC}"
+                                fi
+                            fi
+                            ;;
+                        *)
+                            echo -e "  ${ICO_ERR}  ${ERR}Endpoint${NC}     ${W}${_ep_new_ip}${NC}  ${ERR}(router LAN IP)${NC}"
+                            echo -e "     ${DIM2}This is only reachable from the LAN itself — no external${NC}"
+                            echo -e "     ${DIM2}client will connect. Use a DDNS hostname or the WAN IP.${NC}"
+                            ;;
+                    esac
+                    ;;
+                private)
+                    echo -e "  ${ICO_WARN}  ${WARN_C}Endpoint${NC}     ${W}${_ep_new_ip}${NC}  ${DIM2}(RFC1918 private)${NC}"
+                    echo -e "     ${DIM2}External clients won't reach a private address.${NC}"
+                    ;;
+                loopback)
+                    echo -e "  ${ICO_ERR}  ${ERR}Endpoint${NC}     ${W}${_ep_new_ip}${NC}  ${ERR}(loopback)${NC}"
+                    echo -e "     ${DIM2}127.x.x.x is this very router — no client can connect to that.${NC}"
+                    ;;
+                tunnel)
+                    echo -e "  ${ICO_ERR}  ${ERR}Endpoint${NC}     ${W}${_ep_new_ip}${NC}  ${ERR}(tunnel address)${NC}"
+                    echo -e "     ${DIM2}This IP is inside an existing AmneziaWG subnet — circular.${NC}"
+                    ;;
+                invalid)
+                    echo -e "  ${ICO_ERR}  ${ERR}Endpoint${NC}     ${W}${_ep_new_ip}${NC}  ${ERR}(invalid / multicast)${NC}"
+                    echo -e "     ${DIM2}Not a routable unicast address.${NC}"
+                    ;;
+                external)
+                    _wan_now="$(detect_wan_ip 2>/dev/null || true)"
+                    echo -e "  ${ICO_WARN}  ${WARN_C}Endpoint${NC}     ${W}${_ep_new_ip}${NC}"
+                    [ -n "$_wan_now" ] && \
+                        echo -e "     ${A}WAN${NC}          ${W}${_wan_now}${NC}  ${DIM2}(router)${NC}"
+                    echo -e "     ${DIM2}Addresses differ — clients outside your network may not reach${NC}"
+                    echo -e "     ${DIM2}the server. OK for CGNAT or upstream-forwarded setups.${NC}"
+                    ;;
+                *)        echo -e "  ${ICO_OK}  ${A}Endpoint${NC}     ${W}${_ep_new_ip}${NC}" ;;
             esac
         else
             case "$ENDPOINT_HOST" in
