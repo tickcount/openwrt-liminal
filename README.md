@@ -1,5 +1,13 @@
 # Liminal
 
+> [!WARNING]
+> **Liminal is outdated and no longer developed.** It has been replaced by
+> **[Dawnline](https://github.com/tickcount/luci-app-dawnline)**: an AmneziaWG
+> VPN server for OpenWrt with a LuCI admin, where every person gets a personal
+> link to add their own devices, with per-person access, limits and live traffic.
+>
+> For new setups, use Dawnline. This script stays here for reference only.
+
 AmneziaWG tunnel manager for OpenWrt routers. Runs over SSH as an interactive TUI.
 
 Sets up encrypted VPN tunnels so your devices (phone, laptop, etc.) can route traffic through your home router — accessing your LAN and going out to the internet through your home IP (or any other proxy such as sing-box/podkop/etc).
